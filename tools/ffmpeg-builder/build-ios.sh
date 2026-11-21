@@ -301,13 +301,20 @@ build_one_slice() {
     rm -rf "$dav1d_build"
     local cross_file="$build_tmp/dav1d-cross.meson"
     write_meson_cross > "$cross_file"
-    env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
+    local dav1d_log="$build_tmp/dav1d-setup-$SLICE_TAG.log"
+    if ! env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
       --default-library=static --buildtype=release \
       --cross-file "$cross_file" \
-      -Denable_tools=false -Denable_tests=false >/dev/null
-    ninja -C "$dav1d_build" >/dev/null
-    meson install -C "$dav1d_build" >/dev/null
+      -Denable_tools=false -Denable_tests=false >"$dav1d_log" 2>&1; then
+      cat "$dav1d_log" >&2
+      die "[$slice] dav1d meson setup failed (full log above)"
+    fi
+    if ! ninja -C "$dav1d_build" >"$dav1d_log" 2>&1; then
+      tail -n 60 "$dav1d_log" >&2
+      die "[$slice] dav1d ninja build failed (tail above)"
+    fi
+    meson install -C "$dav1d_build" >"$dav1d_log" 2>&1
     log "[$slice] dav1d installed"
   fi
 
@@ -409,13 +416,20 @@ build_one_slice() {
     rm -rf "$fribidi_build"
     local fribidi_cross="$build_tmp/fribidi-cross.meson"
     write_meson_cross > "$fribidi_cross"
-    env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
+    local fribidi_log="$build_tmp/fribidi-setup-$SLICE_TAG.log"
+    if ! env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
       --default-library=static --buildtype=release \
       --cross-file "$fribidi_cross" \
-      -Ddocs=false -Dtests=false >/dev/null
-    ninja -C "$fribidi_build" >/dev/null
-    meson install -C "$fribidi_build" >/dev/null
+      -Ddocs=false -Dtests=false >"$fribidi_log" 2>&1; then
+      cat "$fribidi_log" >&2
+      die "[$slice] fribidi meson setup failed (full log above)"
+    fi
+    if ! ninja -C "$fribidi_build" >"$fribidi_log" 2>&1; then
+      tail -n 60 "$fribidi_log" >&2
+      die "[$slice] fribidi ninja build failed (tail above)"
+    fi
+    meson install -C "$fribidi_build" >"$fribidi_log" 2>&1
     log "[$slice] fribidi installed"
   fi
 

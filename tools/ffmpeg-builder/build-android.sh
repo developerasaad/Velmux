@@ -266,6 +266,12 @@ build_one_abi() {
     # under >/dev/null; capture to a log and dump it on failure. AS must be
     # the clang wrapper (NDK has no standalone `as`; clang assembles with -c,
     # which vpx's android branch adds itself for *clang AS).
+    #
+    # vpx's android branch also hardcodes `-static` into LDFLAGS (an old-NDK
+    # assumption); modern NDK clang link tests fail with it. Disable the
+    # line for our build (libraries are built static regardless).
+    sed -i.bak 's/^          check_add_ldflags -static$/          : velmux: no -static with modern NDK/' \
+      "$vpx_src/build/make/configure.sh"
     local vpx_log="$build_tmp/vpx-configure-$abi.log"
     if ! (cd "$vpx_src" && AS="$CC" ./configure \
        --target="$VPX_TARGET" \
@@ -299,14 +305,24 @@ build_one_abi() {
       dav1d_asm_args=(-Denable_asm=false)
     fi
     # meson: env CC/CXX describe the NATIVE compiler; the cross file owns
-    # the target, so the exports must not leak into setup.
-    env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
+    # the target, so the exports must not leak into setup. All meson/ninja
+    # output is captured and dumped on failure — meson writes some failure
+    # modes to stdout, which >/dev/null would hide.
+    local dav1d_log="$build_tmp/dav1d-$abi.log"
+    if ! env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
       --prefix="$prefix" --libdir=lib \
       --default-library=static --buildtype=release \
       --cross-file "$cross_file" \
-      -Denable_tools=false -Denable_tests=false "${dav1d_asm_args[@]}" >/dev/null
-    ninja -C "$dav1d_build" >/dev/null
-    meson install -C "$dav1d_build" >/dev/null
+      -Denable_tools=false -Denable_tests=false "${dav1d_asm_args[@]}" \
+      >"$dav1d_log" 2>&1; then
+      cat "$dav1d_log" >&2
+      die "[$abi] dav1d meson setup failed (full log above)"
+    fi
+    if ! ninja -C "$dav1d_build" >"$dav1d_log" 2>&1; then
+      tail -n 60 "$dav1d_log" >&2
+      die "[$abi] dav1d ninja build failed (tail above)"
+    fi
+    meson install -C "$dav1d_build" >"$dav1d_log" 2>&1
     log "[$abi] dav1d installed"
   fi
 
@@ -400,13 +416,20 @@ build_one_abi() {
     rm -rf "$fribidi_build"
     local fribidi_cross="$build_tmp/fribidi-cross-$abi.meson"
     write_meson_cross > "$fribidi_cross"
-    env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
+    local fribidi_log="$build_tmp/fribidi-$abi.log"
+    if ! env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
       --prefix="$prefix" --libdir=lib \
       --default-library=static --buildtype=release \
       --cross-file "$fribidi_cross" \
-      -Ddocs=false -Dtests=false >/dev/null
-    ninja -C "$fribidi_build" >/dev/null
-    meson install -C "$fribidi_build" >/dev/null
+      -Ddocs=false -Dtests=false >"$fribidi_log" 2>&1; then
+      cat "$fribidi_log" >&2
+      die "[$abi] fribidi meson setup failed (full log above)"
+    fi
+    if ! ninja -C "$fribidi_build" >"$fribidi_log" 2>&1; then
+      tail -n 60 "$fribidi_log" >&2
+      die "[$abi] fribidi ninja build failed (tail above)"
+    fi
+    meson install -C "$fribidi_build" >"$fribidi_log" 2>&1
     log "[$abi] fribidi installed"
   fi
 
