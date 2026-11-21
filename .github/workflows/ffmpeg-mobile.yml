@@ -99,6 +99,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Install build tools
+        run: |
+          # meson: dav1d/fribidi cross builds. cmake/ninja/pkg-config are
+          # preinstalled on macOS runners; nasm is not needed (x86 asm off).
+          if ! command -v meson >/dev/null 2>&1; then
+            brew install meson
+          fi
+
       - name: Restore FFmpeg source cache
         id: ffmpeg-sources
         uses: actions/cache/restore@v4

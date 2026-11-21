@@ -6,7 +6,7 @@ import {
 } from '@react-navigation/native';
 import type {BottomTabScreenProps} from '@react-navigation/bottom-tabs';
 import type {NativeStackScreenProps} from '@react-navigation/native-stack';
-import DocumentPicker, {isCancel} from 'react-native-document-picker';
+import {errorCodes, isErrorWithCode, pick, types} from '@react-native-documents/picker';
 
 import {AppText} from '../components/AppText';
 import {EmptyState} from '../components/EmptyState';
@@ -64,9 +64,13 @@ export function HomeScreen() {
   const pickAndRoute = useCallback(
     async (intent: PrimaryAction['id']) => {
       try {
-        const picked = await DocumentPicker.pickSingle({
-          type: [DocumentPicker.types.video, DocumentPicker.types.audio],
+        const [picked] = await pick({
+          type: [types.video, types.audio],
           mode: 'open',
+          // Durable, persistable source access: recovery must be able to
+          // reopen the file long after the picker closed (spec: file access).
+          requestLongTermAccess: true,
+          allowMultiSelection: false,
         });
         const source: MediaSource = {
           uri: picked.uri,
@@ -74,7 +78,10 @@ export function HomeScreen() {
         };
         navigation.navigate('Convert', {source, intent});
       } catch (error) {
-        if (isCancel(error)) {
+        if (
+          isErrorWithCode(error) &&
+          error.code === errorCodes.OPERATION_CANCELED
+        ) {
           return;
         }
         Alert.alert(

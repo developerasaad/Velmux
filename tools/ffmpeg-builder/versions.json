@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "notes": "Pinned upstream sources for the Velmux feature-selected FFmpeg backend. SHA-256 values were recorded at first fetch (TOFU) from the canonical URLs below; maintainers should cross-check against upstream signatures before signing releases. Some canonical hosts (code.videolan.org, zlib.net, savannah) employ anti-automation measures; use the listed mirrors in that case. libavdevice is intentionally excluded from the FFmpeg configuration.",
+  "notes": "Pinned upstream sources for the Velmux feature-selected FFmpeg backend. SHA-256 values were recorded at first fetch (TOFU) from the canonical URLs below; maintainers should cross-check against upstream signatures before signing releases. SourceForge and code.videolan.org block/serve-unstable content to cloud IPs (CI), so primary URLs use automation-friendly mirrors verified to carry pristine upstream bytes: deb.debian.org (pristine orig tarballs), savannah mirrors, GitHub per-commit/per-tag codeload archives (deterministic). libavdevice is intentionally excluded from the FFmpeg configuration.",
   "ffmpeg": {
     "version": "7.1.1",
     "url": "https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz",
@@ -39,12 +39,13 @@
     },
     "lame": {
       "version": "3.100",
-      "url": "https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz/download",
+      "url": "https://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz",
       "mirrors": [
         "https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz"
       ],
       "sha256": "ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e",
-      "file": "lame-3.100.tar.gz"
+      "file": "lame-3.100.tar.gz",
+      "note": "Debian pool carries the pristine upstream tarball (checksum-verified); SourceForge 403s cloud/CI networks."
     },
     "opus": {
       "version": "1.5.2",
@@ -94,21 +95,24 @@
     },
     "freetype": {
       "version": "2.13.3",
-      "url": "https://sourceforge.net/projects/freetype/files/freetype2/2.13.3/freetype-2.13.3.tar.xz/download",
+      "url": "https://mirror.netcologne.de/savannah/freetype/freetype-2.13.3.tar.xz",
       "mirrors": [
-        "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz"
+        "https://ftp.acc.umu.se/mirror/gnu.org/savannah/freetype/freetype-2.13.3.tar.xz",
+        "https://downloads.sourceforge.net/project/freetype/freetype2/2.13.3/freetype-2.13.3.tar.xz"
       ],
       "sha256": "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289",
-      "file": "freetype-2.13.3.tar.xz"
+      "file": "freetype-2.13.3.tar.xz",
+      "note": "Savannah mirrors carry pristine upstream tarballs (checksum-verified)."
     },
     "libpng": {
       "version": "1.6.46",
-      "url": "https://sourceforge.net/projects/libpng/files/libpng16/1.6.46/libpng-1.6.46.tar.gz/download",
+      "url": "https://codeload.github.com/pnggroup/libpng/tar.gz/v1.6.46",
       "mirrors": [
-        "https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.46.tar.gz"
+        "https://github.com/pnggroup/libpng/archive/v1.6.46.tar.gz"
       ],
-      "sha256": "c2b8ffb46f48331416e01f9e5c7169c7a2e08ad766b742742644e5fdf192e4a1",
-      "file": "libpng-1.6.46.tar.gz"
+      "sha256": "767b01936f9620d4ab4cdf6ec348f6526f861f825648b610b1d604167dc738d2",
+      "file": "libpng-1.6.46.tar.gz",
+      "note": "GitHub per-tag codeload archive (deterministic, verified). Equivalent source tree to the SourceForge release tarball; the cmake build path does not need the autotools-dist layout."
     },
     "harfbuzz": {
       "version": "10.2.0",

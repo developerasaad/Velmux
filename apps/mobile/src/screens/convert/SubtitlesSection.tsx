@@ -1,6 +1,6 @@
 import React, {useCallback} from 'react';
 import {Alert, StyleSheet, View} from 'react-native';
-import DocumentPicker, {isCancel} from 'react-native-document-picker';
+import {errorCodes, isErrorWithCode, pick, types} from '@react-native-documents/picker';
 
 import {AppText} from '../../components/AppText';
 import {Button} from '../../components/Button';
@@ -31,16 +31,21 @@ export function SubtitlesSection() {
 
   const pickExternalSubtitle = useCallback(async () => {
     try {
-      const picked = await DocumentPicker.pickSingle({
-        type: [DocumentPicker.types.allFiles],
+      const [picked] = await pick({
+        type: [types.allFiles],
         mode: 'open',
+        requestLongTermAccess: true,
+        allowMultiSelection: false,
       });
       setExternalSubtitle({
         uri: picked.uri,
         name: picked.name ?? 'Subtitle file',
       });
     } catch (error) {
-      if (isCancel(error)) {
+      if (
+        isErrorWithCode(error) &&
+        error.code === errorCodes.OPERATION_CANCELED
+      ) {
         return;
       }
       Alert.alert(
