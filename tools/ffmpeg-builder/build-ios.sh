@@ -502,7 +502,10 @@ ZPC
       svt_flag="--enable-libsvtav1"
     fi
     local configure_log="$build_tmp/ffmpeg-configure-$SLICE_TAG.log"
-    if ! (cd "$ffbuild" && "$ffmpeg_src/configure" \
+    # pkg-config must resolve every dependency from the slice prefix.
+    if ! (cd "$ffbuild" && PKG_CONFIG_PATH="$SLICE_PREFIX/lib/pkgconfig" \
+        PKG_CONFIG_LIBDIR="$SLICE_PREFIX/lib/pkgconfig" \
+        "$ffmpeg_src/configure" \
        --prefix="$SLICE_PREFIX" \
        --pkg-config-flags=--static \
        --enable-cross-compile \

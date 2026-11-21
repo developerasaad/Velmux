@@ -490,7 +490,10 @@ ZPC
       svt_flag="--enable-libsvtav1"
     fi
     local configure_log="$build_tmp/ffmpeg-configure-$abi.log"
-    if ! (cd "$ffbuild" && "$ffmpeg_src/configure" \
+    # pkg-config must resolve every dependency from the per-ABI prefix.
+    if ! (cd "$ffbuild" && PKG_CONFIG_PATH="$prefix/lib/pkgconfig" \
+        PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \
+        "$ffmpeg_src/configure" \
        --prefix="$prefix" \
        --pkg-config-flags=--static \
        --enable-cross-compile \
