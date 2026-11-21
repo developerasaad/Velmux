@@ -163,6 +163,8 @@ target_include_directories(velmux_backend_apple
 add_library(velmux_bridge
   bridge/cpp/velmux_bridge.cpp
 )
+target_include_directories(velmux_bridge
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/bridge/cpp>)
 target_link_libraries(velmux_bridge
   PUBLIC velmux::core velmux_backend_android velmux_backend_apple)
 target_compile_definitions(velmux_bridge PRIVATE

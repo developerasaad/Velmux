@@ -259,6 +259,7 @@ if [ ! -f "$HOST_PREFIX/lib/libass.a" ]; then
   log "building libass"
   (cd "$ass_src" && ./configure --prefix="$HOST_PREFIX" \
      --disable-shared --enable-static \
+     --disable-fontconfig --disable-require-system-font-provider \
      PKG_CONFIG_PATH="$HOST_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >/dev/null && \
    make -j"$JOBS" >/dev/null && make install >/dev/null)
   log "libass installed"
