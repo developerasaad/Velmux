@@ -289,7 +289,8 @@ build_one_slice() {
     local cross_file="$build_tmp/dav1d-cross.meson"
     write_meson_cross > "$cross_file"
     env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
-      --prefix="$SLICE_PREFIX" --default-library=static --buildtype=release \
+      --prefix="$SLICE_PREFIX" --libdir=lib \
+      --default-library=static --buildtype=release \
       --cross-file "$cross_file" \
       -Denable_tools=false -Denable_tests=false >/dev/null
     ninja -C "$dav1d_build" >/dev/null
@@ -396,7 +397,8 @@ build_one_slice() {
     local fribidi_cross="$build_tmp/fribidi-cross.meson"
     write_meson_cross > "$fribidi_cross"
     env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
-      --prefix="$SLICE_PREFIX" --default-library=static --buildtype=release \
+      --prefix="$SLICE_PREFIX" --libdir=lib \
+      --default-library=static --buildtype=release \
       --cross-file "$fribidi_cross" \
       -Ddocs=false -Dtests=false >/dev/null
     ninja -C "$fribidi_build" >/dev/null

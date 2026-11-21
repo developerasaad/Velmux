@@ -26,7 +26,10 @@ ensure_cmake_ninja
 ensure_meson
 
 if [ -f "$HOST_PREFIX/lib/pkgconfig/libavcodec.pc" ] && \
+   [ -f "$HOST_PREFIX/lib/libass.a" ] && \
    [ -f "$HOST_PREFIX/share/velmux/ffmpeg-capabilities.json" ]; then
+  # libass is the sentinel for the deepest dependency chain (freetype ->
+  # harfbuzz -> fribidi -> libass); its presence means the stack completed.
   log "host build up to date"
   exit 0
 fi
@@ -140,8 +143,12 @@ if [ ! -f "$HOST_PREFIX/lib/x86_64-linux-gnu/libdav1d.a" ] && [ ! -f "$HOST_PREF
   log "building dav1d"
   dav1d_build="$BUILD_TMP/dav1d"
   rm -rf "$dav1d_build"
+  # --libdir=lib: Debian meson defaults to lib/<triple> for NATIVE installs,
+  # which would hide the .pc files from consumers that only search
+  # $prefix/lib/pkgconfig (libass, FFmpeg configure). Force the flat layout.
   meson setup "$dav1d_build" "$dav1d_src" \
-    --prefix="$HOST_PREFIX" --default-library=static --buildtype=release \
+    --prefix="$HOST_PREFIX" --libdir=lib \
+    --default-library=static --buildtype=release \
     -Denable_tools=false -Denable_tests=false >/dev/null
   ninja -C "$dav1d_build" >/dev/null
   meson install -C "$dav1d_build" >/dev/null
@@ -223,7 +230,8 @@ if [ ! -f "$HOST_PREFIX/lib/libfribidi.a" ]; then
   fribidi_build="$BUILD_TMP/fribidi"
   rm -rf "$fribidi_build"
   meson setup "$fribidi_build" "$fribidi_src" \
-    --prefix="$HOST_PREFIX" --default-library=static --buildtype=release \
+    --prefix="$HOST_PREFIX" --libdir=lib \
+    --default-library=static --buildtype=release \
     -Ddocs=false -Dtests=false >/dev/null
   ninja -C "$fribidi_build" >/dev/null
   meson install -C "$fribidi_build" >/dev/null

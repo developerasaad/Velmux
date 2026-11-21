@@ -80,10 +80,22 @@ android {
     namespace "com.velmux.mobile"
     defaultConfig {
         applicationId "com.velmux.mobile"
-        minSdkVersion rootProject.ext.minSdkVersion
+        // Velmux product floor: Android 10 / API 29 (docs/DECISIONS.md D-003).
+        minSdkVersion 29
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        externalNativeBuild {
+            cmake {
+                arguments "-DVELMUX_FFMPEG_ANDROID_PREFIX=${project.findProperty('velmuxFFmpegPrefix') ?: ''}"
+            }
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
     }
     signingConfigs {
         debug {

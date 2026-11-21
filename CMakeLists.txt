@@ -15,6 +15,10 @@ option(VELMUX_BUILD_TESTS "Build test binaries (doctest)" ON)
 # fails, the FFmpeg backend is skipped with a warning (CI always provides
 # the prefix, so the backend and its integration tests always build there).
 set(VELMUX_FFMPEG_PREFIX "" CACHE PATH "Prefix of the Velmux-built FFmpeg")
+# Build the vendored SQLite amalgamation instead of finding a system SQLite.
+# Required for targets whose toolchain does not expose SQLite to native code
+# (Android NDK); the amalgamation is public domain (third_party/sqlite).
+option(VELMUX_EMBEDDED_SQLITE "Build the vendored SQLite amalgamation" OFF)
 
 # ---------------------------------------------------------------------------
 # Core library (no React Native dependency; reusable from any host)
@@ -45,8 +49,22 @@ target_compile_features(velmux_core PUBLIC cxx_std_20)
 find_package(Threads REQUIRED)
 target_link_libraries(velmux_core PUBLIC Threads::Threads)
 
-find_package(SQLite3 REQUIRED)
-target_link_libraries(velmux_core PUBLIC SQLite::SQLite3)
+if(VELMUX_EMBEDDED_SQLITE)
+  add_library(velmux_sqlite STATIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite/sqlite3.c)
+  target_include_directories(velmux_sqlite
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite>)
+  # Amalgamation build: no dynamic SQLite features needed by the core.
+  target_compile_definitions(velmux_sqlite PRIVATE
+    SQLITE_OMIT_LOAD_EXTENSION=1 SQLITE_THREADSAFE=1
+    SQLITE_DEFAULT_JOURNAL_MODE_LIMITED=1 SQLITE_ENABLE_FTS5=0)
+  target_link_libraries(velmux_core PUBLIC velmux_sqlite)
+  if(UNIX)
+    target_compile_options(velmux_sqlite PRIVATE -w)
+  endif()
+else()
+  find_package(SQLite3 REQUIRED)
+  target_link_libraries(velmux_core PUBLIC SQLite::SQLite3)
+endif()
 
 if(UNIX)
   target_compile_options(velmux_core PRIVATE -Wall -Wextra -Wpedantic)
@@ -142,18 +160,19 @@ target_include_directories(velmux_backend_apple
 # ---------------------------------------------------------------------------
 # Bridge (engine-side serialization + stable C facade for hosts)
 # ---------------------------------------------------------------------------
+add_library(velmux_bridge
+  bridge/cpp/velmux_bridge.cpp
+)
+target_link_libraries(velmux_bridge
+  PUBLIC velmux::core velmux_backend_android velmux_backend_apple)
+target_compile_definitions(velmux_bridge PRIVATE
+  VELMUX_WITH_ANDROID_BACKEND=1 VELMUX_WITH_APPLE_BACKEND=1)
 if(VELMUX_FFMPEG_FOUND)
-  add_library(velmux_bridge
-    bridge/cpp/velmux_bridge.cpp
-  )
-  target_link_libraries(velmux_bridge
-    PUBLIC velmux::core velmux::backend-ffmpeg velmux_backend_android
-           velmux_backend_apple)
-  target_compile_definitions(velmux_bridge PRIVATE
-    VELMUX_WITH_ANDROID_BACKEND=1 VELMUX_WITH_APPLE_BACKEND=1)
-  if(UNIX)
-    target_compile_options(velmux_bridge PRIVATE -Wall -Wextra)
-  endif()
+  target_link_libraries(velmux_bridge PUBLIC velmux::backend-ffmpeg)
+  target_compile_definitions(velmux_bridge PRIVATE VELMUX_WITH_FFMPEG_BACKEND=1)
+endif()
+if(UNIX)
+  target_compile_options(velmux_bridge PRIVATE -Wall -Wextra)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -164,6 +183,7 @@ if(VELMUX_BUILD_TESTS)
   add_subdirectory(core/tests)
   if(VELMUX_FFMPEG_FOUND)
     add_subdirectory(backends/ffmpeg/tests)
+    add_subdirectory(bridge/tests)
   else()
     message(STATUS "FFmpeg backend not built; its integration tests are skipped")
   endif()

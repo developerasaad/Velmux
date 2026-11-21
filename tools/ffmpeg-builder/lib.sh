@@ -162,7 +162,9 @@ extract_tarball() {
   tmp_marker="$(mktemp "$SRC_DIR/.extractXXXXXX")"
   tar -xf "$tarball" -C "$dest_root"
   local top
-  top="$(tar -tf "$tarball" | head -1 | cut -d/ -f1)"
+  # First entry name; stderr silenced because `head -1` closes the pipe and
+  # tar reports a harmless "write error" on some versions.
+  top="$(tar -tf "$tarball" 2>/dev/null | head -1 | cut -d/ -f1)"
   local dir="$dest_root/$top"
   [ -d "$dir" ] || die "extraction of $tarball produced unexpected layout"
   echo "$dir" > "$stamp"

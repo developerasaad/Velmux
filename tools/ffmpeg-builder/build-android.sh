@@ -285,7 +285,8 @@ build_one_abi() {
     # meson: env CC/CXX describe the NATIVE compiler; the cross file owns
     # the target, so the exports must not leak into setup.
     env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
-      --prefix="$prefix" --default-library=static --buildtype=release \
+      --prefix="$prefix" --libdir=lib \
+      --default-library=static --buildtype=release \
       --cross-file "$cross_file" \
       -Denable_tools=false -Denable_tests=false "${dav1d_asm_args[@]}" >/dev/null
     ninja -C "$dav1d_build" >/dev/null
@@ -385,7 +386,8 @@ build_one_abi() {
     local fribidi_cross="$build_tmp/fribidi-cross-$abi.meson"
     write_meson_cross > "$fribidi_cross"
     env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
-      --prefix="$prefix" --default-library=static --buildtype=release \
+      --prefix="$prefix" --libdir=lib \
+      --default-library=static --buildtype=release \
       --cross-file "$fribidi_cross" \
       -Ddocs=false -Dtests=false >/dev/null
     ninja -C "$fribidi_build" >/dev/null

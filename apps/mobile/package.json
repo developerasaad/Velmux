@@ -1,5 +1,13 @@
 {
   "name": "com.velmux.mobile",
+  "codegenConfig": {
+    "name": "RNVelmuxSpecs",
+    "type": "modules",
+    "jsSrcsDir": "src/native",
+    "android": {
+      "javaPackageName": "com.velmux.mobile"
+    }
+  },
   "version": "0.0.1",
   "private": true,
   "scripts": {

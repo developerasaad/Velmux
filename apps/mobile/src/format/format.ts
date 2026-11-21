@@ -3,24 +3,30 @@
  * by the UI (see AppText `numeric`), these functions only produce strings.
  */
 
+// Decimal (SI) units, matching how Android and iOS report storage and how
+// target sizes are parsed; a "MB" never means two different things in the UI.
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const;
+const BYTE_UNIT_STEP = 1000;
 
 /** Formats a byte count for display; null/unknown renders as an em dash. */
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) {
     return '—';
   }
-  if (bytes < 1024) {
+  if (bytes < BYTE_UNIT_STEP) {
     return `${Math.round(bytes)} B`;
   }
   let value = bytes;
   let unitIndex = 0;
-  while (value >= 1024 && unitIndex < BYTE_UNITS.length - 1) {
-    value /= 1024;
+  while (value >= BYTE_UNIT_STEP && unitIndex < BYTE_UNITS.length - 1) {
+    value /= BYTE_UNIT_STEP;
     unitIndex += 1;
   }
   const decimals = value >= 100 ? 0 : 1;
-  return `${value.toFixed(decimals)} ${BYTE_UNITS[unitIndex]}`;
+  // Drop a trailing ".0": "2 KB" reads better than "2.0 KB" and matches the
+  // test-expressed intent; genuine fractions keep one decimal.
+  const text = value.toFixed(decimals).replace(/\.0$/, '');
+  return `${text} ${BYTE_UNITS[unitIndex]}`;
 }
 
 /** Formats a duration in seconds as h:mm:ss / m:ss. */
