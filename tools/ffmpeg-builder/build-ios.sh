@@ -287,7 +287,7 @@ build_one_slice() {
     # which vpx's android branch adds for *clang AS; the darwin branch sets
     # its own flags).
     local vpx_log="$build_tmp/vpx-configure-$SLICE_TAG.log"
-    if ! (cd "$vpx_src" && AS="$CC" ./configure \
+    if ! (cd "$vpx_src" && AS="$CC" LD="$CC" ./configure \
        --target="$SLICE_VPX_TARGET" \
        --prefix="$SLICE_PREFIX" \
        --disable-shared --enable-static --enable-pic \

@@ -273,7 +273,7 @@ build_one_abi() {
     sed -i.bak 's/^          check_add_ldflags -static$/          : velmux: no -static with modern NDK/' \
       "$vpx_src/build/make/configure.sh"
     local vpx_log="$build_tmp/vpx-configure-$abi.log"
-    if ! (cd "$vpx_src" && AS="$CC" ./configure \
+    if ! (cd "$vpx_src" && AS="$CC" LD="$CC" ./configure \
        --target="$VPX_TARGET" \
        --prefix="$prefix" \
        --disable-shared --enable-static --enable-pic \
