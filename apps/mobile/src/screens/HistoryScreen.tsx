@@ -1,12 +1,5 @@
 import React, {useCallback} from 'react';
-import {
-  Alert,
-  FlatList,
-  RefreshControl,
-  StyleSheet,
-  View,
-  ViewStyle,
-} from 'react-native';
+import {Alert, FlatList, RefreshControl, StyleSheet, View} from 'react-native';
 import type {ListRenderItemInfo} from 'react-native';
 import {
   useNavigation,
@@ -138,7 +131,7 @@ export function HistoryScreen() {
           <RefreshControl
             refreshing={refreshing}
             onRefresh={() => {
-              void refresh();
+              refresh();
             }}
             tintColor={theme.colors.textSecondary}
             colors={[theme.colors.accent]}
@@ -161,24 +154,14 @@ export function HistoryScreen() {
                 available for jobs started in this session.
               </AppText>
             </View>
-          ) : null
+          ) : undefined
         }
       />
     </Screen>
   );
 }
 
-interface HistoryScreenStyles {
-  row: ViewStyle;
-  sizeRow: ViewStyle;
-  actions: ViewStyle;
-  listContent: ViewStyle;
-  emptyContent: ViewStyle;
-  emptyWrap: ViewStyle;
-  footerNote: ViewStyle;
-}
-
-const styles = StyleSheet.create<HistoryScreenStyles>({
+const styles = StyleSheet.create({
   row: {
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,

@@ -1,12 +1,5 @@
 import React from 'react';
-import {
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  StyleSheet,
-  View,
-  ViewStyle,
-} from 'react-native';
+import {KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View} from 'react-native';
 import {SafeAreaView} from 'react-native-safe-area-context';
 
 import {AppText} from './AppText';
@@ -76,15 +69,7 @@ export function Screen({
   );
 }
 
-interface ScreenStyles {
-  safeArea: ViewStyle;
-  flex: ViewStyle;
-  header: ViewStyle;
-  scrollContent: ViewStyle;
-  footer: ViewStyle;
-}
-
-const styles = StyleSheet.create<ScreenStyles>({
+const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
   },

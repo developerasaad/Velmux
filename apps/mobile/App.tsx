@@ -16,7 +16,7 @@ function AppContent() {
   const init = useJobsStore(state => state.init);
 
   useEffect(() => {
-    void init();
+    init();
   }, [init]);
 
   return (

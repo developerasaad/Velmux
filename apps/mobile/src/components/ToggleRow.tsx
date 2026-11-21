@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, Switch, View, ViewStyle} from 'react-native';
+import {StyleSheet, Switch, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -42,12 +42,7 @@ export function ToggleRow({
   );
 }
 
-interface ToggleRowStyles {
-  row: ViewStyle;
-  label: ViewStyle;
-}
-
-const styles = StyleSheet.create<ToggleRowStyles>({
+const styles = StyleSheet.create({
   row: {
     minHeight: 44,
     flexDirection: 'row',

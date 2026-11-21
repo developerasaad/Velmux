@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {OptionChips} from '../../components/OptionChips';
@@ -95,12 +95,7 @@ export function OutputSection() {
   );
 }
 
-interface OutputSectionStyles {
-  videoToggle: ViewStyle;
-  customResolution: ViewStyle;
-}
-
-const styles = StyleSheet.create<OutputSectionStyles>({
+const styles = StyleSheet.create({
   videoToggle: {
     marginTop: 4,
     gap: 4,

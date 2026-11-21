@@ -1,5 +1,5 @@
 import React from 'react';
-import {Pressable, StyleSheet, ViewStyle} from 'react-native';
+import {Pressable, StyleSheet} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -91,14 +91,7 @@ export function StateChip({label, tone}: StateChipProps) {
   );
 }
 
-interface ChipStyles {
-  chip: ViewStyle;
-  disabled: ViewStyle;
-  pressed: ViewStyle;
-  stateChip: ViewStyle;
-}
-
-const styles = StyleSheet.create<ChipStyles>({
+const styles = StyleSheet.create({
   chip: {
     minHeight: 44,
     paddingHorizontal: 14,

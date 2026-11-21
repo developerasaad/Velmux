@@ -1,13 +1,5 @@
 import React, {useCallback} from 'react';
-import {
-  Alert,
-  Pressable,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  View,
-  ViewStyle,
-} from 'react-native';
+import {Alert, Pressable, RefreshControl, ScrollView, StyleSheet, View} from 'react-native';
 import {
   useNavigation,
   type CompositeScreenProps,
@@ -104,7 +96,7 @@ export function HomeScreen() {
           <RefreshControl
             refreshing={refreshing}
             onRefresh={() => {
-              void refresh();
+              refresh();
             }}
             tintColor={theme.colors.textSecondary}
             colors={[theme.colors.accent]}
@@ -124,7 +116,7 @@ export function HomeScreen() {
               accessibilityRole="button"
               accessibilityLabel={action.title}
               onPress={() => {
-                void pickAndRoute(action.id);
+                pickAndRoute(action.id);
               }}
               style={({pressed}) => [
                 styles.actionTile,
@@ -212,22 +204,7 @@ export function HomeScreen() {
   );
 }
 
-interface HomeStyles {
-  flex: ViewStyle;
-  content: ViewStyle;
-  wordmarkRow: ViewStyle;
-  actionGrid: ViewStyle;
-  actionTile: ViewStyle;
-  sectionHeader: ViewStyle;
-  stack: ViewStyle;
-  block: ViewStyle;
-  resultRow: ViewStyle;
-  resultName: ViewStyle;
-  seeAll: ViewStyle;
-  pressed: ViewStyle;
-}
-
-const styles = StyleSheet.create<HomeStyles>({
+const styles = StyleSheet.create({
   flex: {
     flex: 1,
   },

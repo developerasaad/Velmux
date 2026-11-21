@@ -140,7 +140,7 @@ export function subscribeToJobEvents(
     return () => {};
   }
 
-  void module.addListener(JOB_EVENT_NAME);
+  module.addListener(JOB_EVENT_NAME);
   const subscription = DeviceEventEmitter.addListener(
     JOB_EVENT_NAME,
     (raw: unknown) => {
@@ -152,7 +152,7 @@ export function subscribeToJobEvents(
 
   return () => {
     subscription.remove();
-    void module.removeListeners(1);
+    module.removeListeners(1);
   };
 }
 

@@ -1,5 +1,5 @@
 import React, {useState} from 'react';
-import {Pressable, StyleSheet, View, ViewStyle} from 'react-native';
+import {Pressable, StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {Button} from '../../components/Button';
@@ -7,7 +7,6 @@ import {OptionChips} from '../../components/OptionChips';
 import {Section} from '../../components/Section';
 import {Stepper} from '../../components/Stepper';
 import {
-  AUDIO_BITRATES_KBPS,
   AUDIO_ENCODERS,
   BIT_DEPTHS,
   CHANNEL_OPTIONS,
@@ -335,7 +334,7 @@ export function AdvancedSection() {
             <AdvancedLabel>Subtitle timing offset</AdvancedLabel>
             <Stepper
               value={draft.subtitles.timingOffsetMs}
-              onChange={setTimingOffsetMs}
+              onChange={value => setTimingOffsetMs(value ?? 0)}
               step={100}
               min={-10_000}
               max={10_000}
@@ -374,16 +373,7 @@ export function AdvancedSection() {
   );
 }
 
-interface AdvancedSectionStyles {
-  toggle: ViewStyle;
-  stack: ViewStyle;
-  field: ViewStyle;
-  resetRow: ViewStyle;
-  footnote: ViewStyle;
-  pressed: ViewStyle;
-}
-
-const styles = StyleSheet.create<AdvancedSectionStyles>({
+const styles = StyleSheet.create({
   toggle: {
     minHeight: 44,
     justifyContent: 'center',

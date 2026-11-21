@@ -1,5 +1,5 @@
 import React, {useEffect} from 'react';
-import {ScrollView, StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from '../components/AppText';
 import {Banner} from '../components/Banner';
@@ -16,7 +16,6 @@ import type {
   ProcessingPreference,
   ThemeMode,
 } from '../state/settingsStore';
-import {useTheme} from '../theme';
 
 const THEME_OPTIONS: ReadonlyArray<{label: string; value: ThemeMode}> = [
   {label: 'System', value: 'system'},
@@ -46,8 +45,6 @@ const CONTAINER_OPTIONS = CONTAINERS.map(container => ({
 }));
 
 export function SettingsScreen() {
-  const theme = useTheme();
-
   const themeMode = useSettingsStore(state => state.themeMode);
   const setThemeMode = useSettingsStore(state => state.setThemeMode);
   const defaultGoal = useSettingsStore(state => state.defaultGoal);
@@ -96,7 +93,7 @@ export function SettingsScreen() {
   const discoverBackends = useJobsStore(state => state.discoverBackends);
 
   useEffect(() => {
-    void discoverBackends();
+    discoverBackends();
   }, [discoverBackends]);
 
   return (
@@ -225,7 +222,7 @@ export function SettingsScreen() {
               label="Re-check engine"
               variant="secondary"
               onPress={() => {
-                void discoverBackends();
+                discoverBackends();
               }}
             />
           </View>
@@ -235,15 +232,7 @@ export function SettingsScreen() {
   );
 }
 
-interface SettingsScreenStyles {
-  diagnosticsCard: ViewStyle;
-  diagnosticRow: ViewStyle;
-  bannerWrap: ViewStyle;
-  backendStack: ViewStyle;
-  refreshRow: ViewStyle;
-}
-
-const styles = StyleSheet.create<SettingsScreenStyles>({
+const styles = StyleSheet.create({
   diagnosticsCard: {
     gap: 8,
   },

@@ -1,5 +1,5 @@
 import React from 'react';
-import {Pressable, StyleSheet, View, ViewStyle} from 'react-native';
+import {Pressable, StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -50,14 +50,7 @@ export function Banner({message, tone = 'warning', onPress}: BannerProps) {
   );
 }
 
-interface BannerStyles {
-  container: ViewStyle;
-  mark: ViewStyle;
-  message: ViewStyle;
-  pressed: ViewStyle;
-}
-
-const styles = StyleSheet.create<BannerStyles>({
+const styles = StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',

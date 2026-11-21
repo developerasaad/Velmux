@@ -1,0 +1,137 @@
+cmake_minimum_required(VERSION 3.21)
+project(velmux LANGUAGES C CXX VERSION 0.1.0)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+option(VELMUX_BUILD_TESTS "Build test binaries (doctest)" ON)
+# FFmpeg backend prefix produced by tools/ffmpeg-builder/build-host.sh.
+# When empty, the build looks for FFmpeg via pkg-config; when that also
+# fails, the FFmpeg backend is skipped with a warning (CI always provides
+# the prefix, so the backend and its integration tests always build there).
+set(VELMUX_FFMPEG_PREFIX "" CACHE PATH "Prefix of the Velmux-built FFmpeg")
+
+# ---------------------------------------------------------------------------
+# Core library (no React Native dependency; reusable from any host)
+# ---------------------------------------------------------------------------
+add_library(velmux_core
+  core/src/types.cpp
+  core/src/feature_registry.cpp
+  core/src/capability_registry.cpp
+  core/src/compression.cpp
+  core/src/planner.cpp
+  core/src/events.cpp
+  core/src/job_store.cpp
+  core/src/recovery.cpp
+  core/src/telemetry.cpp
+  core/src/validation.cpp
+  core/src/scheduler.cpp
+  core/src/job_manager.cpp
+  core/src/engine.cpp
+)
+add_library(velmux::core ALIAS velmux_core)
+target_include_directories(velmux_core
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/contracts/include>
+)
+target_compile_features(velmux_core PUBLIC cxx_std_20)
+
+find_package(Threads REQUIRED)
+target_link_libraries(velmux_core PUBLIC Threads::Threads)
+
+find_package(SQLite3 REQUIRED)
+target_link_libraries(velmux_core PUBLIC SQLite::SQLite3)
+
+if(UNIX)
+  target_compile_options(velmux_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------------------
+# FFmpeg backend (libav* libraries directly; no CLI subprocess architecture)
+# ---------------------------------------------------------------------------
+set(VELMUX_FFMPEG_FOUND FALSE)
+set(VELMUX_FFMPEG_PC_PATH "")
+if(VELMUX_FFMPEG_PREFIX)
+  if(EXISTS "${VELMUX_FFMPEG_PREFIX}/lib/pkgconfig/libavcodec.pc")
+    set(VELMUX_FFMPEG_PC_PATH "${VELMUX_FFMPEG_PREFIX}/lib/pkgconfig")
+    set(VELMUX_FFMPEG_FOUND TRUE)
+    message(STATUS "Velmux FFmpeg prefix: ${VELMUX_FFMPEG_PREFIX}")
+  else()
+    message(WARNING
+      "VELMUX_FFMPEG_PREFIX given but no pkg-config files found there; "
+      "FFmpeg backend disabled")
+  endif()
+else()
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    execute_process(
+      COMMAND ${PKG_CONFIG_EXECUTABLE} --exists libavcodec libavformat
+      RESULT_VARIABLE _system_ffmpeg_ok)
+    if(_system_ffmpeg_ok EQUAL 0)
+      set(VELMUX_FFMPEG_FOUND TRUE)
+      message(STATUS "FFmpeg found via system pkg-config")
+    endif()
+  endif()
+endif()
+
+if(VELMUX_FFMPEG_FOUND)
+  # Resolve flags once at configure time. Static linking of the Velmux-built
+  # FFmpeg needs --static so the pinned external codec libs come along.
+  set(_pc_env "PKG_CONFIG_PATH=${VELMUX_FFMPEG_PC_PATH}:$ENV{PKG_CONFIG_PATH}")
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env ${_pc_env}
+            ${PKG_CONFIG_EXECUTABLE} --static --cflags
+            libavcodec libavformat libavutil libswscale libswresample
+    OUTPUT_VARIABLE VELMUX_FFMPEG_CFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _cflags_ok)
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env ${_pc_env}
+            ${PKG_CONFIG_EXECUTABLE} --static --libs
+            libavcodec libavformat libavutil libswscale libswresample
+    OUTPUT_VARIABLE VELMUX_FFMPEG_LIBS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _libs_ok)
+  if(NOT _cflags_ok EQUAL 0 OR NOT _libs_ok EQUAL 0)
+    message(WARNING "pkg-config query for FFmpeg failed; backend disabled")
+    set(VELMUX_FFMPEG_FOUND FALSE)
+  else()
+    add_library(velmux_backend_ffmpeg
+      backends/ffmpeg/src/codec_mapping.cpp
+      backends/ffmpeg/src/ffmpeg_backend.cpp
+    )
+    add_library(velmux::backend-ffmpeg ALIAS velmux_backend_ffmpeg)
+    target_include_directories(velmux_backend_ffmpeg
+      PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/ffmpeg/include>)
+    target_link_libraries(velmux_backend_ffmpeg PUBLIC velmux::core)
+    separate_arguments(VELMUX_FFMPEG_CFLAGS_SPLIT NATIVE_COMMAND
+                       "${VELMUX_FFMPEG_CFLAGS}")
+    separate_arguments(VELMUX_FFMPEG_LIBS_SPLIT NATIVE_COMMAND
+                       "${VELMUX_FFMPEG_LIBS}")
+    target_compile_options(velmux_backend_ffmpeg PRIVATE
+                           ${VELMUX_FFMPEG_CFLAGS_SPLIT})
+    target_link_options(velmux_backend_ffmpeg PUBLIC ${VELMUX_FFMPEG_LIBS_SPLIT})
+    if(UNIX)
+      target_compile_options(velmux_backend_ffmpeg PRIVATE -Wall -Wextra)
+    endif()
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(VELMUX_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(core/tests)
+  if(VELMUX_FFMPEG_FOUND)
+    add_subdirectory(backends/ffmpeg/tests)
+  else()
+    message(STATUS "FFmpeg backend not built; its integration tests are skipped")
+  endif()
+endif()

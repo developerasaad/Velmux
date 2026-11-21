@@ -1,7 +1,9 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {Alert, StyleSheet, View, ViewStyle} from 'react-native';
+import {Alert, StyleSheet, View} from 'react-native';
 import {
   useNavigation,
+} from '@react-navigation/native';
+import {
   type NativeStackScreenProps,
 } from '@react-navigation/native-stack';
 
@@ -89,13 +91,13 @@ export function ConvertScreen({route}: ConvertScreenProps) {
   }, [source]);
 
   useEffect(() => {
-    void runInspect();
+    runInspect();
   }, [runInspect]);
 
   // Immediate re-plan, used by the estimate retry control.
   const runPlan = useCallback(async () => {
-    const request = computeRequest(useConvertStore.getState().draft);
-    if (request === null) {
+    const computed = computeRequest(useConvertStore.getState().draft);
+    if (computed === null) {
       setPlanState({status: 'idle'});
       return;
     }
@@ -110,7 +112,7 @@ export function ConvertScreen({route}: ConvertScreenProps) {
     planRun.current = run;
     setPlanState({status: 'estimating'});
     try {
-      const plan = await engineClient.plan(request);
+      const plan = await engineClient.plan(computed);
       if (planRun.current === run) {
         setPlanState({status: 'ready', ...plan});
       }
@@ -131,8 +133,8 @@ export function ConvertScreen({route}: ConvertScreenProps) {
 
   // Debounced re-plan whenever the request changes.
   useEffect(() => {
-    const request = computeRequest(draft);
-    if (request === null) {
+    const computed = computeRequest(draft);
+    if (computed === null) {
       setPlanState({status: 'idle'});
       return;
     }
@@ -149,9 +151,9 @@ export function ConvertScreen({route}: ConvertScreenProps) {
     setPlanState({status: 'estimating'});
 
     const timer = setTimeout(() => {
-      void (async () => {
+      (async () => {
         try {
-          const plan = await engineClient.plan(request);
+          const plan = await engineClient.plan(computed);
           if (planRun.current === run) {
             setPlanState({status: 'ready', ...plan});
           }
@@ -181,13 +183,13 @@ export function ConvertScreen({route}: ConvertScreenProps) {
   const canStart = bridgeAvailable && draft.source !== null && !planInfeasible;
 
   const handleStart = useCallback(async () => {
-    const request = computeRequest(useConvertStore.getState().draft);
-    if (request === null) {
+    const computed = computeRequest(useConvertStore.getState().draft);
+    if (computed === null) {
       return;
     }
     setStarting(true);
     try {
-      await startJob(request);
+      await startJob(computed);
       navigation.goBack();
     } catch (error) {
       setStarting(false);
@@ -219,7 +221,7 @@ export function ConvertScreen({route}: ConvertScreenProps) {
             loading={starting}
             disabled={!canStart}
             onPress={() => {
-              void handleStart();
+              handleStart();
             }}
           />
           {startFootnote !== undefined && (
@@ -233,25 +235,22 @@ export function ConvertScreen({route}: ConvertScreenProps) {
         sourceName={source.displayName}
         inspectState={inspectState}
         onRetry={() => {
-          void runInspect();
+          runInspect();
         }}
       />
       <GoalSection />
       <OutputSection />
       <AudioSection />
       <SubtitlesSection />
-      <EstimateCard planState={planState} onRetry={() => void runPlan()} />
+      <EstimateCard planState={planState} onRetry={() => {
+        runPlan();
+      }} />
       <AdvancedSection />
     </Screen>
   );
 }
 
-interface ConvertScreenStyles {
-  footer: ViewStyle;
-  footnote: ViewStyle;
-}
-
-const styles = StyleSheet.create<ConvertScreenStyles>({
+const styles = StyleSheet.create({
   footer: {
     gap: 8,
   },

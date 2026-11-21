@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, TextStyle, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {Button} from './Button';
@@ -38,13 +38,7 @@ export function ErrorState({
   );
 }
 
-interface ErrorStateStyles {
-  container: ViewStyle;
-  message: TextStyle;
-  retry: ViewStyle;
-}
-
-const styles = StyleSheet.create<ErrorStateStyles>({
+const styles = StyleSheet.create({
   container: {
     borderRadius: 12,
     borderWidth: 1,

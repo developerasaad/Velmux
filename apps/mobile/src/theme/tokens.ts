@@ -94,7 +94,7 @@ export const type = {
 } as const;
 
 /** Numeric text (sizes, rates, percentages) uses tabular figures. */
-export const numericFontVariant: ReadonlyArray<string> = ['tabular-nums'];
+export const numericFontVariant = ['tabular-nums'] as const;
 
 /** Motion: short, restrained, purposeful. */
 export const motion = {

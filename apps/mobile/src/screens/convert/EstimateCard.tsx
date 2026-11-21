@@ -1,5 +1,5 @@
 import React from 'react';
-import {ActivityIndicator, StyleSheet, View, ViewStyle} from 'react-native';
+import {ActivityIndicator, StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {ErrorState} from '../../components/ErrorState';
@@ -100,13 +100,7 @@ export function EstimateCard({planState, onRetry}: EstimateCardProps) {
   );
 }
 
-interface EstimateCardStyles {
-  loadingRow: ViewStyle;
-  stack: ViewStyle;
-  sizeRow: ViewStyle;
-}
-
-const styles = StyleSheet.create<EstimateCardStyles>({
+const styles = StyleSheet.create({
   loadingRow: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {OptionChips} from '../../components/OptionChips';
@@ -113,12 +113,7 @@ export function AudioSection() {
   );
 }
 
-interface AudioSectionStyles {
-  toggleBlock: ViewStyle;
-  controls: ViewStyle;
-}
-
-const styles = StyleSheet.create<AudioSectionStyles>({
+const styles = StyleSheet.create({
   toggleBlock: {
     gap: 4,
   },

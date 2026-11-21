@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, TextStyle, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -27,12 +27,7 @@ export function EmptyState({title, message}: EmptyStateProps) {
   );
 }
 
-interface EmptyStateStyles {
-  container: ViewStyle;
-  message: TextStyle;
-}
-
-const styles = StyleSheet.create<EmptyStateStyles>({
+const styles = StyleSheet.create({
   container: {
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,

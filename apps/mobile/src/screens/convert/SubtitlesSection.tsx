@@ -1,5 +1,5 @@
 import React, {useCallback} from 'react';
-import {Alert, StyleSheet, View, ViewStyle} from 'react-native';
+import {Alert, StyleSheet, View} from 'react-native';
 import DocumentPicker, {isCancel} from 'react-native-document-picker';
 
 import {AppText} from '../../components/AppText';
@@ -66,7 +66,7 @@ export function SubtitlesSection() {
         </AppText>
         <Stepper
           value={draft.subtitles.timingOffsetMs}
-          onChange={setTimingOffsetMs}
+          onChange={value => setTimingOffsetMs(value ?? 0)}
           step={100}
           min={-10_000}
           max={10_000}
@@ -83,7 +83,7 @@ export function SubtitlesSection() {
             label="Add subtitle file"
             variant="secondary"
             onPress={() => {
-              void pickExternalSubtitle();
+              pickExternalSubtitle();
             }}
           />
         ) : (
@@ -107,13 +107,7 @@ export function SubtitlesSection() {
   );
 }
 
-interface SubtitlesSectionStyles {
-  block: ViewStyle;
-  externalRow: ViewStyle;
-  externalName: ViewStyle;
-}
-
-const styles = StyleSheet.create<SubtitlesSectionStyles>({
+const styles = StyleSheet.create({
   block: {
     gap: 8,
     marginTop: 4,

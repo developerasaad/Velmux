@@ -1,10 +1,5 @@
 import React from 'react';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  ViewStyle,
-} from 'react-native';
+import {ActivityIndicator, Pressable, StyleSheet} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -109,14 +104,7 @@ export function Button({
   );
 }
 
-interface ButtonStyles {
-  base: ViewStyle;
-  bordered: ViewStyle;
-  inactive: ViewStyle;
-  flatPressed: ViewStyle;
-}
-
-const styles = StyleSheet.create<ButtonStyles>({
+const styles = StyleSheet.create({
   base: {
     minHeight: 44,
     paddingHorizontal: 16,

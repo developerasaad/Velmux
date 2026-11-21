@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {ProgressBar} from './ProgressBar';
@@ -76,18 +76,7 @@ export function JobRow({job, compact = false, actions}: JobRowProps) {
   );
 }
 
-interface JobRowStyles {
-  container: ViewStyle;
-  compact: ViewStyle;
-  titleRow: ViewStyle;
-  name: ViewStyle;
-  progressRow: ViewStyle;
-  percent: ViewStyle;
-  error: ViewStyle;
-  actions: ViewStyle;
-}
-
-const styles = StyleSheet.create<JobRowStyles>({
+const styles = StyleSheet.create({
   container: {
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,

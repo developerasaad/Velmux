@@ -101,7 +101,7 @@ function scheduleRefresh() {
   refreshScheduled = true;
   setTimeout(() => {
     refreshScheduled = false;
-    void useJobsStore.getState().refresh();
+    useJobsStore.getState().refresh();
   }, EVENT_FLUSH_INTERVAL_MS);
 }
 

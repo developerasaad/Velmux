@@ -1,5 +1,5 @@
 import React, {useState} from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 import Animated, {
   useAnimatedStyle,
   withTiming,
@@ -58,12 +58,7 @@ export function ProgressBar({progress, height = 6}: ProgressBarProps) {
   );
 }
 
-interface ProgressBarStyles {
-  track: ViewStyle;
-  fill: ViewStyle;
-}
-
-const styles = StyleSheet.create<ProgressBarStyles>({
+const styles = StyleSheet.create({
   track: {
     flex: 1,
     backgroundColor: 'rgba(128,128,128,0.22)',

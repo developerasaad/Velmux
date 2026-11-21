@@ -1,5 +1,5 @@
 import React from 'react';
-import {Pressable, StyleSheet, View, ViewStyle} from 'react-native';
+import {Pressable, StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -127,17 +127,7 @@ function round(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-interface StepperStyles {
-  container: ViewStyle;
-  button: ViewStyle;
-  buttonMinus: ViewStyle;
-  buttonPlus: ViewStyle;
-  value: ViewStyle;
-  disabled: ViewStyle;
-  pressed: ViewStyle;
-}
-
-const styles = StyleSheet.create<StepperStyles>({
+const styles = StyleSheet.create({
   container: {
     flexDirection: 'row',
     alignItems: 'center',

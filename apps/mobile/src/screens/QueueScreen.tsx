@@ -1,12 +1,5 @@
 import React, {useCallback} from 'react';
-import {
-  Alert,
-  FlatList,
-  RefreshControl,
-  StyleSheet,
-  View,
-  ViewStyle,
-} from 'react-native';
+import {Alert, FlatList, RefreshControl, StyleSheet, View} from 'react-native';
 import type {ListRenderItemInfo} from 'react-native';
 
 import {AppText} from '../components/AppText';
@@ -44,7 +37,7 @@ export function QueueScreen() {
             text: 'Cancel job',
             style: 'destructive',
             onPress: () => {
-              void cancelJob(job.id);
+              cancelJob(job.id);
             },
           },
         ],
@@ -79,7 +72,7 @@ export function QueueScreen() {
                   label="Pause"
                   variant="secondary"
                   onPress={() => {
-                    void pauseJob(item.id);
+                    pauseJob(item.id);
                   }}
                 />
               )}
@@ -88,7 +81,7 @@ export function QueueScreen() {
                   label="Resume"
                   variant="secondary"
                   onPress={() => {
-                    void resumeJob(item.id);
+                    resumeJob(item.id);
                   }}
                 />
               )}
@@ -99,7 +92,7 @@ export function QueueScreen() {
                     variant="secondary"
                     disabled={!hasRequest}
                     onPress={() => {
-                      void retryJob(item.id);
+                      retryJob(item.id);
                     }}
                   />
                   {!hasRequest && (
@@ -130,7 +123,7 @@ export function QueueScreen() {
             message={refreshError}
             retryLabel="Retry"
             onRetry={() => {
-              void refresh();
+              refresh();
             }}
           />
         </View>
@@ -146,7 +139,7 @@ export function QueueScreen() {
           <RefreshControl
             refreshing={refreshing}
             onRefresh={() => {
-              void refresh();
+              refresh();
             }}
             tintColor={theme.colors.textSecondary}
             colors={[theme.colors.accent]}
@@ -165,16 +158,7 @@ export function QueueScreen() {
   );
 }
 
-interface QueueScreenStyles {
-  errorWrap: ViewStyle;
-  listContent: ViewStyle;
-  emptyContent: ViewStyle;
-  emptyWrap: ViewStyle;
-  actions: ViewStyle;
-  retryBlock: ViewStyle;
-}
-
-const styles = StyleSheet.create<QueueScreenStyles>({
+const styles = StyleSheet.create({
   errorWrap: {
     paddingHorizontal: 16,
     paddingBottom: 12,

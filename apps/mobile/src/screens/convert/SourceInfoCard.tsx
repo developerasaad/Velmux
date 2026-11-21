@@ -1,5 +1,5 @@
 import React from 'react';
-import {ActivityIndicator, StyleSheet, View, ViewStyle} from 'react-native';
+import {ActivityIndicator, StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {ErrorState} from '../../components/ErrorState';
@@ -135,13 +135,7 @@ export function SourceInfoCard({
   );
 }
 
-interface SourceInfoCardStyles {
-  loadingRow: ViewStyle;
-  infoStack: ViewStyle;
-  summaryRow: ViewStyle;
-}
-
-const styles = StyleSheet.create<SourceInfoCardStyles>({
+const styles = StyleSheet.create({
   loadingRow: {
     flexDirection: 'row',
     alignItems: 'center',

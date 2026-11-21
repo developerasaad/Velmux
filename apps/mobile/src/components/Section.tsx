@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -63,16 +63,7 @@ export function FieldRow({label, value, children}: RowProps) {
   );
 }
 
-interface SectionStyles {
-  container: ViewStyle;
-  headerRow: ViewStyle;
-  headerText: ViewStyle;
-  row: ViewStyle;
-  rowLabel: ViewStyle;
-  rowValue: ViewStyle;
-}
-
-const styles = StyleSheet.create<SectionStyles>({
+const styles = StyleSheet.create({
   container: {
     paddingHorizontal: 16,
     paddingVertical: 16,

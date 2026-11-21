@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, View, ViewStyle} from 'react-native';
+import {StyleSheet, View} from 'react-native';
 
 import {Chip} from './Chip';
 
@@ -42,11 +42,7 @@ export function OptionChips<T>({
   );
 }
 
-interface OptionChipsStyles {
-  wrap: ViewStyle;
-}
-
-const styles = StyleSheet.create<OptionChipsStyles>({
+const styles = StyleSheet.create({
   wrap: {
     flexDirection: 'row',
     flexWrap: 'wrap',

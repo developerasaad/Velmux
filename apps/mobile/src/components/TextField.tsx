@@ -1,5 +1,5 @@
 import React from 'react';
-import {StyleSheet, TextInput, View, ViewStyle} from 'react-native';
+import {StyleSheet, TextInput, View} from 'react-native';
 
 import {AppText} from './AppText';
 import {useTheme} from '../theme';
@@ -64,14 +64,7 @@ export function TextField({
   );
 }
 
-interface TextFieldStyles {
-  container: ViewStyle;
-  inputRow: ViewStyle;
-  inputWrap: ViewStyle;
-  input: ViewStyle;
-}
-
-const styles = StyleSheet.create<TextFieldStyles>({
+const styles = StyleSheet.create({
   container: {
     gap: 6,
   },
