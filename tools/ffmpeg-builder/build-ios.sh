@@ -272,15 +272,23 @@ build_one_slice() {
     log "[$slice] building libvpx"
     vpx_tb="$(fetch_tarball libvpx)"
     vpx_src="$(extract_tarball "$vpx_tb" "$SLICE_TAG")"
-    (cd "$vpx_src" && ./configure \
+    # vpx's die() prints to stdout; capture and dump on failure. AS must be
+    # the clang wrapper (no standalone `as` in Xcode; clang assembles with -c,
+    # which vpx's android branch adds for *clang AS; the darwin branch sets
+    # its own flags).
+    local vpx_log="$build_tmp/vpx-configure-$SLICE_TAG.log"
+    if ! (cd "$vpx_src" && AS="$CC" ./configure \
        --target="$SLICE_VPX_TARGET" \
        --prefix="$SLICE_PREFIX" \
        --disable-shared --enable-static --enable-pic \
        --disable-unit-tests --disable-examples --disable-tools --disable-docs \
        --disable-install-docs --disable-webm-io \
        --extra-cflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG" \
-       >/dev/null && \
-     make -j"$JOBS" >/dev/null && make install >/dev/null)
+       >"$vpx_log" 2>&1); then
+      cat "$vpx_log" >&2
+      die "[$slice] libvpx configure failed (full log above)"
+    fi
+    (cd "$vpx_src" && make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$slice] libvpx installed"
   fi
 
@@ -318,7 +326,7 @@ build_one_slice() {
         -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
         -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
-        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_APPS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
       cmake --build "$svt_build" >/dev/null
       cmake --install "$svt_build" >/dev/null

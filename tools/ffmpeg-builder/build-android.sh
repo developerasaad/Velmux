@@ -262,14 +262,23 @@ build_one_abi() {
     log "[$abi] building libvpx"
     vpx_tb="$(fetch_tarball libvpx)"
     vpx_src="$(extract_tarball "$vpx_tb" "$srctag")"
-    (cd "$vpx_src" && ./configure \
+    # vpx's die() prints to stdout (plain echo), so failures are invisible
+    # under >/dev/null; capture to a log and dump it on failure. AS must be
+    # the clang wrapper (NDK has no standalone `as`; clang assembles with -c,
+    # which vpx's android branch adds itself for *clang AS).
+    local vpx_log="$build_tmp/vpx-configure-$abi.log"
+    if ! (cd "$vpx_src" && AS="$CC" ./configure \
        --target="$VPX_TARGET" \
        --prefix="$prefix" \
        --disable-shared --enable-static --enable-pic \
        --disable-unit-tests --disable-examples --disable-tools --disable-docs \
        --disable-install-docs --disable-webm-io \
-       >/dev/null && \
-     make -j"$JOBS" >/dev/null && make install >/dev/null)
+       --extra-cflags="$ABI_CFLAGS -O3" \
+       >"$vpx_log" 2>&1); then
+      cat "$vpx_log" >&2
+      die "[$abi] libvpx configure failed (full log above)"
+    fi
+    (cd "$vpx_src" && make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$abi] libvpx installed"
   fi
 
@@ -314,7 +323,7 @@ build_one_abi() {
         -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
         -DCMAKE_FIND_ROOT_PATH="$prefix" \
-        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+        -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_APPS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
       cmake --build "$svt_build" >/dev/null
       cmake --install "$svt_build" >/dev/null
