@@ -43,8 +43,14 @@ NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
 [ -n "$NDK" ] || die "ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) not set"
 [ -d "$NDK" ] || die "NDK directory not found: $NDK"
 
-TOOLCHAIN="$(ls -d "$NDK"/toolchains/llvm/prebuilt/* 2>/dev/null | head -1)"
-[ -n "$TOOLCHAIN" ] && [ -d "$TOOLCHAIN" ] \
+TOOLCHAIN=""
+for candidate in "$NDK"/toolchains/llvm/prebuilt/*; do
+  if [ -d "$candidate" ]; then
+    TOOLCHAIN="$candidate"
+    break
+  fi
+done
+[ -n "$TOOLCHAIN" ] \
   || die "LLVM toolchain not found under $NDK/toolchains/llvm/prebuilt"
 SYSROOT="$TOOLCHAIN/sysroot"
 
@@ -351,8 +357,7 @@ build_one_abi() {
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
-      -DPNG_SHARED=OFF -DPNG_EXECUTABLES=OFF \
-      -DPNG_ARM_NEON=check >/dev/null
+      -DPNG_SHARED=OFF -DPNG_EXECUTABLES=OFF >/dev/null
     cmake --build "$png_build" >/dev/null
     cmake --install "$png_build" >/dev/null
     log "[$abi] libpng installed"
@@ -401,14 +406,16 @@ build_one_abi() {
     log "[$abi] building libass"
     ass_tb="$(fetch_tarball libass)"
     ass_src="$(extract_tarball "$ass_tb" "$srctag")"
+    # libass uses plain autoconf (no --extra-cflags); flags travel via env.
     (cd "$ass_src" && \
+     CFLAGS="$ABI_CFLAGS -O3 -I$prefix/include" \
+     LDFLAGS="-L$prefix/lib" \
      PKG_CONFIG_PATH="$prefix/lib/pkgconfig" \
      PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \
      ./configure \
        --prefix="$prefix" --disable-shared --enable-static \
        --disable-fontconfig --disable-require-system-font-provider \
        --host="$AUTOCONF_HOST" \
-       --extra-cflags="$ABI_CFLAGS -O3" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$abi] libass installed"
@@ -426,7 +433,8 @@ build_one_abi() {
     if [ "$WANT_SVT" = "1" ]; then
       svt_flag="--enable-libsvtav1"
     fi
-    (cd "$ffbuild" && "$ffmpeg_src/configure" \
+    local configure_log="$build_tmp/ffmpeg-configure-$abi.log"
+    if ! (cd "$ffbuild" && "$ffmpeg_src/configure" \
        --prefix="$prefix" \
        --pkg-config-flags=--static \
        --enable-cross-compile \
@@ -460,9 +468,16 @@ build_one_abi() {
        --enable-zlib \
        --enable-protocol=file \
        --enable-protocol=pipe \
-       >/dev/null)
+       >"$configure_log" 2>&1); then
+      cat "$configure_log" >&2
+      die "[$abi] FFmpeg configure failed (full log above)"
+    fi
     log "[$abi] building FFmpeg with $JOBS jobs"
-    (cd "$ffbuild" && make -j"$JOBS" >/dev/null && make install >/dev/null)
+    if ! (cd "$ffbuild" && make -j"$JOBS" >"$configure_log" 2>&1); then
+      tail -n 80 "$configure_log" >&2
+      die "[$abi] FFmpeg build failed (tail above)"
+    fi
+    (cd "$ffbuild" && make install >/dev/null)
     log "[$abi] FFmpeg installed to $prefix"
   fi
 

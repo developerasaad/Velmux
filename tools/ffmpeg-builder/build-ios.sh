@@ -259,6 +259,10 @@ build_one_slice() {
        --prefix="$SLICE_PREFIX" --disable-shared --enable-static --disable-docs \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
+     # libvorbis's configure unconditionally injects the legacy
+     # -force_cpusubtype_ALL flag on Darwin, which current Apple linkers
+     # reject; strip it from the generated Makefiles (portable sed -i.bak).
+     find . -name Makefile -exec sed -i.bak 's/-force_cpusubtype_ALL //g' {} + && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$slice] libvorbis installed"
   fi
@@ -412,15 +416,16 @@ build_one_slice() {
     log "[$slice] building libass"
     ass_tb="$(fetch_tarball libass)"
     ass_src="$(extract_tarball "$ass_tb" "$SLICE_TAG")"
+    # libass uses plain autoconf (no --extra-cflags); flags travel via env.
     (cd "$ass_src" && \
+     CFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -I$SLICE_PREFIX/include" \
+     LDFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -L$SLICE_PREFIX/lib" \
      PKG_CONFIG_PATH="$SLICE_PREFIX/lib/pkgconfig" \
      PKG_CONFIG_LIBDIR="$SLICE_PREFIX/lib/pkgconfig" \
      ./configure \
        --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
        --disable-fontconfig --disable-require-system-font-provider \
        --host="$SLICE_AUTOCONF_HOST" \
-       --extra-cflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG" \
-       --extra-ldflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$slice] libass installed"
@@ -438,7 +443,8 @@ build_one_slice() {
     if [ "$SLICE_WANT_SVT" = "1" ]; then
       svt_flag="--enable-libsvtav1"
     fi
-    (cd "$ffbuild" && "$ffmpeg_src/configure" \
+    local configure_log="$build_tmp/ffmpeg-configure-$SLICE_TAG.log"
+    if ! (cd "$ffbuild" && "$ffmpeg_src/configure" \
        --prefix="$SLICE_PREFIX" \
        --pkg-config-flags=--static \
        --enable-cross-compile \
@@ -470,9 +476,16 @@ build_one_slice() {
        --enable-zlib \
        --enable-protocol=file \
        --enable-protocol=pipe \
-       >/dev/null)
+       >"$configure_log" 2>&1); then
+      cat "$configure_log" >&2
+      die "[$slice] FFmpeg configure failed (full log above)"
+    fi
     log "[$slice] building FFmpeg with $JOBS jobs"
-    (cd "$ffbuild" && make -j"$JOBS" >/dev/null && make install >/dev/null)
+    if ! (cd "$ffbuild" && make -j"$JOBS" >"$configure_log" 2>&1); then
+      tail -n 80 "$configure_log" >&2
+      die "[$slice] FFmpeg build failed (tail above)"
+    fi
+    (cd "$ffbuild" && make install >/dev/null)
     log "[$slice] FFmpeg installed to $SLICE_PREFIX"
   fi
 

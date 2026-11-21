@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # Shared helpers for the Velmux FFmpeg builder.
 # Targets: host (Linux/macOS), android (NDK), ios (Xcode).
+#
+# NOTE on error handling: callers capture function output via $( ) command
+# substitution. Plain `set -e` does NOT propagate into command substitutions
+# unless `inherit_errexit` is enabled — without it, failed builds silently
+# continued and "installed" messages lied (caught in CI). Enabled below,
+# guarded for bash < 4.4.
 set -euo pipefail
+if (shopt -s inherit_errexit) 2>/dev/null; then
+  shopt -s inherit_errexit
+fi
 
 BUILDER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOADS_DIR="${VELMUX_DOWNLOADS_DIR:-$BUILDER_ROOT/downloads}"
@@ -181,9 +190,9 @@ extract_tarball() {
   tmp_marker="$(mktemp "$SRC_DIR/.extractXXXXXX")"
   tar -xf "$tarball" -C "$dest_root"
   local top
-  # First entry name; stderr silenced because `head -1` closes the pipe and
-  # tar reports a harmless "write error" on some versions.
-  top="$(tar -tf "$tarball" 2>/dev/null | head -1 | cut -d/ -f1)"
+  # First entry name; `head -1` closes the pipe early (harmless tar noise on
+  # some versions), so the pipeline must not be errexit-fatal.
+  top="$(tar -tf "$tarball" 2>/dev/null | head -1 | cut -d/ -f1 || true)"
   local dir="$dest_root/$top"
   [ -d "$dir" ] || die "extraction of $tarball produced unexpected layout"
   echo "$dir" > "$stamp"
