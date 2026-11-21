@@ -100,9 +100,11 @@ public:
   // Called by the engine's scheduler callback when capacity allows.
   void executeJob(const std::string &jobId);
 
-  // Progress reporting from the execution path.
+  // Progress reporting from the execution path. The generation ties the
+  // report to one execution run: a superseded run's late progress must not
+  // regress the record owned by a newer run.
   void reportProgress(const std::string &jobId, double fraction,
-                      std::int64_t outputBytes = -1);
+                      std::int64_t outputBytes, std::uint64_t generation);
 
   // Cooperative cancel of every running job (engine shutdown). Does not
   // wait for the workers; the engine joins them separately.
@@ -112,11 +114,20 @@ private:
   struct RunningJob {
     JobRecord record;
     std::shared_ptr<backend::CancelToken> cancel;
+    // Identifies one execution run of this job. A pause->resume or retry
+    // starts a new run and replaces the entry; the superseded worker must
+    // observe the mismatch and walk away without touching shared state.
+    std::uint64_t generation = 0;
   };
 
   void persistAndEmit(JobRecord &record, const char *transitionNote);
   void finishFailure(JobRecord &record);
-  bool validateOutput(JobRecord &record);
+  bool validateOutput(JobRecord &record, std::uint64_t generation);
+  // True (call under mutex_) when the running entry still belongs to the
+  // given execution run. A pause->resume or retry replaces the entry; a late
+  // wakeup from the superseded run must not clobber the new run's state.
+  bool runStillCurrent(const std::string &jobId,
+                       std::uint64_t generation) const;
   std::optional<Pipeline> planPipelineFor(const JobRecord &record);
   backend::IBackend *backendFor(const Pipeline &pipeline);
   std::string outputNameFor(const JobRecord &record) const;
@@ -130,6 +141,7 @@ private:
   OutputValidator *validator_ = nullptr;
   std::vector<backend::IBackend *> backends_;
   std::map<std::string, RunningJob> running_;
+  std::uint64_t nextGeneration_ = 0; // guarded by mutex_
   mutable std::mutex mutex_;
 };
 

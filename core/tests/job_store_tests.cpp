@@ -122,9 +122,12 @@ TEST_CASE("loadResumableJobs returns only mid-flight jobs") {
   TempDb db;
   REQUIRE(db.jobs().insertJob(sampleJob("queued", JobState::Queued)).ok());
   REQUIRE(db.jobs().insertJob(sampleJob("running", JobState::Running)).ok());
+  REQUIRE(db.jobs().insertJob(sampleJob("recovering", JobState::Recovering)).ok());
   REQUIRE(db.jobs().insertJob(sampleJob("done", JobState::Completed)).ok());
   REQUIRE(db.jobs().insertJob(sampleJob("failed", JobState::Failed)).ok());
+  // User-held states: never auto-resumed at startup; the user resumes them.
   REQUIRE(db.jobs().insertJob(sampleJob("paused", JobState::Paused)).ok());
+  REQUIRE(db.jobs().insertJob(sampleJob("interrupted", JobState::Interrupted)).ok());
 
   Error error;
   const auto resumable = db.jobs().loadResumableJobs(error);
@@ -132,6 +135,8 @@ TEST_CASE("loadResumableJobs returns only mid-flight jobs") {
   for (const auto &job : resumable) {
     CHECK(job.id != "done");
     CHECK(job.id != "failed");
+    CHECK(job.id != "paused");
+    CHECK(job.id != "interrupted");
   }
 }
 

@@ -14,7 +14,7 @@ the ultimate truth.
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
 | 5 | Complete V1 media support | Not started |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
-| 7 | Persistence/recovery | Partial (SQLite job store + checkpoint model; fault-injection pending) |
+| 7 | Persistence/recovery | Partial (SQLite job store + checkpoint model + shutdown-to-recovery contract; fault-injection pending) |
 | 8 | Background and notifications | Not started |
 | 9 | Batch scheduler | Partial (resource-aware scheduler implemented + unit tested) |
 | 10 | Premium UX polish | In progress (design system + screens scaffolded) |
@@ -24,12 +24,18 @@ the ultimate truth.
 ## What actually works today
 
 - C++ core builds on Linux with CMake/Ninja; unit tests pass (feature registry,
-  capability registry, planner, compression budgets, scheduler, job state machine).
+  capability registry, planner, compression budgets, scheduler, job state machine,
+  pause/resume, shutdown-to-recovery handoff). Full suite passes under
+  ASan+UBSan with leak detection.
 - FFmpeg backend performs REAL conversions through libav* libraries directly
   (demux → decode → process → encode → mux) on host, with output validation via
   the core validator and an independent ffprobe cross-check.
 - Pinned host FFmpeg builds through `tools/ffmpeg-builder/build-host.sh`.
-- React Native app source with Home/Convert/Queue/History/Settings surfaces.
+- React Native app source with Home/Convert/Queue/History/Settings surfaces;
+  `tsc --noEmit` and `eslint` clean.
+- Engine shutdown contract: running jobs are durably marked `recovering`
+  (never silently canceled) and auto-resume on next startup; user-paused and
+  interrupted jobs are never auto-resumed (user resumes explicitly).
 - CI builds core+tests on Linux (fast signal).
 
 ## Known limitations (do not pretend otherwise)
@@ -39,7 +45,9 @@ the ultimate truth.
 - Hybrid stage-composed execution interfaces exist; only whole-pipeline FFmpeg
   execution is implemented (M4 pending).
 - No background hosts/notifications yet (M8).
-- FFmpeg mobile artifacts not yet built (M3; scripts exist, CI pending).
+- FFmpeg mobile artifacts not yet built: `build-android.sh` and `build-ios.sh`
+  are still to be written (M3); only the host builder exists. The
+  `ffmpeg-mobile.yml` workflow is manual-dispatch until then.
 - Recovery fault-injection test suite not yet implemented (M7 completion).
 
 ## Environment notes

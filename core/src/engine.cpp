@@ -118,8 +118,17 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
       });
   engine->scheduler_->updateResources(initial);
 
-  // Crash recovery: reconcile DB + artifacts before serving traffic.
-  (void)engine->jobs_->recoverInterruptedJobs();
+  // Crash recovery: reconcile DB + artifacts before serving traffic. Jobs
+  // that recovery re-queued are handed to the scheduler so they actually
+  // resume (a durable Queued record alone would never execute).
+  const std::vector<RecoveryDecision> decisions =
+      engine->jobs_->recoverInterruptedJobs();
+  for (const RecoveryDecision &decision : decisions) {
+    if (decision.action == RecoveryAction::RestartJob ||
+        decision.action == RecoveryAction::ResumeFromCheckpoint) {
+      engine->scheduler_->submit(decision.jobId);
+    }
+  }
 
   return engine;
 }

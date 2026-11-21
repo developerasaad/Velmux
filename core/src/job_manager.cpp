@@ -205,8 +205,13 @@ Result<void> JobManager::cancel(const std::string &jobId) {
                                     "job already finished"));
   }
   auto running = running_.find(jobId);
-  if (running != running_.end() && running->second.cancel != nullptr) {
-    running->second.cancel->cancel();
+  if (running != running_.end()) {
+    // Record the intent in the in-memory running record too: when the worker
+    // observes the cancel token it finalizes exactly this state.
+    running->second.record.state = JobState::Canceled;
+    if (running->second.cancel != nullptr) {
+      running->second.cancel->cancel();
+    }
   }
   record->state = JobState::Canceled;
   record->finishedAtMs = nowMs();
@@ -230,15 +235,18 @@ Result<void> JobManager::pause(const std::string &jobId) {
                                         std::string(jobStateName(record->state))));
   }
   auto running = running_.find(jobId);
-  if (running != running_.end() && running->second.cancel != nullptr) {
+  if (running != running_.end()) {
     // Cooperative pause = cancel the current execution; the durable record
     // keeps committed checkpoints, and resume restarts from the safest
-    // checkpoint (spec: no fake in-place encoder suspension).
-    running->second.cancel->cancel();
-    record->state = JobState::Paused;
-  } else {
-    record->state = JobState::Paused;
+    // checkpoint (spec: no fake in-place encoder suspension). The intent is
+    // recorded in the running record so the worker finalizes Paused, not
+    // Canceled (they share the cooperative token).
+    running->second.record.state = JobState::Paused;
+    if (running->second.cancel != nullptr) {
+      running->second.cancel->cancel();
+    }
   }
+  record->state = JobState::Paused;
   persistAndEmit(*record, "pause");
   return Result<void>();
 }
@@ -340,6 +348,7 @@ std::vector<RecoveryDecision> JobManager::recoverInterruptedJobs() {
         record->state = JobState::Recovering;
         persistAndEmit(*record, "recovery");
         record->state = JobState::Queued;
+        record->error.clear();
         persistAndEmit(*record, "recovery-queued");
         break;
       }
@@ -362,8 +371,12 @@ void JobManager::attachScheduler(Scheduler &scheduler) {
 }
 
 void JobManager::reportProgress(const std::string &jobId, double fraction,
-                                std::int64_t outputBytes) {
+                                std::int64_t outputBytes,
+                                std::uint64_t generation) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!runStillCurrent(jobId, generation)) {
+    return; // superseded run; the newer run owns the record
+  }
   auto running = running_.find(jobId);
   if (running == running_.end()) {
     return;
@@ -378,6 +391,50 @@ void JobManager::reportProgress(const std::string &jobId, double fraction,
   event.progress = fraction;
   event.outputSizeBytes = running->second.record.outputSizeBytes;
   events_.emit(event);
+}
+
+bool JobManager::runStillCurrent(const std::string &jobId,
+                                 std::uint64_t generation) const {
+  const auto it = running_.find(jobId);
+  return it != running_.end() && it->second.generation == generation;
+}
+
+void JobManager::cancelAllRunning(const char *reason) {
+  const std::string why = reason != nullptr ? reason : "engine shutdown";
+  std::vector<std::shared_ptr<backend::CancelToken>> tokens;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto &entry : running_) {
+      RunningJob &running = entry.second;
+      // Respect earlier user intent: a job already canceled/paused (or
+      // finished) keeps that state. Actively executing jobs move to
+      // Recovering so the next startup auto-resumes them from their
+      // committed checkpoints (spec §4.5/§22: a shutdown is not a user
+      // cancel; committed work is preserved aggressively).
+      Error loadError;
+      auto durable = store_.loadJob(entry.first, loadError);
+      const bool userHeld =
+          durable.has_value() &&
+          (durable->state == JobState::Canceled ||
+           durable->state == JobState::Paused ||
+           durable->state == JobState::Completed ||
+           durable->state == JobState::Failed ||
+           durable->state == JobState::Interrupted);
+      if (!userHeld) {
+        running.record.state = JobState::Recovering;
+        running.record.error = why;
+        persistAndEmit(running.record, "recovering");
+      }
+      if (running.cancel != nullptr) {
+        tokens.push_back(running.cancel);
+      }
+    }
+  }
+  // Tokens fire after the Recovering records are durable, so workers
+  // observe a consistent intended state when they finalize.
+  for (const auto &token : tokens) {
+    token->cancel();
+  }
 }
 
 void JobManager::persistAndEmit(JobRecord &record, const char * /*note*/) {
@@ -399,17 +456,27 @@ void JobManager::executeJob(const std::string &jobId) {
     return;
   }
   if (record->state == JobState::Canceled ||
-      record->state == JobState::Completed) {
+      record->state == JobState::Completed ||
+      record->state == JobState::Failed ||
+      record->state == JobState::Paused ||
+      record->state == JobState::Interrupted) {
+    // Terminal or user-held states never (re)start execution from the
+    // scheduler path; resume()/retry() re-queue explicitly.
     return;
   }
 
   record->state = JobState::Preparing;
   record->startedAtMs = nowMs();
+  std::uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     RunningJob running;
     running.record = *record;
     running.cancel = std::make_shared<backend::CancelToken>();
+    running.generation = ++nextGeneration_;
+    generation = running.generation;
+    // Replaces any superseded run's entry: the new run owns the record from
+    // here on, and the old worker will detect the generation mismatch.
     running_[jobId] = std::move(running);
   }
   persistAndEmit(*record, "preparing");
@@ -420,6 +487,9 @@ void JobManager::executeJob(const std::string &jobId) {
     const Result<MediaInfo> inspected = inspect(record->request.source);
     if (!inspected.ok()) {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (!runStillCurrent(jobId, generation)) {
+        return; // superseded by a newer run of this job
+      }
       auto &running = running_[jobId];
       running.record.state = JobState::Failed;
       running.record.error =
@@ -433,6 +503,9 @@ void JobManager::executeJob(const std::string &jobId) {
   PlanResult plan = planner_.plan(info, record->request);
   if (!plan.feasible || !plan.best.has_value()) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
     running.record.error =
@@ -445,12 +518,18 @@ void JobManager::executeJob(const std::string &jobId) {
   record->pipeline = pipeline;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     running_[jobId].record.pipeline = pipeline;
   }
 
   backend::IBackend *backend = backendFor(pipeline);
   if (backend == nullptr || backend->executor() == nullptr) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
     running.record.error = "no backend could execute the planned pipeline";
@@ -462,6 +541,9 @@ void JobManager::executeJob(const std::string &jobId) {
   record->outputPath = outputNameFor(*record);
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     running_[jobId].record.outputPath = record->outputPath;
     running_[jobId].record.state = JobState::Running;
   }
@@ -474,12 +556,16 @@ void JobManager::executeJob(const std::string &jobId) {
   std::shared_ptr<backend::CancelToken> cancel;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     cancel = running_[jobId].cancel;
   }
   params.cancel = cancel;
-  params.onProgress = [this, jobId](const backend::ProgressReport &report) {
-    reportProgress(jobId, report.fraction, -1);
-  };
+  params.onProgress =
+      [this, jobId, generation](const backend::ProgressReport &report) {
+        reportProgress(jobId, report.fraction, -1, generation);
+      };
   CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
   params.checkpoints = &coordinator;
 
@@ -507,22 +593,35 @@ void JobManager::executeJob(const std::string &jobId) {
 
   if (cancel->isCancelled()) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded (e.g. paused then quickly resumed): the newer
+              // run owns the record; this worker must not touch it.
+    }
     auto &running = running_[jobId];
-    // Pause keeps checkpoints for resume; explicit cancel is terminal.
-    running.record.state = running.record.state == JobState::Paused
-                               ? JobState::Paused
-                               : JobState::Canceled;
+    // The control path (cancel / pause / engine shutdown) already recorded
+    // the intended durable state on the running record; finalize exactly
+    // that. An active state here means the token fired without a recorded
+    // decision — the honest fallback is a terminal cancel.
+    if (running.record.state == JobState::Running ||
+        running.record.state == JobState::Preparing ||
+        running.record.state == JobState::Validating ||
+        running.record.state == JobState::Checkpointing) {
+      running.record.state = JobState::Canceled;
+    }
     if (running.record.state == JobState::Canceled) {
       running.record.finishedAtMs = nowMs();
     }
     JobRecord final = running.record;
     running_.erase(jobId);
-    persistAndEmit(final, "canceled");
+    persistAndEmit(final, "final");
     return;
   }
 
   if (!execResult.success) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
     running.record.error = execResult.error.message.empty()
@@ -535,17 +634,23 @@ void JobManager::executeJob(const std::string &jobId) {
   // Validation before completion (never trust pipeline success alone).
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     running_[jobId].record.state = JobState::Validating;
   }
   persistAndEmit(*record, "validating");
-  if (!validateOutput(*record)) {
-    return; // finishFailure already ran
+  if (!validateOutput(*record, generation)) {
+    return; // finishFailure already ran (or the run was superseded)
   }
 
   std::int64_t outputBytes = -1;
   fileExistsWithSize(record->outputPath, outputBytes);
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return; // superseded by a newer run of this job
+    }
     auto &running = running_[jobId];
     running.record.state = JobState::Completed;
     running.record.progress = 1.0;
@@ -565,10 +670,13 @@ void JobManager::finishFailure(JobRecord &record) {
   persistAndEmit(final, "failed");
 }
 
-bool JobManager::validateOutput(JobRecord &record) {
+bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   if (validator_ == nullptr) {
     // No validator wired: honest failure rather than fake success.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(record.id, generation)) {
+      return false; // superseded; the newer run owns finalization
+    }
     auto &running = running_[record.id];
     running.record.state = JobState::Failed;
     running.record.error = "output validator unavailable";
@@ -606,6 +714,9 @@ bool JobManager::validateOutput(JobRecord &record) {
     problems += problem + "; ";
   }
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!runStillCurrent(record.id, generation)) {
+    return false; // superseded; the newer run owns finalization
+  }
   auto &running = running_[record.id];
   running.record.state = JobState::Failed;
   running.record.error = "output validation failed: " + problems;

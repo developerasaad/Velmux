@@ -521,10 +521,13 @@ std::vector<JobRecord> JobStore::loadAllJobs(Error &error) {
 
 std::vector<JobRecord> JobStore::loadResumableJobs(Error &error) {
   std::vector<JobRecord> jobs;
-  // Jobs that were mid-flight (not terminal) when the process disappeared.
+  // Jobs that were mid-flight (not terminal, not user-held) when the process
+  // disappeared, plus jobs already handed to recovery by a graceful shutdown.
+  // User-held states (paused, interrupted) are deliberately excluded: their
+  // committed checkpoints survive and the user resumes them explicitly.
   db_.query("SELECT * FROM jobs WHERE state IN "
-            "('queued','preparing','running','checkpointing','paused',"
-            "'recovering') ORDER BY created_at ASC",
+            "('queued','preparing','running','checkpointing','recovering') "
+            "ORDER BY created_at ASC",
             [&](sqlite3_stmt &stmt) {
               jobs.push_back(rowToRecord(stmt));
               return true;

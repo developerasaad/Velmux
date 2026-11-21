@@ -80,6 +80,7 @@ public:
   ExecuteResult execute(const ExecuteParams &params) override {
     ExecuteResult result;
     executions.fetch_add(1);
+    const int sleepMs = iterationSleepMs.load();
     for (int i = 0; i <= 10; ++i) {
       if (params.cancel && params.cancel->isCancelled()) {
         result.error = Error::make(ErrorCode::Cancelled, "cancelled", "fake");
@@ -90,7 +91,7 @@ public:
         report.fraction = double(i) / 10.0;
         params.onProgress(report);
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
     }
     // Produce a real output file the validator can inspect.
     std::ofstream out(params.outputPath, std::ios::binary);
@@ -104,6 +105,8 @@ public:
   }
 
   std::atomic<int> executions{0};
+  // Per-iteration sleep; tests raise it to keep execution observable.
+  std::atomic<int> iterationSleepMs{1};
 };
 
 class FakeBackend final : public velmux::backend::IBackend {
@@ -142,33 +145,53 @@ public:
   void onJobEvent(const JobEvent &event) override {
     std::lock_guard<std::mutex> lock(mutex_);
     events.push_back(event);
-    if (isTerminal(event.state)) {
-      done.notify_all();
-    }
+    done.notify_all();
   }
   std::optional<JobEvent> waitForTerminal(std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    done.wait_for(lock, timeout, [this] {
-      for (const auto &e : events) {
-        if (isTerminal(e.state)) {
-          return true;
-        }
-      }
-      return false;
-    });
+    return waitFor(
+        [](const JobEvent &e) { return isTerminal(e.state); }, timeout);
+  }
+  std::optional<JobEvent> waitForState(JobState state,
+                                       std::chrono::milliseconds timeout) {
+    return waitFor([state](const JobEvent &e) { return e.state == state; },
+                   timeout);
+  }
+  bool sawTerminal() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &e : events) {
       if (isTerminal(e.state)) {
-        return e;
+        return true;
       }
     }
-    return std::nullopt;
+    return false;
   }
   static bool isTerminal(JobState state) {
     return state == JobState::Completed || state == JobState::Failed ||
            state == JobState::Canceled;
   }
   std::vector<JobEvent> events;
-  std::mutex mutex_;
+
+private:
+  template <typename Pred>
+  std::optional<JobEvent> waitFor(Pred pred,
+                                  std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    done.wait_for(lock, timeout, [this, &pred] {
+      for (const auto &e : events) {
+        if (pred(e)) {
+          return true;
+        }
+      }
+      return false;
+    });
+    for (const auto &e : events) {
+      if (pred(e)) {
+        return e;
+      }
+    }
+    return std::nullopt;
+  }
+  mutable std::mutex mutex_;
   std::condition_variable done;
 };
 
@@ -315,4 +338,107 @@ TEST_CASE("describeBackends reflects registered capabilities") {
   REQUIRE(descriptions.size() == 1);
   CHECK(descriptions[0].find("FakeBackend") != std::string::npos);
   CHECK(descriptions[0].find("fake-for-tests") != std::string::npos);
+}
+
+TEST_CASE("pause holds a running job; resume finishes it for real") {
+  EngineEnv env;
+  env.backend().executor_.iterationSleepMs.store(50); // ~550 ms per run
+  const std::string media = makeFakeMedia(env.dir() / "in.mp4");
+  const Result<std::string> jobId =
+      env.engine().startJob(env.requestFor(media));
+  REQUIRE(jobId.ok());
+
+  REQUIRE(env.events()
+              .waitForState(JobState::Running, std::chrono::seconds(5))
+              .has_value());
+
+  const Result<bool> paused = env.engine().pauseJob(jobId.value());
+  REQUIRE(paused.ok());
+
+  const auto held =
+      env.events().waitForState(JobState::Paused, std::chrono::seconds(5));
+  REQUIRE(held.has_value());
+  // A pause is not a cancel: while held, no terminal state may appear.
+  CHECK_FALSE(env.events().sawTerminal());
+  CHECK(env.backend().executor_.executions.load() == 1);
+
+  // Resume re-queues through the scheduler; the job must complete for real.
+  const Result<bool> resumed = env.engine().resumeJob(jobId.value());
+  REQUIRE(resumed.ok());
+  const auto terminal =
+      env.events().waitForTerminal(std::chrono::seconds(10));
+  REQUIRE(terminal.has_value());
+  CHECK(terminal->state == JobState::Completed);
+  CHECK(terminal->jobId == jobId.value());
+  CHECK(env.backend().executor_.executions.load() == 2);
+}
+
+TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("velmux-shutdown-" + std::to_string(::getpid()));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+  const std::string media = makeFakeMedia(dir / "in.mp4");
+
+  ConversionRequest request;
+  request.source.uri = media;
+  request.source.displayName = "sample.mp4";
+  request.outputContainer = Container::Mkv;
+  request.goal.kind = GoalKind::Recommended;
+  request.video.codec = VideoCodec::VP9;
+  request.audio.codec = AudioCodec::Opus;
+
+  std::string jobId;
+  {
+    auto backend = std::make_unique<FakeBackend>();
+    backend->executor_.iterationSleepMs.store(50);
+    std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+    backends.push_back(std::move(backend));
+    auto engine =
+        VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
+    REQUIRE(engine != nullptr);
+    EventRecorder recorder;
+    engine->events().subscribe(&recorder);
+
+    const Result<std::string> submitted = engine->startJob(request);
+    REQUIRE(submitted.ok());
+    jobId = submitted.value();
+    REQUIRE(recorder
+                .waitForState(JobState::Running, std::chrono::seconds(5))
+                .has_value());
+    // Engine destruction runs the shutdown contract: running jobs become
+    // recoverable, never silently canceled.
+    engine.reset();
+  }
+
+  // Durable state after shutdown: Recovering (auto-resumable), not Canceled.
+  {
+    SqliteStore db;
+    REQUIRE(db.open((dir / "velmux-jobs.sqlite").string()).ok());
+    JobStore store(db);
+    Error loadError;
+    const auto record = store.loadJob(jobId, loadError);
+    REQUIRE(record.has_value());
+    CHECK(record->state == JobState::Recovering);
+  }
+
+  // Startup recovery on a fresh engine over the same data dir resumes the
+  // job honestly and it completes for real.
+  {
+    auto backend = std::make_unique<FakeBackend>();
+    std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+    backends.push_back(std::move(backend));
+    auto engine =
+        VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
+    REQUIRE(engine != nullptr);
+    EventRecorder recorder;
+    engine->events().subscribe(&recorder);
+    const auto terminal =
+        recorder.waitForTerminal(std::chrono::seconds(10));
+    REQUIRE(terminal.has_value());
+    CHECK(terminal->state == JobState::Completed);
+    CHECK(terminal->jobId == jobId);
+  }
+  std::filesystem::remove_all(dir, ec);
 }
