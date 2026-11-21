@@ -29,10 +29,13 @@
     },
     "x264": {
       "version": "31e19f92f00c7003fa115047ce50978bc98c3a0d",
-      "url": "https://code.videolan.org/videolan/x264/-/archive/31e19f92f00c7003fa115047ce50978bc98c3a0d/x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
+      "url": "https://codeload.github.com/mirror/x264/tar.gz/31e19f92f00c7003fa115047ce50978bc98c3a0d",
       "file": "x264-31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz",
-      "mirrors": [],
-      "sha256": "d053c9d86988d6bc78237ca5205865c5ddf99c98ef4cd9927eec8f6d388f6dd9"
+      "mirrors": [
+        "https://github.com/mirror/x264/archive/31e19f92f00c7003fa115047ce50978bc98c3a0d.tar.gz"
+      ],
+      "sha256": "d053c9d86988d6bc78237ca5205865c5ddf99c98ef4cd9927eec8f6d388f6dd9",
+      "note": "code.videolan.org git-archive tarballs are regenerated per request (byte-unstable); the GitHub mirror's per-commit codeload archives are deterministic and verified to match this checksum."
     },
     "lame": {
       "version": "3.100",

@@ -139,22 +139,31 @@ fetch_ffmpeg() {
   echo "$dest"
 }
 
-# extract <tarball> — unpack into SRC_DIR, print the resulting source directory.
-# Handles tarballs whose top-level directory name differs from the file name.
+# extract <tarball> [tag] — unpack into SRC_DIR (optionally under a per-target
+# subdirectory "tag" so cross builds never reuse an in-tree configure run),
+# print the resulting source directory. Handles tarballs whose top-level
+# directory name differs from the file name.
 extract_tarball() {
   local tarball="$1"
+  local tag="${2:-}"
   mkdir -p "$SRC_DIR"
+  local dest_root="$SRC_DIR"
   local stamp="$tarball.extracted"
+  if [ -n "$tag" ]; then
+    dest_root="$SRC_DIR/$tag"
+    mkdir -p "$dest_root"
+    stamp="$SRC_DIR/$tag/$(basename "$tarball").extracted"
+  fi
   if [ -f "$stamp" ] && [ -d "$(cat "$stamp")" ]; then
     cat "$stamp"
     return 0
   fi
   local tmp_marker
   tmp_marker="$(mktemp "$SRC_DIR/.extractXXXXXX")"
-  tar -xf "$tarball" -C "$SRC_DIR"
+  tar -xf "$tarball" -C "$dest_root"
   local top
   top="$(tar -tf "$tarball" | head -1 | cut -d/ -f1)"
-  local dir="$SRC_DIR/$top"
+  local dir="$dest_root/$top"
   [ -d "$dir" ] || die "extraction of $tarball produced unexpected layout"
   echo "$dir" > "$stamp"
   rm -f "$tmp_marker"

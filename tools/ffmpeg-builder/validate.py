@@ -55,10 +55,20 @@ REQUIRED_DEMUXERS = {
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: validate.py <manifest.json>", file=sys.stderr)
+    args = sys.argv[1:]
+    exempt = set()
+    if args and args[0] == "--exempt":
+        if len(args) < 2:
+            print("usage: validate.py [--exempt n1,n2,...] <manifest.json>",
+                  file=sys.stderr)
+            return 2
+        exempt = {e.strip() for e in args[1].split(",") if e.strip()}
+        args = args[2:]
+    if len(args) != 1:
+        print("usage: validate.py [--exempt n1,n2,...] <manifest.json>",
+                  file=sys.stderr)
         return 2
-    with open(sys.argv[1], encoding="utf-8") as fh:
+    with open(args[0], encoding="utf-8") as fh:
         manifest = json.load(fh)
 
     problems = []
@@ -68,16 +78,16 @@ def main() -> int:
     muxers = {f["name"] for f in manifest.get("muxers", [])}
     demuxers = {f["name"] for f in manifest.get("demuxers", [])}
 
-    missing = sorted(REQUIRED_DECODERS - decoders)
+    missing = sorted(REQUIRED_DECODERS - decoders - exempt)
     if missing:
         problems.append("missing decoders: " + ", ".join(missing))
-    missing = sorted(REQUIRED_ENCODERS - encoders)
+    missing = sorted(REQUIRED_ENCODERS - encoders - exempt)
     if missing:
         problems.append("missing encoders: " + ", ".join(missing))
-    missing = sorted(REQUIRED_MUXERS - muxers)
+    missing = sorted(REQUIRED_MUXERS - muxers - exempt)
     if missing:
         problems.append("missing muxers: " + ", ".join(missing))
-    missing = sorted(REQUIRED_DEMUXERS - demuxers)
+    missing = sorted(REQUIRED_DEMUXERS - demuxers - exempt)
     if missing:
         problems.append("missing demuxers: " + ", ".join(missing))
 
@@ -92,7 +102,10 @@ def main() -> int:
         "--enable-libsvtav1",
         "--enable-libass",
     ):
-        if flag not in config:
+        # An exemption (e.g. "libsvtav1" on 32-bit ABIs where upstream does
+        # not support it) also covers its configure flag.
+        short = flag.removeprefix("--enable-")
+        if flag not in config and short not in exempt:
             problems.append("configure flag absent: " + flag)
     if "--disable-avdevice" not in config:
         problems.append("libavdevice should be disabled but is not")

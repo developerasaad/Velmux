@@ -40,6 +40,13 @@ jobs:
           yes | sdkmanager --licenses
           sdkmanager "ndk;27.0.12077973" "platform-tools"
 
+      - name: Install host build tools
+        run: |
+          sudo apt-get update
+          # meson: dav1d/fribidi cross builds; nasm: dav1d x86_64 asm;
+          # pkg-config: FFmpeg configure probes the cross prefix.
+          sudo apt-get install -y ninja-build meson nasm pkg-config
+
       - name: Export ANDROID_NDK_HOME
         run: |
           echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
