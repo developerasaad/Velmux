@@ -1,0 +1,129 @@
+# Heavy FFmpeg cross-compilation for mobile platforms. Produces the native
+# artifacts consumed by the Android and Apple backends (Milestone 3).
+#
+# Heavy builds: manual dispatch only until Milestone 3 validates the toolchain;
+# path-based auto-trigger will be enabled when build times are acceptable.
+name: FFmpeg mobile artifacts
+
+on:
+  workflow_dispatch:
+
+# Sequential, never cancel an in-flight heavy build; queued runs wait for the
+# previous one to finish instead of discarding its progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ffmpeg-android:
+    name: FFmpeg for Android (all ABIs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK command line tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK 27.0.12077973 and platform-tools
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "ndk;27.0.12077973" "platform-tools"
+
+      - name: Export ANDROID_NDK_HOME
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          # Fail fast if the NDK did not land where we expect it.
+          test -d "${ANDROID_HOME}/ndk/27.0.12077973"
+
+      - name: Restore FFmpeg source cache
+        id: ffmpeg-sources
+        uses: actions/cache/restore@v4
+        with:
+          # Upstream source tarballs; the key changes whenever the pinned
+          # versions in versions.json change.
+          path: tools/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          restore-keys: |
+            ffmpeg-downloads-${{ runner.os }}-
+
+      - name: Build FFmpeg for all Android ABIs
+        id: build-ffmpeg
+        env:
+          # ubuntu-latest runners provide 4 vCPUs.
+          VELMUX_FFMPEG_JOBS: 4
+        run: |
+          # Script contract: builds arm64-v8a, armeabi-v7a, and x86_64.
+          tools/ffmpeg-builder/build-android.sh --all-abis
+
+      - name: Save FFmpeg source cache
+        # Save only after a successful build and only when this run actually
+        # downloaded something (no exact cache hit). A lost cross-run cache
+        # race only costs a later re-download, hence continue-on-error.
+        if: steps.build-ffmpeg.outcome == 'success' && steps.ffmpeg-sources.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: tools/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+
+      - name: Upload Android FFmpeg artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-ffmpeg-android
+          path: tools/ffmpeg-builder/out/android/**
+          retention-days: 14
+
+  ffmpeg-ios:
+    name: FFmpeg for iOS (device and simulator)
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Restore FFmpeg source cache
+        id: ffmpeg-sources
+        uses: actions/cache/restore@v4
+        with:
+          # Upstream source tarballs; the key changes whenever the pinned
+          # versions in versions.json change.
+          path: tools/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          restore-keys: |
+            ffmpeg-downloads-${{ runner.os }}-
+
+      - name: Build FFmpeg for iOS
+        id: build-ffmpeg
+        run: |
+          # Script contract: builds iphoneos and iphonesimulator slices,
+          # laid out so they can be wrapped into an xcframework.
+          tools/ffmpeg-builder/build-ios.sh
+
+      - name: Save FFmpeg source cache
+        # Save only after a successful build and only when this run actually
+        # downloaded something (no exact cache hit). A lost cross-run cache
+        # race only costs a later re-download, hence continue-on-error.
+        if: steps.build-ffmpeg.outcome == 'success' && steps.ffmpeg-sources.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: tools/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+
+      - name: Upload iOS FFmpeg artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-ffmpeg-ios
+          path: tools/ffmpeg-builder/out/ios/**
+          retention-days: 14

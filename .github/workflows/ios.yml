@@ -1,0 +1,73 @@
+# CI for the iOS application: CocoaPods install plus a simulator build with
+# code signing disabled (no certificates needed on CI).
+name: iOS build
+
+on:
+  push:
+    paths:
+      - apps/**
+      - core/**
+      - backends/**
+      - bridge/**
+      - .github/workflows/ios.yml
+  pull_request:
+    paths:
+      - apps/**
+      - core/**
+      - backends/**
+      - bridge/**
+      - .github/workflows/ios.yml
+  workflow_dispatch:
+
+# One run per ref; a newer push supersedes the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: iOS simulator build
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install JS dependencies
+        working-directory: apps/mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        run: |
+          if [ ! -f Podfile ]; then
+            echo "No Podfile found; skipping pod install."
+            exit 0
+          fi
+          # CocoaPods is preinstalled on macOS runners; install it on demand
+          # if the image ever drops it.
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods
+          fi
+          pod install
+
+      # The workspace and scheme names below must match the React Native
+      # template ("Velmux") once the Xcode project is integrated into the
+      # repository; adjust them here if the template uses different names.
+      - name: Build for the iOS simulator
+        working-directory: apps/mobile/ios
+        run: |
+          set -o pipefail
+          if command -v xcpretty >/dev/null 2>&1; then
+            xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO | xcpretty --color
+          else
+            xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO
+          fi

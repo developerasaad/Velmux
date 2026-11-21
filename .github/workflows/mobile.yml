@@ -1,0 +1,61 @@
+# CI for the React Native application (TypeScript only: type check + lint).
+# Native builds live in android.yml and ios.yml.
+name: Mobile app (TS)
+
+on:
+  push:
+    paths:
+      - apps/**
+      - bridge/ts/**
+      - .github/workflows/mobile.yml
+  pull_request:
+    paths:
+      - apps/**
+      - bridge/ts/**
+      - .github/workflows/mobile.yml
+  workflow_dispatch:
+
+# One run per ref; a newer push supersedes the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Type check and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # NOTE: until apps/mobile/package.json exists, this job fails at the
+    # Node/npm setup or install step; the workflow itself stays valid.
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/mobile
+        run: |
+          # Prefer a reproducible install from the lockfile; fall back to a
+          # plain install only when the lockfile is missing or out of sync.
+          if ! npm ci --no-audit --no-fund; then
+            echo "npm ci failed (lockfile missing or out of sync); falling back to npm install"
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Type check (tsc)
+        working-directory: apps/mobile
+        run: npx tsc --noEmit
+
+      - name: Lint
+        working-directory: apps/mobile
+        run: npm run lint
+        continue-on-error: false

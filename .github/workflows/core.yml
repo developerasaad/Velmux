@@ -1,0 +1,134 @@
+# Host CI for the shared C++ core and the FFmpeg backend.
+# Runs on a Linux x64 host: build the pinned FFmpeg through the Velmux
+# builder, then configure/build/test with CMake + Ninja + ctest.
+name: Core & FFmpeg backend (host)
+
+on:
+  push:
+    paths:
+      - core/**
+      - backends/**
+      - bridge/cpp/**
+      - tools/ffmpeg-builder/**
+      - testdata/**
+      - CMakeLists.txt
+      - .github/workflows/core.yml
+  pull_request:
+    paths:
+      - core/**
+      - backends/**
+      - bridge/cpp/**
+      - tools/ffmpeg-builder/**
+      - testdata/**
+      - CMakeLists.txt
+      - .github/workflows/core.yml
+  workflow_dispatch:
+
+# One run per ref; a newer push supersedes the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: Linux host build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsqlite3-dev
+
+      - name: Verify CMake toolchain
+        run: |
+          # CMake is preinstalled on GitHub-hosted runners; install it via pip
+          # only if the image ever ships without it.
+          if ! command -v cmake >/dev/null 2>&1; then
+            python3 -m pip install cmake ninja
+          fi
+          cmake --version
+
+      - name: Restore host FFmpeg cache
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          # Cache both the built host toolchain and the downloaded source
+          # tarballs. The key changes whenever the pinned versions change.
+          path: |
+            tools/ffmpeg-builder/out/host
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          restore-keys: |
+            ffmpeg-host-${{ runner.os }}-
+
+      - name: Build pinned host FFmpeg
+        id: build-ffmpeg
+        env:
+          # ubuntu-latest runners provide 4 vCPUs.
+          VELMUX_FFMPEG_JOBS: 4
+        run: |
+          # The builder is idempotent: on a warm cache it detects the existing
+          # out/host artifacts and skips the expensive rebuild.
+          tools/ffmpeg-builder/build-host.sh
+
+      - name: Save host FFmpeg cache
+        # Save only when the builder succeeded and this run actually built
+        # something (no exact cache hit), so a partial output can never poison
+        # the cache. A lost cross-run cache race only costs a later rebuild,
+        # hence continue-on-error.
+        if: steps.build-ffmpeg.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            tools/ffmpeg-builder/out/host
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+
+      - name: Configure (CMake)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVELMUX_BUILD_TESTS=ON -DVELMUX_FFMPEG_PREFIX="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/host"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure
+
+      # Runs only when a .clang-format file exists at the repository root;
+      # hashFiles returns an empty string otherwise and the step is skipped
+      # silently.
+      - name: clang-format check
+        if: hashFiles('.clang-format') != ''
+        run: |
+          sudo apt-get install -y clang-format
+          # Check every C/C++ source owned by the native layers. Directories
+          # that do not exist are ignored so the step degrades gracefully.
+          sources=$(find core backends bridge/cpp -type f \
+            \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' \) 2>/dev/null || true)
+          if [ -n "$sources" ]; then
+            # --Werror makes clang-format fail on any file it would rewrite.
+            clang-format --dry-run --Werror $sources
+          else
+            echo "No C/C++ sources found; nothing to check."
+          fi
+
+      - name: Upload build and test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-build-logs
+          # Not every failure produces logs; missing files are tolerated.
+          path: |
+            build/**/Testing/
+            build/CMakeFiles/*.log
+          if-no-files-found: ignore
+          retention-days: 7
