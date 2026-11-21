@@ -10,9 +10,11 @@
 
 #include <doctest/doctest.h>
 
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 using namespace velmux::core;
@@ -49,8 +51,10 @@ struct TestEnv {
     std::filesystem::create_directories(dir);
     auto owned = std::make_unique<FfmpegBackend>();
     backend = owned.get();
+    std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+    backends.push_back(std::move(owned));
     engine = VelmuxEngine::create(EngineConfig{dir.string()},
-                                  std::move(owned));
+                                  std::move(backends));
     REQUIRE(engine != nullptr);
   }
   ~TestEnv() {
@@ -63,13 +67,16 @@ struct TestEnv {
 
 // Generates a deterministic H.264+AAC MP4 fixture with the pinned build's
 // ffmpeg binary (dev tooling; the backend itself never spawns processes).
+// Uses -filter_complex source filters (testsrc2/sine): the lavfi input
+// device would require libavdevice, which Velmux intentionally excludes.
 std::string generateFixture(const std::filesystem::path &path,
                             const std::string &videoExpr,
                             const std::string &audioExpr, double seconds) {
   const std::string cmd =
       ffmpegBin() + " -y -hide_banner -loglevel error " +
-      "-f lavfi -i \"" + videoExpr + "\" -f lavfi -i \"" + audioExpr +
-      "\" -c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 96k " +
+      "-filter_complex \"" + videoExpr + "[v];" + audioExpr +
+      "[a]\" -map \"[v]\" -map \"[a]\" "
+      "-c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 96k " +
       "-t " + std::to_string(seconds) + " " +
       // -pix_fmt yuv420p keeps the fixture broadly decodable
       "-pix_fmt yuv420p " + path.string();
@@ -120,14 +127,15 @@ ProbeResult probeWith(const std::string &path) {
       }
     }
     if (fields.size() >= 3 && fields[0] == "stream") {
-      if (fields[1] == "video" && fields[2] != "unknown") {
-        result.videoCodec = fields[2];
+      // csv order: stream,codec_name,codec_type[,width,height|,sample_rate]
+      if (fields[2] == "video" && fields[1] != "unknown") {
+        result.videoCodec = fields[1];
         if (fields.size() >= 5) {
           result.width = std::stoi(fields[3]);
           result.height = std::stoi(fields[4]);
         }
-      } else if (fields[1] == "audio" && fields[2] != "unknown") {
-        result.audioCodec = fields[2];
+      } else if (fields[2] == "audio" && fields[1] != "unknown") {
+        result.audioCodec = fields[1];
         if (fields.size() >= 4) {
           try {
             result.audioSampleRate = std::stoi(fields[3]);

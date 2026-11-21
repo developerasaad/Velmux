@@ -154,10 +154,26 @@ PlanResult Planner::plan(const MediaInfo &source,
 
   const bool canStreamCopyVideo =
       wantsVideo && source.video.front().codec == outVideoCodec &&
-      features_.videoSupport(outVideoCodec).streamCopy;
+      features_.videoSupport(outVideoCodec).streamCopy &&
+      // No transformation requested: stream copy is only valid when the
+      // output streams are identical to the input.
+      !request.video.resolutionHeight.has_value() &&
+      !request.video.frameRate.has_value();
   const bool canStreamCopyAudio =
       wantsAudio && source.audio.front().codec == outAudioCodec &&
-      features_.audioSupport(outAudioCodec).streamCopy;
+      features_.audioSupport(outAudioCodec).streamCopy &&
+      !request.audio.sampleRate.has_value() &&
+      !request.audio.channels.has_value() &&
+      !request.audio.bitRate.has_value();
+  // Goal sanity: remuxing cannot shrink anything. Stream copy satisfies a
+  // size goal only when the source already fits under the target.
+  const bool sizeGoalAllowsCopy =
+      (request.goal.kind != GoalKind::FitUnderSize &&
+       request.goal.kind != GoalKind::SmallerFile) ||
+      (request.goal.targetSizeBytes > 0 && source.sizeBytes > 0 &&
+       source.sizeBytes <= request.goal.targetSizeBytes);
+  const bool streamCopyIsValid =
+      sizeGoalAllowsCopy && canStreamCopyVideo && canStreamCopyAudio;
   const bool sameContainer = source.container == outContainer;
 
   const auto addCandidate = [&](BackendId backend, bool streamCopy) {
@@ -310,7 +326,7 @@ PlanResult Planner::plan(const MediaInfo &source,
   };
 
   // Stream-copy first (never re-encode unnecessarily), then transcodes.
-  if (canStreamCopyVideo && canStreamCopyAudio &&
+  if (streamCopyIsValid &&
       (sameContainer || features_.containerAccepts(outContainer, outVideoCodec))) {
     for (BackendId backend : caps_.registeredBackends()) {
       addCandidate(backend, true);

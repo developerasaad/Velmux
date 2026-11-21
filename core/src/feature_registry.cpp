@@ -15,14 +15,12 @@ namespace {
 std::vector<Container> mp4Family() {
   return {CT::Mp4, CT::M4v, CT::Mov, CT::ThreeGp};
 }
-std::vector<Container> mkvFamily() { return {CT::Mkv, CT::WebM}; }
-std::vector<Container> isoBmff() { return {CT::Mp4, CT::M4v, CT::Mov}; }
+// WebM intentionally accepts only VP8/VP9/AV1 video and Vorbis/Opus audio.
 std::vector<Container> allVideoContainers() {
-  return {CT::Mp4,  CT::M4v, CT::Mov, CT::Mkv, CT::WebM, CT::Avi,
+  return {CT::Mp4,  CT::M4v, CT::Mov, CT::Mkv, CT::Avi,
           CT::MpegTs, CT::Flv, CT::ThreeGp, CT::Asf};
 }
 std::vector<Container> webmOnly() { return {CT::WebM, CT::Mkv}; }
-std::vector<Container> tsFamily() { return {CT::MpegTs}; }
 
 std::vector<Container> audioContainers() {
   return {CT::Mp4, CT::M4a, CT::Mkv, CT::Ogg, CT::Mp3, CT::Wav,

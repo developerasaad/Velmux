@@ -13,9 +13,13 @@
 #include <string>
 #include <vector>
 
+namespace velmux::backend {
+class IInspector; // backend contracts
+} // namespace velmux::backend
+
 namespace velmux::core {
 
-class IInspector; // backend contracts
+using velmux::backend::IInspector;
 
 struct ValidationReport {
   bool ok = false;

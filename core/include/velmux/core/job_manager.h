@@ -14,6 +14,7 @@
 //                     +-> recovering -> running (from safest checkpoint)
 #pragma once
 
+#include "velmux/backend/contracts.h"
 #include "velmux/core/events.h"
 #include "velmux/core/job.h"
 #include "velmux/core/job_store.h"
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace velmux::backend {
@@ -94,9 +96,17 @@ public:
   // Wire the scheduler's run callback: the manager executes the job.
   void attachScheduler(Scheduler &scheduler);
 
+  // Scheduler entry point: executes one job to completion (worker thread).
+  // Called by the engine's scheduler callback when capacity allows.
+  void executeJob(const std::string &jobId);
+
   // Progress reporting from the execution path.
   void reportProgress(const std::string &jobId, double fraction,
                       std::int64_t outputBytes = -1);
+
+  // Cooperative cancel of every running job (engine shutdown). Does not
+  // wait for the workers; the engine joins them separately.
+  void cancelAllRunning(const char *reason);
 
 private:
   struct RunningJob {
@@ -105,7 +115,7 @@ private:
   };
 
   void persistAndEmit(JobRecord &record, const char *transitionNote);
-  void executeJob(const std::string &jobId);
+  void finishFailure(JobRecord &record);
   bool validateOutput(JobRecord &record);
   std::optional<Pipeline> planPipelineFor(const JobRecord &record);
   backend::IBackend *backendFor(const Pipeline &pipeline);

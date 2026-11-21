@@ -8,7 +8,7 @@ using namespace velmux::core;
 
 namespace {
 
-MediaInfo sampleVideo(std::int64_t sizeBytes = 2000LL * 1000 * 1000,
+MediaInfo sampleVideo(std::int64_t sizeBytes = 620'000'000,
                       double durationSec = 600.0) {
   MediaInfo info;
   info.durationSec = durationSec;
@@ -16,10 +16,10 @@ MediaInfo sampleVideo(std::int64_t sizeBytes = 2000LL * 1000 * 1000,
   info.sizeBytes = sizeBytes;
   VideoStream video;
   video.codec = VideoCodec::H264;
-  video.width = 3840;
-  video.height = 2160;
+  video.width = 1920;
+  video.height = 1080;
   video.frameRate = 30.0;
-  video.bitRate = 25'000'000;
+  video.bitRate = 8'000'000;
   info.video.push_back(video);
   AudioStream audio;
   audio.codec = AudioCodec::Aac;
@@ -62,13 +62,23 @@ TEST_CASE("a realistic fit-under-size budget is feasible and consistent") {
 
 TEST_CASE("impossible targets are rejected with an honest message") {
   // 10 minutes of 4K30 video cannot fit in 1 MB.
-  const MediaInfo source = sampleVideo();
+  MediaInfo uhd = sampleVideo();
+  uhd.video.front().width = 3840;
+  uhd.video.front().height = 2160;
+  uhd.video.front().bitRate = 25'000'000;
   const ConversionRequest request = requestForGoal(GoalKind::FitUnderSize,
                                                    1LL * 1000 * 1000);
   const BitrateBudget budget =
-      computeBitrateBudget(source, request, request.goal.targetSizeBytes);
+      computeBitrateBudget(uhd, request, request.goal.targetSizeBytes);
   CHECK_FALSE(budget.feasible);
   CHECK_FALSE(budget.message.empty());
+
+  // 4K content under a tight-but-large target is also honestly infeasible
+  // at the source resolution (the floor bitrate alone exceeds it).
+  const BitrateBudget tight =
+      computeBitrateBudget(uhd, request, 500LL * 1000 * 1000);
+  CHECK_FALSE(tight.feasible);
+  CHECK_FALSE(tight.message.empty());
 }
 
 TEST_CASE("degenerate inputs produce clear infeasibility") {
@@ -116,7 +126,8 @@ TEST_CASE("output estimation respects stream copy") {
 
   Pipeline transcodePipeline = copyPipeline;
   transcodePipeline.videoStreamCopy = false;
-  request.video.bitRate = 2'000'000; // far below the source's 25 Mbps
+  request.video.bitRate = 1'500'000; // far below the source's rate
+  request.audio.bitRate = 96'000;
   const auto transcodeBytes =
       estimateOutputBytes(source, transcodePipeline, request);
   REQUIRE(transcodeBytes.has_value());

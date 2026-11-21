@@ -18,6 +18,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <functional>
 
 struct sqlite3;
 struct sqlite3_stmt;

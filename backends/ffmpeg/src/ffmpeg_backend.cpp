@@ -2,6 +2,7 @@
 #include "velmux/ffmpeg/codec_mapping.h"
 
 #include "velmux/core/compression.h"
+#include "velmux/core/feature_registry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +13,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/opt.h>
@@ -454,28 +456,36 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
       }
     }
 
-    AVPacket outPacket = *toWrite;
-    outPacket.stream_index = outIndex;
-    const AVStream *srcStream = cleanup.in->streams[toWrite->stream_index];
-    outPacket.pts = av_rescale_q_rnd(
-        toWrite->pts, srcStream->time_base,
-        cleanup.out->streams[outIndex]->time_base,
+    // av_interleaved_write_frame takes ownership of the packet content it
+    // is given. A shallow struct copy would share the data buffer with the
+    // source packet without raising its refcount — a use-after-free once
+    // the source is unreffed. Move the reference into a dedicated packet
+    // instead.
+    AVPacket *outPacket = av_packet_alloc();
+    const int srcStreamIndex = toWrite->stream_index;
+    av_packet_move_ref(outPacket, toWrite);
+    if (toWrite != cleanup.packet) {
+      av_packet_free(&toWrite); // filtered shell, now empty
+    }
+    outPacket->stream_index = outIndex;
+    const AVStream *srcStream = cleanup.in->streams[srcStreamIndex];
+    const AVRounding rounding = static_cast<AVRounding>(
         AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-    outPacket.dts = av_rescale_q_rnd(
-        toWrite->dts, srcStream->time_base,
-        cleanup.out->streams[outIndex]->time_base,
-        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-    outPacket.duration =
-        av_rescale_q(toWrite->duration, srcStream->time_base,
+    outPacket->pts = av_rescale_q_rnd(
+        outPacket->pts, srcStream->time_base,
+        cleanup.out->streams[outIndex]->time_base, rounding);
+    outPacket->dts = av_rescale_q_rnd(
+        outPacket->dts, srcStream->time_base,
+        cleanup.out->streams[outIndex]->time_base, rounding);
+    outPacket->duration =
+        av_rescale_q(outPacket->duration, srcStream->time_base,
                      cleanup.out->streams[outIndex]->time_base);
-    outPacket.pos = -1;
+    outPacket->pos = -1;
 
-    if (av_interleaved_write_frame(cleanup.out, &outPacket) < 0) {
+    if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
       writeFailed = true;
     }
-    if (toWrite != cleanup.packet) {
-      av_packet_free(&toWrite);
-    }
+    av_packet_free(&outPacket);
     av_packet_unref(cleanup.packet);
     ++processedPackets;
     if (writeFailed) {
@@ -629,7 +639,7 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
         request.video.bitRate.has_value()) {
       cleanup.videoEnc->bit_rate = *request.video.bitRate;
       cleanup.videoEnc->rc_max_rate = *request.video.bitRate;
-      cleanup.videoEnc->rc_buffer_size = *request.video.bit_rate * 2;
+      cleanup.videoEnc->rc_buffer_size = *request.video.bitRate * 2;
     } else {
       // Quality-driven (CRF-style): explicit quality or goal-derived.
       const std::int32_t qualityPct =
@@ -721,6 +731,30 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     if (cleanup.audioEnc->sample_rate <= 0) {
       cleanup.audioEnc->sample_rate = 48000;
     }
+    // Encoders with restricted rate lists (e.g. Opus: 8/12/16/24/48 kHz)
+    // cannot open at arbitrary rates: pick the closest supported one and
+    // resample into it.
+    if (encCodec->supported_samplerates != nullptr) {
+      bool supported = false;
+      int best = 0;
+      int bestDistance = 0;
+      for (int i = 0; encCodec->supported_samplerates[i] != 0; ++i) {
+        const int candidate = encCodec->supported_samplerates[i];
+        if (candidate == cleanup.audioEnc->sample_rate) {
+          supported = true;
+          break;
+        }
+        const int distance =
+            std::abs(candidate - cleanup.audioEnc->sample_rate);
+        if (best == 0 || distance < bestDistance) {
+          best = candidate;
+          bestDistance = distance;
+        }
+      }
+      if (!supported && best > 0) {
+        cleanup.audioEnc->sample_rate = best;
+      }
+    }
     const std::int32_t channels = request.audio.channels.value_or(
         cleanup.audioDec->ch_layout.nb_channels);
     av_channel_layout_default(&cleanup.audioEnc->ch_layout,
@@ -756,14 +790,21 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     avcodec_parameters_from_context(outAudio->codecpar, cleanup.audioEnc);
     outAudio->time_base = AVRational{1, cleanup.audioEnc->sample_rate};
 
-    cleanup.swr = swr_alloc_set_opts(
-        nullptr, cleanup.audioEnc->ch_layout.u.mask,
-        cleanup.audioEnc->sample_fmt, cleanup.audioEnc->sample_rate,
-        cleanup.audioDec->ch_layout.u.mask,
-        static_cast<AVSampleFormat>(cleanup.audioDec->sample_fmt),
-        cleanup.audioDec->sample_rate > 0 ? cleanup.audioDec->sample_rate
-                                          : 48000,
-        0, nullptr);
+    cleanup.swr = swr_alloc();
+    if (cleanup.swr != nullptr &&
+        swr_alloc_set_opts2(&cleanup.swr,
+                            &cleanup.audioEnc->ch_layout,
+                            cleanup.audioEnc->sample_fmt,
+                            cleanup.audioEnc->sample_rate,
+                            &cleanup.audioDec->ch_layout,
+                            static_cast<AVSampleFormat>(
+                                cleanup.audioDec->sample_fmt),
+                            cleanup.audioDec->sample_rate > 0
+                                ? cleanup.audioDec->sample_rate
+                                : 48000,
+                            0, nullptr) < 0) {
+      swr_free(&cleanup.swr);
+    }
     if (cleanup.swr == nullptr || swr_init(cleanup.swr) < 0) {
       result.error = Error::make(ErrorCode::ExecutionFailed,
                                  "cannot create audio resampler", "ffmpeg");
@@ -806,7 +847,7 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
   bool writeFailed = false;
 
   // Timestamp bookkeeping for continuous output audio (resampler delay).
-  std::int64_t audioSamplesIn = 0;
+  std::int64_t audioSamplesOut = 0;
 
   const auto drainVideoEncoder = [&]() {
     if (cleanup.videoEnc == nullptr) {
@@ -862,7 +903,8 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
           videoFrame->pts =
               av_rescale_q_rnd(cleanup.frame->pts, cleanup.videoDec->time_base,
                                cleanup.videoEnc->time_base,
-                               AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+                               static_cast<AVRounding>(
+                                   AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
           if (avcodec_send_frame(cleanup.videoEnc, videoFrame) == 0) {
             AVPacket *encPacket = av_packet_alloc();
             while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
@@ -917,10 +959,9 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
               cleanup.frame->nb_samples);
           if (converted > 0) {
             audioFrame->nb_samples = converted;
-            audioFrame->pts = av_rescale_rnd(
-                audioSamplesIn + swr_get_delay(cleanup.swr,
-                                               cleanup.audioEnc->sample_rate),
-                1, cleanup.audioEnc->sample_rate, AV_ROUND_NEAR_INF);
+            // Encoder time_base is 1/sample_rate: pts in output samples.
+            audioFrame->pts = audioSamplesOut;
+            audioSamplesOut += converted;
             if (avcodec_send_frame(cleanup.audioEnc, audioFrame) == 0) {
               AVPacket *encPacket = av_packet_alloc();
               while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
@@ -935,7 +976,7 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
               av_packet_free(&encPacket);
             }
           }
-          audioSamplesIn += cleanup.frame->nb_samples;
+          (void)0; /* input sample counting not needed: pts follows output samples */
           av_frame_free(&audioFrame);
           av_frame_unref(cleanup.frame);
         }

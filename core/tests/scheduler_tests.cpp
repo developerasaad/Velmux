@@ -67,8 +67,10 @@ TEST_CASE("submit starts jobs while capacity allows") {
 
   scheduler.submit("a");
   scheduler.submit("b");
-  CHECK(scheduler.runningCount() ==
-        std::size_t(scheduler.policy().maxConcurrentJobs));
+  // Two jobs, capacity >= 2 on a healthy desktop: both run immediately.
+  const auto capacity =
+      std::size_t(std::max(scheduler.policy().maxConcurrentJobs, 2));
+  CHECK(scheduler.runningCount() == std::min<std::size_t>(2, capacity));
   CHECK(scheduler.queuedCount() + scheduler.runningCount() == 2);
   CHECK(recorder.started.size() == scheduler.runningCount());
 }
@@ -94,11 +96,15 @@ TEST_CASE("finish frees a slot and starts the next queued job") {
 TEST_CASE("higher priority jobs run first within a capacity batch") {
   Recorder recorder;
   Scheduler scheduler(recorder.run);
-  scheduler.updateResources(desktopSnapshot());
-  scheduler.setPolicy(SchedulerPolicy{1, 1, true});
-
+  // Queue everything while no capacity is available.
+  scheduler.setPolicy(SchedulerPolicy{0, 0, true});
   scheduler.submit("low", 1);
   scheduler.submit("high", 9);
+  CHECK(recorder.started.empty());
+
+  // Grant one slot: the high-priority job starts, low stays queued.
+  scheduler.setPolicy(SchedulerPolicy{1, 1, true});
+  scheduler.pump();
   REQUIRE(recorder.started.size() == 1);
   CHECK(recorder.started.front() == "high");
   CHECK(scheduler.queuedJobIds().front() == "low");

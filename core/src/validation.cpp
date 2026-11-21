@@ -22,6 +22,32 @@ bool fileExists(const std::string &path, std::int64_t *sizeOut = nullptr) {
   return true;
 }
 
+// Container families that share one demuxer name on inspection: the
+// distinction (WebM vs Matroska, MP4 vs M4V) is a muxer-side restriction
+// that a re-parse of the output cannot always see. Family members count as
+// a match; the codec checks carry the real compatibility constraints.
+bool containerFamilyMatches(Container expected, Container observed) {
+  const auto sameFamily = [](Container a, Container b) {
+    if (a == b) {
+      return true;
+    }
+    const bool aMkv = a == Container::Mkv || a == Container::WebM;
+    const bool bMkv = b == Container::Mkv || b == Container::WebM;
+    if (aMkv && bMkv) {
+      return true;
+    }
+    const bool aIso = a == Container::Mp4 || a == Container::M4v ||
+                      a == Container::Mov;
+    const bool bIso = b == Container::Mp4 || b == Container::M4v ||
+                      b == Container::Mov;
+    if (aIso && bIso) {
+      return true;
+    }
+    return false;
+  };
+  return sameFamily(expected, observed);
+}
+
 } // namespace
 
 ValidationReport OutputValidator::validate(const std::string &outputPath,
@@ -47,7 +73,7 @@ ValidationReport OutputValidator::validate(const std::string &outputPath,
     return report;
   }
 
-  if (report.observed.container != expect.container) {
+  if (!containerFamilyMatches(expect.container, report.observed.container)) {
     report.problems.push_back(
         std::string("Container mismatch: expected ") +
         containerName(expect.container) + ", found " +

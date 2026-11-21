@@ -112,9 +112,10 @@ std::optional<SubtitleFormat> subtitleFormatFromAv(AVCodecID id) {
     case AV_CODEC_ID_TTML:
       return SubtitleFormat::Ttml;
     case AV_CODEC_ID_EIA_608:
+      // CEA-708 is carried by the same closed-caption infrastructure in
+      // FFmpeg 7.1 (no distinct codec id); the capability report therefore
+      // does not claim CEA-708 decoding.
       return SubtitleFormat::Cea608;
-    case AV_CODEC_ID_EIA_708:
-      return SubtitleFormat::Cea708;
     case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
       return SubtitleFormat::Pgs;
     case AV_CODEC_ID_DVD_SUBTITLE:
@@ -246,7 +247,13 @@ std::optional<Container> containerFromAvFormatName(const char *name) {
   if (n == "mp4" || n.rfind("mp4,", 0) == 0) {
     return Container::Mp4;
   }
-  if (n == "mov,mp4,m4a,3gp,3g2,mj2" || n == "mov") {
+  // The mov-family demuxer handles mov/mp4/m4a/3gp/3g2/mj2 with one name;
+  // for INPUT the family default is Mp4 (most common). The muxer side
+  // reports the precise "mov"/"mp4" names.
+  if (n == "mov,mp4,m4a,3gp,3g2,mj2") {
+    return Container::Mp4;
+  }
+  if (n == "mov") {
     return Container::Mov;
   }
   if (n == "matroska,webm" || n == "matroska") {

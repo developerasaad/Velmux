@@ -7,6 +7,7 @@
 // Copyright: Velmux project. License: see repository LICENSE.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -153,6 +154,14 @@ enum class SubtitleFormat : std::uint8_t {
 enum class MediaKind : std::uint8_t { Video, Audio, Subtitle, Data };
 
 enum class CodecOp : std::uint8_t { Decode, Encode, StreamCopy };
+
+// Per-codec operation support (shared by feature and capability
+// registries).
+struct CodecSupport {
+  bool decode = false;
+  bool encode = false;
+  bool streamCopy = false;
+};
 
 // Canonical names (used in JSON persistence, the bridge and logs).
 const char *codecName(VideoCodec codec);

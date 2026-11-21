@@ -19,7 +19,7 @@ namespace velmux::core {
 namespace {
 
 std::int64_t nowMs() {
-  return std::chrono::duration_cast<std::int64_t, std::milli>(
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
 }
@@ -146,7 +146,7 @@ Result<MediaInfo> JobManager::inspect(const MediaSource &source) {
     }
     // Untrusted input isolation: try the next backend; if all fail, report
     // the last error.
-    if (&backend == &backends_.back()) {
+    if (backend == backends_.back()) {
       return Result<MediaInfo>(error);
     }
   }

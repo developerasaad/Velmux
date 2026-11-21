@@ -11,6 +11,8 @@
 // between backends under the checkpoint coordinator's control.
 #pragma once
 
+#include "velmux/core/capability_registry.h"
+#include "velmux/core/job.h"
 #include "velmux/core/media_model.h"
 #include "velmux/core/pipeline_fwd.h"
 #include "velmux/core/types.h"
@@ -20,6 +22,8 @@
 #include <memory>
 
 namespace velmux::backend {
+
+using velmux::core::MediaKind;
 
 // ---------------------------------------------------------------------------
 // Buffer model

@@ -116,10 +116,43 @@ if(VELMUX_FFMPEG_FOUND)
                        "${VELMUX_FFMPEG_LIBS}")
     target_compile_options(velmux_backend_ffmpeg PRIVATE
                            ${VELMUX_FFMPEG_CFLAGS_SPLIT})
-    target_link_options(velmux_backend_ffmpeg PUBLIC ${VELMUX_FFMPEG_LIBS_SPLIT})
+    # Raw -l/-L flags go through target_link_libraries so they appear AFTER
+    # the objects (static archives resolve left-to-right).
+    target_link_libraries(velmux_backend_ffmpeg PUBLIC velmux::core
+                          ${VELMUX_FFMPEG_LIBS_SPLIT})
     if(UNIX)
       target_compile_options(velmux_backend_ffmpeg PRIVATE -Wall -Wextra)
     endif()
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Platform backend skeletons (honest availability reporting)
+# ---------------------------------------------------------------------------
+add_library(velmux_backend_android backends/android/cpp/android_backend.cpp)
+target_link_libraries(velmux_backend_android PUBLIC velmux::core ${CMAKE_DL_LIBS})
+target_include_directories(velmux_backend_android
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/android/cpp>)
+
+add_library(velmux_backend_apple backends/apple/objcpp/apple_backend.cpp)
+target_link_libraries(velmux_backend_apple PUBLIC velmux::core)
+target_include_directories(velmux_backend_apple
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/apple/objcpp>)
+
+# ---------------------------------------------------------------------------
+# Bridge (engine-side serialization + stable C facade for hosts)
+# ---------------------------------------------------------------------------
+if(VELMUX_FFMPEG_FOUND)
+  add_library(velmux_bridge
+    bridge/cpp/velmux_bridge.cpp
+  )
+  target_link_libraries(velmux_bridge
+    PUBLIC velmux::core velmux::backend-ffmpeg velmux_backend_android
+           velmux_backend_apple)
+  target_compile_definitions(velmux_bridge PRIVATE
+    VELMUX_WITH_ANDROID_BACKEND=1 VELMUX_WITH_APPLE_BACKEND=1)
+  if(UNIX)
+    target_compile_options(velmux_bridge PRIVATE -Wall -Wextra)
   endif()
 endif()
 

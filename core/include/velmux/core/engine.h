@@ -80,6 +80,10 @@ private:
   std::unique_ptr<JobManager> jobs_;
   std::unique_ptr<Scheduler> scheduler_;
   std::vector<std::unique_ptr<backend::IBackend>> backends_;
+  // Worker threads spawned by the scheduler callback; joined at shutdown
+  // before any member tears down (spec: deterministic resource cleanup).
+  std::vector<std::thread> workers_;
+  std::mutex workersMutex_;
 };
 
 } // namespace velmux::core

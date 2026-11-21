@@ -7,8 +7,10 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 
 using namespace velmux::core;
@@ -40,22 +42,24 @@ public:
       return Error::make(ErrorCode::SourceUnavailable,
                          "fake inspector: missing source", "fake");
     }
+    // Canned answer consistent with what the fake executor "produces":
+    // the requestFor() below always asks for VP9/Opus into MKV.
     out = MediaInfo{};
     out.durationSec = 10.0;
-    out.container = Container::Mp4;
+    out.container = Container::Mkv;
     out.sizeBytes = std::filesystem::file_size(source.uri, ec);
     VideoStream video;
-    video.codec = VideoCodec::H264;
+    video.codec = VideoCodec::VP9;
     video.width = 1280;
     video.height = 720;
     video.frameRate = 30.0;
     video.bitRate = 2'000'000;
     out.video.push_back(video);
     AudioStream audio;
-    audio.codec = AudioCodec::Aac;
+    audio.codec = AudioCodec::Opus;
     audio.channels = 2;
-    audio.sampleRate = 44100;
-    audio.bitRate = 128'000;
+    audio.sampleRate = 48000;
+    audio.bitRate = 96'000;
     out.audio.push_back(audio);
     return {};
   }
@@ -138,8 +142,7 @@ public:
   void onJobEvent(const JobEvent &event) override {
     std::lock_guard<std::mutex> lock(mutex_);
     events.push_back(event);
-    if (event.state == JobState::Completed ||
-        event.state == JobState::Failed) {
+    if (isTerminal(event.state)) {
       done.notify_all();
     }
   }
@@ -147,18 +150,22 @@ public:
     std::unique_lock<std::mutex> lock(mutex_);
     done.wait_for(lock, timeout, [this] {
       for (const auto &e : events) {
-        if (e.state == JobState::Completed || e.state == JobState::Failed) {
+        if (isTerminal(e.state)) {
           return true;
         }
       }
       return false;
     });
     for (const auto &e : events) {
-      if (e.state == JobState::Completed || e.state == JobState::Failed) {
+      if (isTerminal(e.state)) {
         return e;
       }
     }
     return std::nullopt;
+  }
+  static bool isTerminal(JobState state) {
+    return state == JobState::Completed || state == JobState::Failed ||
+           state == JobState::Canceled;
   }
   std::vector<JobEvent> events;
   std::mutex mutex_;
@@ -174,8 +181,10 @@ public:
     std::filesystem::create_directories(dir_);
     auto backend = std::make_unique<FakeBackend>();
     backend_ = backend.get();
+    std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+    backends.push_back(std::move(backend));
     engine_ = VelmuxEngine::create(EngineConfig{dir_.string()},
-                                   std::move(backend));
+                                   std::move(backends));
     REQUIRE(engine_ != nullptr);
     engine_->events().subscribe(&recorder_);
   }
@@ -217,7 +226,7 @@ TEST_CASE("engine inspects sources through the backend") {
       env.engine().inspect(MediaSource{media, "in.mp4"});
   REQUIRE(info.ok());
   CHECK(info.value().durationSec == doctest::Approx(10.0));
-  CHECK(info.value().video.front().codec == VideoCodec::H264);
+  CHECK(info.value().video.front().codec == VideoCodec::VP9);
   CHECK(info.value().sizeBytes == 64 * 1024);
 
   const Result<MediaInfo> missing = env.engine().inspect(
@@ -264,7 +273,11 @@ TEST_CASE("full job lifecycle: submit, run, validate, complete, persist") {
   // accepts any non-empty file, so completion implies the output existed.
   const auto jobs = env.engine().listJobs();
   REQUIRE(jobs.size() == 1);
-  CHECK(jobs[0].pipelineSummary.find("VP9") != std::string::npos);
+  // The canned source reports VP9/Opus-in-MKV, so the planner legitimately
+  // picks the stream-copy remux path for this request.
+  CHECK(jobs[0].pipelineSummary.find("emux") != std::string::npos);
+  CHECK_FALSE(jobs[0].outputPath.empty());
+  CHECK(std::filesystem::exists(jobs[0].outputPath));
 }
 
 TEST_CASE("cancel terminates a running job honestly") {
@@ -288,9 +301,11 @@ TEST_CASE("cancel terminates a running job honestly") {
 
 TEST_CASE("engine creation with an unusable data dir fails honestly") {
   auto backend = std::make_unique<FakeBackend>();
+  std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+  backends.push_back(std::move(backend));
   auto engine =
       VelmuxEngine::create(EngineConfig{"/proc/definitely/not/writable"},
-                           std::move(backend));
+                           std::move(backends));
   CHECK(engine == nullptr);
 }
 

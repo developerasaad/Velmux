@@ -9,6 +9,7 @@
 
 #include <sys/stat.h>
 #include <thread>
+#include <vector>
 
 namespace velmux::core {
 
@@ -23,7 +24,23 @@ bool ensureDir(const std::string &path) {
 VelmuxEngine::VelmuxEngine(EngineConfig config)
     : config_(std::move(config)), features_(FeatureRegistry::instance()) {}
 
-VelmuxEngine::~VelmuxEngine() = default;
+VelmuxEngine::~VelmuxEngine() {
+  // Lifecycle contract: workers are joined before any member tears down.
+  // Running jobs get a cooperative cancel so joins complete quickly; the
+  // durable records keep their committed checkpoints for recovery.
+  if (jobs_ != nullptr) {
+    jobs_->cancelAllRunning("engine shutdown");
+  }
+  {
+    std::lock_guard<std::mutex> lock(workersMutex_);
+    for (std::thread &worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers_.clear();
+  }
+}
 
 std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
     const EngineConfig &config,
@@ -83,17 +100,22 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
   }
   engine->jobs_->setValidator(engine->validator_.get());
 
-  // Scheduler: executes jobs on worker threads, honoring resource limits.
+  // Scheduler: executes jobs on worker threads OWNED by this engine (so
+  // shutdown can join them), honoring resource limits.
   ResourceSnapshot initial;
   initial.cpuCores = std::max<std::int32_t>(
       1, std::int32_t(std::thread::hardware_concurrency()));
-  engine->scheduler_ = std::make_unique<Scheduler>([engineRaw = engine.get()](
-                                                       const std::string &jobId) {
-    // Each job runs on its own worker thread; the scheduler bounds
-    // concurrency. UI threads are never blocked (spec §4.1).
-    std::thread([engineRaw, jobId] { engineRaw->jobs_->executeJob(jobId); })
-        .detach();
-  });
+  engine->scheduler_ = std::make_unique<Scheduler>(
+      [engineRaw = engine.get()](const std::string &jobId) {
+        // Each job runs on its own worker thread; the scheduler bounds
+        // concurrency. UI threads are never blocked (spec §4.1), and the
+        // engine joins every worker at shutdown.
+        std::thread worker([engineRaw, jobId] {
+          engineRaw->jobs_->executeJob(jobId);
+        });
+        std::lock_guard<std::mutex> lock(engineRaw->workersMutex_);
+        engineRaw->workers_.push_back(std::move(worker));
+      });
   engine->scheduler_->updateResources(initial);
 
   // Crash recovery: reconcile DB + artifacts before serving traffic.

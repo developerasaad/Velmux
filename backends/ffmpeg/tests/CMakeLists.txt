@@ -12,7 +12,8 @@ if(NOT EXISTS "${FFPROBE}")
 endif()
 
 function(velmux_ffmpeg_test name)
-  add_executable(${name} ${name}.cpp)
+  add_executable(${name} ${name}.cpp
+                 ${CMAKE_SOURCE_DIR}/core/tests/doctest_main.cpp)
   target_link_libraries(${name} PRIVATE velmux::core velmux::backend-ffmpeg
                                         doctest)
   target_compile_definitions(${name} PRIVATE

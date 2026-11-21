@@ -60,12 +60,6 @@ enum class Operation : std::uint16_t {
   SubtitleTextConversion,
 };
 
-struct CodecSupport {
-  bool decode = false;
-  bool encode = false;
-  bool streamCopy = false;
-};
-
 struct VideoCodecFeature {
   VideoCodec codec;
   CodecSupport support;

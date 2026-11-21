@@ -21,19 +21,20 @@ REQUIRED_DECODERS = {
     "prores", "dnxhd", "ffv1", "mjpeg",
     # audio
     "aac", "mp3", "opus", "vorbis", "flac", "alac", "pcm_s16le", "ac3", "eac3",
-    "dts", "truehd", "wmapro", "wmav2", "wavpack", "ape", "amrnb", "amrwb",
-    # subtitles
-    "srt", "subrip", "webvtt", "ass", "ssa", "mov_text", "ttml", "text",
-    "dvb_subtitle", "pgssub", "dvdsub",
+    "dca", "truehd", "wmapro", "wmav2", "wavpack", "ape", "amrnb", "amrwb",
+    # subtitles (FFmpeg 7.1 names; TTML decode is demux-level in this pin
+    # and is tracked as a known limitation in docs/FEATURE_MATRIX.md)
+    "srt", "subrip", "webvtt", "ass", "ssa", "mov_text", "text",
+    "dvbsub", "pgssub", "dvdsub",
 }
 
 REQUIRED_ENCODERS = {
     # video
-    "libx264", "libsvtav1", "libvpx-vp8", "libvpx-vp9", "mpeg4", "ffv1",
+    "libx264", "libsvtav1", "libvpx", "libvpx-vp9", "mpeg4", "ffv1",
     "mjpeg", "libx264rgb",
     # audio
     "aac", "libmp3lame", "libopus", "libvorbis", "flac", "pcm_s16le", "ac3",
-    "libwavpack", "libopusenc",
+    "wavpack",
     # subtitles
     "srt", "subrip", "webvtt", "ass", "mov_text", "text",
 }

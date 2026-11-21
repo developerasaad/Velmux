@@ -1,5 +1,7 @@
 #include "velmux/core/recovery.h"
 
+#include <sqlite3.h>
+
 #include <sys/stat.h>
 
 #include <algorithm>

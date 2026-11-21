@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cctype>
 
 using namespace velmux::core;
 
@@ -111,7 +112,8 @@ TEST_CASE_FIXTURE(Fixture, "same-codec remux prefers stream copy") {
   REQUIRE(plan.best.has_value());
   CHECK(plan.best->pipeline.videoStreamCopy);
   CHECK(plan.best->pipeline.audioStreamCopy);
-  CHECK(plan.best->pipeline.summary.find("remux") != std::string::npos);
+  // Summary names the remux path (capital R).
+  CHECK(plan.best->pipeline.summary.find("Remux") != std::string::npos);
 }
 
 TEST_CASE_FIXTURE(Fixture, "transcode requests re-encode with valid stages") {
@@ -161,7 +163,12 @@ TEST_CASE_FIXTURE(Fixture,
 
   const PlanResult plan = planner.plan(source, request);
   CHECK_FALSE(plan.feasible);
-  CHECK(plan.message.find("subtitle") != std::string::npos);
+  // Case-insensitive: the message names the subtitle problem.
+  std::string lower;
+  for (char c : plan.message) {
+    lower.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+  }
+  CHECK(lower.find("subtitle") != std::string::npos);
 }
 
 TEST_CASE_FIXTURE(Fixture, "explicit subtitle removal avoids the conflict") {
@@ -253,7 +260,7 @@ TEST_CASE_FIXTURE(Fixture, "alternates are ranked best-first") {
   const MediaInfo source = h264AacSource();
   ConversionRequest request;
   request.video.codec = VideoCodec::H264;
-  request.audio.codec = VideoCodec::Aac;
+  request.audio.codec = AudioCodec::Aac;
   request.outputContainer = Container::Mp4;
 
   const PlanResult plan = planner.plan(source, request);

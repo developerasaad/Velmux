@@ -63,9 +63,8 @@ static void print_codec_list(int encoders) {
         if (!first) putchar(',');
         first = 0;
         printf("{\"name\":");
-        print_json_string(avcodec_get_name(codec));
+        print_json_string(codec->name);
         printf(",\"type\":\"%s\"", media_type_name(codec->type));
-        if (codec->wrapper_only) printf(",\"wrapper_only\":true");
         printf("}");
     }
 }
