@@ -19,30 +19,24 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "required tool '$1' not found in PATH"
 }
 
-# Ensure cmake and ninja are usable. The sandbox installs them via a python
-# venv; prefer system tools, fall back to the venv.
+# Optional extra tool locations (e.g. a user venv carrying cmake/ninja/meson
+# when the system does not). Set VELMUX_TOOL_PATH to a colon-separated list.
+if [ -n "${VELMUX_TOOL_PATH:-}" ]; then
+  case ":$PATH:" in
+    *":$VELMUX_TOOL_PATH:"*) ;;
+    *) export PATH="$VELMUX_TOOL_PATH:$PATH" ;;
+  esac
+fi
+
+# Ensure cmake and ninja are usable (dav1d, fribidi and friends build with
+# them; FFmpeg's configure accepts ninja makefiles).
 ensure_cmake_ninja() {
-  if ! command -v cmake >/dev/null 2>&1; then
-    if [ -x /home/z/.venv/bin/cmake ]; then
-      export PATH="/home/z/.venv/bin:$PATH"
-    fi
-  fi
-  if ! command -v ninja >/dev/null 2>&1; then
-    if [ -x /home/z/.venv/bin/ninja ]; then
-      export PATH="/home/z/.venv/bin:$PATH"
-    fi
-  fi
   command -v cmake >/dev/null 2>&1 || die "cmake not found"
   command -v ninja >/dev/null 2>&1 || die "ninja not found"
 }
 
 # ensure_meson: dav1d builds with meson.
 ensure_meson() {
-  if ! command -v meson >/dev/null 2>&1; then
-    if [ -x /home/z/.venv/bin/meson ]; then
-      export PATH="/home/z/.venv/bin:$PATH"
-    fi
-  fi
   command -v meson >/dev/null 2>&1 || die "meson not found (install with: pip install meson)"
 }
 

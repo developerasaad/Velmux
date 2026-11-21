@@ -44,7 +44,8 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsqlite3-dev
+          # meson: dav1d build system; pkg-config: FFmpeg configure probes.
+          sudo apt-get install -y ninja-build libsqlite3-dev meson pkg-config
 
       - name: Verify CMake toolchain
         run: |
