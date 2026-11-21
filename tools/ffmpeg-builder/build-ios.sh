@@ -202,6 +202,24 @@ build_one_slice() {
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" >/dev/null
     cmake --build "$zlib_build" >/dev/null
     cmake --install "$zlib_build" >/dev/null
+    # zlib's CMake build installs no pkg-config file (only autotools does);
+    # freetype2.pc's "Requires: zlib" needs one, so write it explicitly with
+    # the pinned version.
+    mkdir -p "$SLICE_PREFIX/lib/pkgconfig"
+    cat > "$SLICE_PREFIX/lib/pkgconfig/zlib.pc" <<ZPC
+prefix=$SLICE_PREFIX
+exec_prefix=$${prefix}
+libdir=$${prefix}/lib
+includedir=$${prefix}/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.3.1
+
+Requires:
+Libs: -L$${libdir} -lz
+Cflags: -I$${includedir}
+ZPC
     log "[$slice] zlib installed"
   fi
 
