@@ -208,17 +208,17 @@ build_one_slice() {
     mkdir -p "$SLICE_PREFIX/lib/pkgconfig"
     cat > "$SLICE_PREFIX/lib/pkgconfig/zlib.pc" <<ZPC
 prefix=$SLICE_PREFIX
-exec_prefix=$${prefix}
-libdir=$${prefix}/lib
-includedir=$${prefix}/include
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
 
 Name: zlib
 Description: zlib compression library
 Version: 1.3.1
 
 Requires:
-Libs: -L$${libdir} -lz
-Cflags: -I$${includedir}
+Libs: -L\${libdir} -lz
+Cflags: -I\${includedir}
 ZPC
     log "[$slice] zlib installed"
   fi

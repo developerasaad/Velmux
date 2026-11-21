@@ -193,17 +193,17 @@ build_one_abi() {
     mkdir -p "$prefix/lib/pkgconfig"
     cat > "$prefix/lib/pkgconfig/zlib.pc" <<ZPC
 prefix=$prefix
-exec_prefix=$${prefix}
-libdir=$${prefix}/lib
-includedir=$${prefix}/include
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
 
 Name: zlib
 Description: zlib compression library
 Version: 1.3.1
 
 Requires:
-Libs: -L$${libdir} -lz
-Cflags: -I$${includedir}
+Libs: -L\${libdir} -lz
+Cflags: -I\${includedir}
 ZPC
     log "[$abi] zlib installed"
   fi
