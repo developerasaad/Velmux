@@ -7,12 +7,12 @@ the ultimate truth.
 
 | # | Milestone | State |
 |---|---|---|
-| 0 | Foundation (monorepo, RN app, C++ engine, bridge, backend skeletons, FFmpeg builder foundation, docs, CI) | In progress |
-| 1 | First real Android conversion (MP4/H.264/AAC via native APIs) | Not started |
+| 0 | Foundation (monorepo, RN app, C++ engine, bridge, backend skeletons, FFmpeg builder foundation, docs, CI) | Mostly complete; FFmpeg mobile artifacts pending (M3) |
+| 1 | First real Android conversion (MP4/H.264/AAC via native APIs) | Not started (Android backend is an honest skeleton) |
 | 2 | Capability system and planner | In progress (core-level, host-validated) |
-| 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | Not started (host build works) |
+| 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | In progress: build-android.sh + build-ios.sh written; artifacts building in CI (manual dispatch) |
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
-| 5 | Complete V1 media support | Not started |
+| 5 | Complete V1 media support | Not started (host FFmpeg backend covers the codec catalog) |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
 | 7 | Persistence/recovery | Partial (SQLite job store + checkpoint model + shutdown-to-recovery contract; fault-injection pending) |
 | 8 | Background and notifications | Not started |
@@ -23,36 +23,55 @@ the ultimate truth.
 
 ## What actually works today
 
-- C++ core builds on Linux with CMake/Ninja; unit tests pass (feature registry,
-  capability registry, planner, compression budgets, scheduler, job state machine,
-  pause/resume, shutdown-to-recovery handoff). Full suite passes under
-  ASan+UBSan with leak detection.
+- C++ core builds on Linux with CMake/Ninja; 10/10 test suites pass (feature
+  registry, capability registry, planner, compression budgets, scheduler, job
+  state machine, pause/resume, shutdown-to-recovery handoff, job store,
+  recovery). Full suite passes under ASan+UBSan with leak detection.
 - FFmpeg backend performs REAL conversions through libav* libraries directly
   (demux → decode → process → encode → mux) on host, with output validation via
   the core validator and an independent ffprobe cross-check.
-- Pinned host FFmpeg builds through `tools/ffmpeg-builder/build-host.sh`.
-- React Native app source with Home/Convert/Queue/History/Settings surfaces;
-  `tsc --noEmit` and `eslint` clean.
-- Engine shutdown contract: running jobs are durably marked `recovering`
-  (never silently canceled) and auto-resume on next startup; user-paused and
-  interrupted jobs are never auto-resumed (user resumes explicitly).
-- CI builds core+tests on Linux (fast signal).
+- The bridge C facade is complete and tested: JSON request parsing, plan,
+  startJob, cancel/pause/resume, getJob/listJobs, describeBackends and
+  event polling; bridge integration tests run a REAL conversion end-to-end
+  through JSON exactly as mobile hosts will, with ffprobe cross-validation.
+- Android app builds the C++ engine natively (gradle externalNativeBuild →
+  monorepo CMake, embedded public-domain SQLite for the NDK) with a JNI
+  adapter and a TurboModule (`VelmuxEngine`) implementing the codegen'd spec;
+  durable engine storage under filesDir; event polling at UI cadence.
+- iOS app builds in CI (CocoaPods + simulator build); engine wiring for iOS
+  is the next integration step.
+- Pinned host FFmpeg builds through `tools/ffmpeg-builder/build-host.sh`
+  (all 16 pinned sources fetch+checksum-verified from automation-friendly
+  mirrors; SourceForge/code.videolan.org are avoided because they block or
+  serve byte-unstable content to CI).
+- React Native app: Home/Convert/Queue/History/Settings; tsc + eslint + jest
+  green; durable SAF document picking (requestLongTermAccess).
+- CI on GitHub Actions: core+tests (Linux, with the pinned FFmpeg built
+  in-run), mobile TS checks, Android APK, iOS simulator build, FFmpeg mobile
+  artifacts (manual dispatch, building now).
 
 ## Known limitations (do not pretend otherwise)
 
-- Android/iOS backends are skeletons: real interfaces and capability reporting,
-  but no working device conversion yet (M1).
-- Hybrid stage-composed execution interfaces exist; only whole-pipeline FFmpeg
-  execution is implemented (M4 pending).
+- Android/iOS backends are skeletons: real interfaces and capability
+  reporting, but no working device conversion yet (M1).
+- The Android app links the engine WITHOUT the FFmpeg backend until the
+  mobile artifacts are consumed (M3 wiring: `-PvelmuxFFmpegPrefix=...`);
+  conversions on-device report honest "no compatible pipeline" errors until
+  then.
+- Hybrid stage-composed execution interfaces exist; only whole-pipeline
+  FFmpeg execution is implemented (M4 pending).
 - No background hosts/notifications yet (M8).
-- FFmpeg mobile artifacts not yet built: `build-android.sh` and `build-ios.sh`
-  are still to be written (M3); only the host builder exists. The
-  `ffmpeg-mobile.yml` workflow is manual-dispatch until then.
+- FFmpeg mobile artifacts (out/android, out/ios) are being validated in CI
+  for the first time; armeabi-v7a honestly omits SVT-AV1 (32-bit unsupported
+  upstream), as does the x86_64 iOS simulator slice.
 - Recovery fault-injection test suite not yet implemented (M7 completion).
 
 ## Environment notes
 
-- Sandbox: Linux, no Android SDK/NDK installed locally yet; CI is authoritative
-  for Android/iOS builds.
+- Sandbox: Linux, no Android SDK/NDK installed locally; CI is authoritative
+  for Android/iOS builds (and now for the FFmpeg mobile artifacts too).
 - Host FFmpeg dev packages unavailable; backend builds against the pinned
   FFmpeg produced by `tools/ffmpeg-builder` (correct per spec §28).
+- The sandbox image happens to carry system fribidi/libass headers, which
+  once masked a pkg-config search-path bug; CI's clean runners are the
+  authoritative validator for the builder.

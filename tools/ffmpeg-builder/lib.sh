@@ -40,6 +40,25 @@ ensure_meson() {
   command -v meson >/dev/null 2>&1 || die "meson not found (install with: pip install meson)"
 }
 
+# sha256_of <file> — portable digest (GNU coreutils, macOS shasum, openssl).
+# macOS Sequoia ships a BSD-style sha256sum without GNU's checksum-file mode,
+# so verify by digest comparison instead of `sha256sum -c`.
+sha256_of() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | cut -d' ' -f1
+  else
+    openssl dgst -sha256 -r "$file" | cut -d' ' -f1
+  fi
+}
+
+# verify_sha256 <expected> <file> — true when the file matches the pin.
+verify_sha256() {
+  [ "$(sha256_of "$2")" = "$1" ]
+}
+
 # json_field <file> <dot.path> — minimal JSON reader using python3.
 # Prints nothing when the path does not exist.
 json_field() {
@@ -81,7 +100,7 @@ fetch_tarball() {
   mkdir -p "$DOWNLOADS_DIR"
   local dest="$DOWNLOADS_DIR/$fname"
 
-  if [ -f "$dest" ] && echo "$sha256  $dest" | sha256sum -c --status 2>/dev/null; then
+  if [ -f "$dest" ] && verify_sha256 "$sha256" "$dest"; then
     log "using cached $fname"
     echo "$dest"
     return 0
@@ -101,7 +120,7 @@ fetch_tarball() {
   done
   [ "$ok" = "1" ] || die "failed to download $name from any listed URL"
 
-  echo "$sha256  $dest" | sha256sum -c --status || die "checksum mismatch for $fname (expected $sha256)"
+  verify_sha256 "$sha256" "$dest" || die "checksum mismatch for $fname (expected $sha256, got $(sha256_of "$dest"))"
   log "verified $fname"
   echo "$dest"
 }
@@ -115,7 +134,7 @@ fetch_ffmpeg() {
   mkdir -p "$DOWNLOADS_DIR"
   local dest="$DOWNLOADS_DIR/$fname"
 
-  if [ -f "$dest" ] && echo "$sha256  $dest" | sha256sum -c --status 2>/dev/null; then
+  if [ -f "$dest" ] && verify_sha256 "$sha256" "$dest"; then
     log "using cached $fname"
     echo "$dest"
     return 0
@@ -134,7 +153,7 @@ fetch_ffmpeg() {
   done
   [ "$ok" = "1" ] || die "failed to download ffmpeg from any listed URL"
 
-  echo "$sha256  $dest" | sha256sum -c --status || die "checksum mismatch for $fname (expected $sha256)"
+  verify_sha256 "$sha256" "$dest" || die "checksum mismatch for $fname (expected $sha256, got $(sha256_of "$dest"))"
   log "verified $fname"
   echo "$dest"
 }

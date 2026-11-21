@@ -32,12 +32,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK command line tools
-        uses: android-actions/setup-android@v3
-
+      # ubuntu-latest runners ship the Android SDK with cmdline-tools at
+      # /usr/local/lib/android/sdk (ANDROID_HOME is preset). The
+      # android-actions/setup-android action is unnecessary here and currently
+      # broken (it tries to install the removed legacy 'tools' package).
       - name: Install NDK 27.0.12077973 and platform-tools
         run: |
-          yes | sdkmanager --licenses
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "ndk;27.0.12077973" "platform-tools"
 
       - name: Install host build tools
