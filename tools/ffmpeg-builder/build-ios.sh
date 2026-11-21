@@ -162,6 +162,16 @@ needs_exe_wrapper = true
 EOF
 }
 
+# Native (build machine) file: the compiler that runs ON the build machine.
+# macOS runners ship /usr/bin/clang; it must not be the iOS-targeting wrapper
+# or fribidi's gen.tab host-side generators cannot be built.
+write_meson_native() {
+  cat <<EOF
+[binaries]
+c = '/usr/bin/clang'
+EOF
+}
+
 build_one_slice() {
   local slice="$1"
   slice_settings "$slice"
@@ -286,6 +296,10 @@ build_one_slice() {
        --extra-cflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG" \
        >"$vpx_log" 2>&1); then
       cat "$vpx_log" >&2
+      if [ -f "$vpx_src/config.log" ]; then
+        echo "--- vpx config.log (tail) ---" >&2
+        tail -n 80 "$vpx_src/config.log" >&2
+      fi
       die "[$slice] libvpx configure failed (full log above)"
     fi
     (cd "$vpx_src" && make -j"$JOBS" >/dev/null && make install >/dev/null)
@@ -301,11 +315,13 @@ build_one_slice() {
     rm -rf "$dav1d_build"
     local cross_file="$build_tmp/dav1d-cross.meson"
     write_meson_cross > "$cross_file"
+    local native_file="$build_tmp/native.meson"
+    write_meson_native > "$native_file"
     local dav1d_log="$build_tmp/dav1d-setup-$SLICE_TAG.log"
     if ! env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
       --default-library=static --buildtype=release \
-      --cross-file "$cross_file" \
+      --cross-file "$cross_file" --native-file "$native_file" \
       -Denable_tools=false -Denable_tests=false >"$dav1d_log" 2>&1; then
       cat "$dav1d_log" >&2
       die "[$slice] dav1d meson setup failed (full log above)"
@@ -416,11 +432,13 @@ build_one_slice() {
     rm -rf "$fribidi_build"
     local fribidi_cross="$build_tmp/fribidi-cross.meson"
     write_meson_cross > "$fribidi_cross"
+    local native_file="$build_tmp/native.meson"
+    write_meson_native > "$native_file"
     local fribidi_log="$build_tmp/fribidi-setup-$SLICE_TAG.log"
     if ! env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
       --default-library=static --buildtype=release \
-      --cross-file "$fribidi_cross" \
+      --cross-file "$fribidi_cross" --native-file "$native_file" \
       -Ddocs=false -Dtests=false >"$fribidi_log" 2>&1; then
       cat "$fribidi_log" >&2
       die "[$slice] fribidi meson setup failed (full log above)"

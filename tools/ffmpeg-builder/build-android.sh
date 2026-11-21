@@ -282,6 +282,12 @@ build_one_abi() {
        --extra-cflags="$ABI_CFLAGS -O3" \
        >"$vpx_log" 2>&1); then
       cat "$vpx_log" >&2
+      # vpx records the exact failing compiler invocation in config.log
+      # (inside the source tree, since configure runs in-tree).
+      if [ -f "$vpx_src/config.log" ]; then
+        echo "--- vpx config.log (tail) ---" >&2
+        tail -n 80 "$vpx_src/config.log" >&2
+      fi
       die "[$abi] libvpx configure failed (full log above)"
     fi
     (cd "$vpx_src" && make -j"$JOBS" >/dev/null && make install >/dev/null)
