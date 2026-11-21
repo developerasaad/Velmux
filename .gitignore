@@ -1,0 +1,93 @@
+# --- Velmux repository ---
+
+# Build outputs
+build/
+build-*/
+out/
+dist/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.lib
+*.la
+*.lo
+.libs/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+cmake-build-*/
+install_manifest.txt
+
+# Node / JavaScript
+node_modules/
+.npm/
+.yarn/
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.metro-health-check*
+*.tsbuildinfo
+
+# React Native
+.expo/
+dist/
+web-build/
+ios/Pods/
+ios/build/
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+*.hprof
+.metro/
+*.ipa
+*.aab
+
+# Android
+*.keystore
+!debug.keystore
+**/android/.cxx/
+
+# iOS / macOS
+ios/build/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+**/ios/.xcode.env.local
+
+# FFmpeg builder
+tools/ffmpeg-builder/src/
+tools/ffmpeg-builder/out/
+tools/ffmpeg-builder/deps/
+tools/ffmpeg-builder/downloads/
+
+# Databases / test artifacts
+*.db
+*.sqlite
+testdata/fixtures/
+test-results/
+
+# Coverage
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
