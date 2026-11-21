@@ -25,11 +25,24 @@ require_tool python3
 ensure_cmake_ninja
 ensure_meson
 
-if [ -f "$HOST_PREFIX/lib/pkgconfig/libavcodec.pc" ] && \
-   [ -f "$HOST_PREFIX/lib/libass.a" ] && \
-   [ -f "$HOST_PREFIX/share/velmux/ffmpeg-capabilities.json" ]; then
-  # libass is the sentinel for the deepest dependency chain (freetype ->
-  # harfbuzz -> fribidi -> libass); its presence means the stack completed.
+# Complete-artifact check: every library of the feature-selected stack plus
+# FFmpeg and the manifest. A partial prefix (interrupted build, tainted
+# environment) rebuilds instead of masquerading as complete. zlib is exempt:
+# the host build intentionally uses the system zlib when available.
+host_build_complete() {
+  local lib
+  for lib in libx264.a libmp3lame.a libopus.a libogg.a libvorbis.a \
+             libvpx.a libdav1d.a libSvtAv1Enc.a libfreetype.a libpng16.a \
+             libharfbuzz.a libfribidi.a libass.a libavcodec.a libavformat.a \
+             libavutil.a libavfilter.a libswscale.a libswresample.a; do
+    [ -f "$HOST_PREFIX/lib/$lib" ] || return 1
+  done
+  [ -f "$HOST_PREFIX/lib/pkgconfig/libavcodec.pc" ] || return 1
+  [ -f "$HOST_PREFIX/share/velmux/ffmpeg-capabilities.json" ] || return 1
+  return 0
+}
+
+if host_build_complete; then
   log "host build up to date"
   exit 0
 fi
@@ -87,7 +100,8 @@ lame_src="$(extract_tarball "$lame_tb")"
 if [ ! -f "$HOST_PREFIX/lib/libmp3lame.a" ]; then
   log "building lame"
   (cd "$lame_src" && ./configure --prefix="$HOST_PREFIX" \
-     --disable-shared --enable-static --disable-dependency-tracking >/dev/null && \
+     --disable-shared --enable-static --disable-dependency-tracking \
+     --disable-frontend >/dev/null && \
    make -j"$JOBS" >/dev/null && make install >/dev/null)
   log "lame installed"
 fi

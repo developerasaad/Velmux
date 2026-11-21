@@ -206,6 +206,7 @@ build_one_abi() {
     (cd "$lame_src" && ./configure \
        --prefix="$prefix" --disable-shared --enable-static \
        --disable-dependency-tracking --disable-gtktest --disable-nasm \
+       --disable-frontend \
        --host="$AUTOCONF_HOST" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)

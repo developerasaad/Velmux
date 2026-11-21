@@ -218,6 +218,7 @@ build_one_slice() {
     (cd "$lame_src" && ./configure \
        --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
        --disable-dependency-tracking --disable-gtktest --disable-nasm \
+       --disable-frontend \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
