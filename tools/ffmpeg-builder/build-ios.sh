@@ -305,7 +305,12 @@ ZPC
     # which vpx's android branch adds for *clang AS; the darwin branch sets
     # its own flags).
     local vpx_log="$build_tmp/vpx-configure-$SLICE_TAG.log"
-    if ! (cd "$vpx_src" && AS="$CC" LD="$CC" ./configure \
+    local vpx_as="$CC"
+    if [ "$SLICE_ARCH" = "x86_64" ]; then
+      # x86 asm is nasm syntax; installed via brew in the workflow.
+      command -v nasm >/dev/null 2>&1 && vpx_as="nasm"
+    fi
+    if ! (cd "$vpx_src" && AS="$vpx_as" LD="$CC" ./configure \
        --target="$SLICE_VPX_TARGET" \
        --prefix="$SLICE_PREFIX" \
        --disable-shared --enable-static --enable-pic \
@@ -539,6 +544,10 @@ ZPC
        --enable-protocol=pipe \
        >"$configure_log" 2>&1); then
       cat "$configure_log" >&2
+      if [ -f "$ffbuild/ffbuild/config.log" ]; then
+        echo "--- FFmpeg config.log (tail) ---" >&2
+        tail -n 120 "$ffbuild/ffbuild/config.log" >&2
+      fi
       die "[$slice] FFmpeg configure failed (full log above)"
     fi
     log "[$slice] building FFmpeg with $JOBS jobs"

@@ -291,7 +291,12 @@ ZPC
     sed -i.bak 's/^          check_add_ldflags -static$/          : velmux: no -static with modern NDK/' \
       "$vpx_src/build/make/configure.sh"
     local vpx_log="$build_tmp/vpx-configure-$abi.log"
-    if ! (cd "$vpx_src" && AS="$CC" LD="$CC" ./configure \
+    local vpx_as="$CC"
+    if [ "$abi" = "x86_64" ]; then
+      # x86 asm is nasm syntax; the runner has nasm via apt.
+      command -v nasm >/dev/null 2>&1 && vpx_as="nasm"
+    fi
+    if ! (cd "$vpx_src" && AS="$vpx_as" LD="$CC" ./configure \
        --target="$VPX_TARGET" \
        --prefix="$prefix" \
        --disable-shared --enable-static --enable-pic \
@@ -529,6 +534,10 @@ ZPC
        --enable-protocol=pipe \
        >"$configure_log" 2>&1); then
       cat "$configure_log" >&2
+      if [ -f "$ffbuild/ffbuild/config.log" ]; then
+        echo "--- FFmpeg config.log (tail) ---" >&2
+        tail -n 120 "$ffbuild/ffbuild/config.log" >&2
+      fi
       die "[$abi] FFmpeg configure failed (full log above)"
     fi
     log "[$abi] building FFmpeg with $JOBS jobs"
