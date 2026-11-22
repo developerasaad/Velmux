@@ -137,6 +137,23 @@ Error CheckpointStore::deleteCheckpoints(const std::string &jobId) {
   return {};
 }
 
+std::int32_t CheckpointStore::maxSequence(const std::string &jobId) {
+  Error error;
+  sqlite3_stmt *stmt = db_.prepare(
+      "SELECT COALESCE(MAX(sequence), 0) FROM checkpoints WHERE job_id = ?",
+      error);
+  if (stmt == nullptr) {
+    return 0;
+  }
+  sqlite3_bind_text(stmt, 1, jobId.c_str(), -1, SQLITE_TRANSIENT);
+  std::int32_t max = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    max = sqlite3_column_int(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return max;
+}
+
 std::string CheckpointStore::artifactsDirFor(const std::string &jobsRoot,
                                              const std::string &jobId) {
   return jobsRoot + "/artifacts/" + jobId;

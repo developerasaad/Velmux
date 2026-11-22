@@ -90,6 +90,11 @@ public:
   std::optional<JobSnapshot> snapshot(const std::string &jobId);
   std::vector<JobSnapshot> snapshots();
   std::optional<JobRecord> record(const std::string &jobId);
+  // True while a worker thread is executing (or finalizing) this job.
+  // Distinguishes "cancel recorded" (durable state already Canceled)
+  // from "cancel completed" (worker unwound, artifacts stable): callers
+  // that inspect execution artifacts must wait for this to turn false.
+  bool isActive(const std::string &jobId);
 
   // Startup recovery: reconcile DB + artifacts, produce decisions, move
   // interrupted jobs to their recovery state. Must be called once after

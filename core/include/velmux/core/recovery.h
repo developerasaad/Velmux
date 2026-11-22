@@ -42,6 +42,10 @@ public:
   Error insertCheckpoint(CheckpointRecord &record);
   std::vector<CheckpointRecord> loadCheckpoints(const std::string &jobId,
                                                 Error &error);
+  // Highest sequence ever committed for the job (0 when none). New runs
+  // must continue AFTER it: (job_id, sequence) is UNIQUE, and rows from
+  // earlier runs legitimately survive retries (they are the resume data).
+  std::int32_t maxSequence(const std::string &jobId);
   Error deleteCheckpoints(const std::string &jobId);
 
   // Artifact directory management. Recovery segments live in durable

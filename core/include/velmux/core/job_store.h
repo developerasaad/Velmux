@@ -70,17 +70,25 @@ public:
   explicit JobStore(SqliteStore &db) : db_(db) {}
 
   Error insertJob(const JobRecord &record);
+  // State/progress persistence. NEVER touches the checkpoint table: a
+  // state change (cancel, pause, retry, running, validating...) must not
+  // destroy the committed checkpoints those very transitions rely on for
+  // recovery (spec §25/§26). Checkpoint rows are removed only through
+  // deleteJob (job removal) or explicit completion cleanup.
   Error updateJob(const JobRecord &record);
   std::optional<JobRecord> loadJob(const std::string &id, Error &error);
   std::vector<JobRecord> loadAllJobs(Error &error);
   // Jobs that were mid-flight when the process disappeared.
   std::vector<JobRecord> loadResumableJobs(Error &error);
+  // Removes the job AND its checkpoint rows (cascade).
   Error deleteJob(const std::string &id);
 
   static constexpr std::int32_t kSchemaVersion = 1;
 
 private:
   static JobRecord rowToRecord(sqlite3_stmt &stmt);
+  // Deletes only the jobs-table row (no checkpoint cascade).
+  Error deleteJobRow(const std::string &id);
   SqliteStore &db_;
 };
 

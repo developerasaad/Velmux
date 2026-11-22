@@ -203,6 +203,10 @@ std::optional<JobSnapshot> VelmuxEngine::getJob(const std::string &jobId) {
 
 std::vector<JobSnapshot> VelmuxEngine::listJobs() { return jobs_->snapshots(); }
 
+bool VelmuxEngine::isJobActive(const std::string &jobId) {
+  return jobs_->isActive(jobId);
+}
+
 std::vector<std::string> VelmuxEngine::describeBackends() {
   std::vector<std::string> descriptions;
   for (const auto &backend : backends_) {

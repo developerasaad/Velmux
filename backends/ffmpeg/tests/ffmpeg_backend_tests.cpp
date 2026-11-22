@@ -187,11 +187,19 @@ public:
   }
   std::optional<JobEvent> waitForTerminal(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    done.wait_for(lock, timeout, [this] { return last && isTerminal(last->state); });
+    done.wait_for(lock, timeout,
+                  [this] { return last && isTerminal(last->state); });
     return last;
   }
+  // Drop latched state so the next waitFor* observes a fresh run
+  // (retry/resume after a terminal event).
+  void reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last.reset();
+  }
   static bool isTerminal(JobState state) {
-    return state == JobState::Completed || state == JobState::Failed;
+    return state == JobState::Completed || state == JobState::Failed ||
+           state == JobState::Canceled;
   }
 
 private:
@@ -703,6 +711,11 @@ TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segments") {
+  // The waiter is declared BEFORE the engine so it is destroyed AFTER it:
+  // if a REQUIRE fails while a worker still runs, engine teardown (which
+  // joins workers) happens before the sink dies instead of emitting into
+  // a destroyed object (observed as "pure virtual method called").
+  EventWaiter waiter;
   TestEnv env;
   // Long enough to trigger segmentation (> 4 x 10s targets).
   const std::string fixture =
@@ -715,7 +728,6 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
   // polling cancel can fire).
   ConversionRequest request = transcodeRequest(
       fixture, Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
-  EventWaiter waiter;
   env.engine->events().subscribe(&waiter);
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
@@ -731,6 +743,9 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
         snapshot->state == JobState::Failed) {
       break; // machine too fast; the resume assertions still hold below
     }
+    if (cancelled && snapshot->state == JobState::Canceled) {
+      break; // control path recorded the intent; stop polling
+    }
     if (!cancelled && snapshot->progress >= 0.5) {
       const Result<bool> cancelResult = env.engine->cancelJob(id);
       REQUIRE(cancelResult.ok());
@@ -738,6 +753,20 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
       cancelled = true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  if (cancelled) {
+    // The durable record flips to Canceled immediately (control path),
+    // but the executor may still be unwinding: its in-flight partial
+    // segment must be gone before artifacts are inspected. isActive is
+    // the deterministic worker-liveness signal (progress events carry
+    // the Canceled state too, so event counting cannot distinguish).
+    for (int i = 0; i < 2400; ++i) { // up to 60s
+      if (!env.engine->isJobActive(id)) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE_FALSE(env.engine->isJobActive(id));
   }
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -768,6 +797,11 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
     }
 
     // Recovery: retry the durable job; committed segments must be reused.
+    // Reset the waiter BEFORE re-queueing: the latched Canceled must be
+    // dropped first, and the retry's own events (Queued...Completed) latch
+    // only after the reset (a reset after retryJob could clear a terminal
+    // event on an absurdly fast machine and deadlock the wait).
+    waiter.reset();
     const Result<bool> retried = env.engine->retryJob(id);
     REQUIRE(retried.ok());
     REQUIRE(retried.value());

@@ -1559,8 +1559,13 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     const bool isVideo = cleanup.packet->stream_index == videoIn;
     const bool isAudio = cleanup.packet->stream_index == audioIn;
     // Range gate on the demux side: packets at/after the end stop the run
-    // (their content belongs to the next segment); packets before the
-    // start are dropped (their content is covered by earlier segments).
+    // (their content belongs to the next segment). Packets BEFORE the
+    // start are NOT skipped here: after the backward seek they begin at
+    // the keyframe, and the decoder must see that keyframe to establish
+    // references — dropping them at the demux level makes every segment
+    // that does not start exactly on a keyframe decode zero/garbled
+    // frames. The decoded frames before the boundary are discarded by the
+    // frame-level gates below (they exist for exactly this).
     if (rangeBounded) {
       const AVStream *pktStream =
           cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
@@ -1573,10 +1578,6 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         rangeDone = true;
         av_packet_unref(cleanup.packet);
         break;
-      }
-      if (pktUs >= 0 && pktUs < rangeStartUs && (isVideo || isAudio)) {
-        av_packet_unref(cleanup.packet);
-        continue;
       }
     }
 
@@ -1902,9 +1903,16 @@ bool assembleSegments(const std::vector<std::string> &segments,
   bool ok = false;
   do {
     const AVInputFormat *concatFormat = av_find_input_format("concat");
-    if (concatFormat == nullptr ||
+    // The list carries absolute artifact paths; the concat demuxer's safe
+    // mode (default on) rejects those with "Unsafe file name". The paths
+    // are core-generated, not user input, so safe=0 is correct here.
+    AVDictionary *openOpts = nullptr;
+    av_dict_set(&openOpts, "safe", "0", 0);
+    const int openRc =
         avformat_open_input(&in, listPath.string().c_str(), concatFormat,
-                            nullptr) < 0 ||
+                            &openOpts);
+    av_dict_free(&openOpts);
+    if (concatFormat == nullptr || openRc < 0 ||
         avformat_find_stream_info(in, nullptr) < 0) {
       break;
     }
@@ -2029,6 +2037,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
       if (info.position <= expectedStart || info.position > totalUs) {
         continue; // overlapping or out-of-range record
       }
+      if (info.position - expectedStart > 2 * kSegmentTargetUs) {
+        break; // suspicious gap: the tiling is not contiguous, redo it
+      }
       if (!segmentArtifactUsable(info.artifactPath)) {
         break; // prefix ends here; redo the rest
       }
@@ -2080,8 +2091,14 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
     const std::string segPath =
         (segDir / ("seg-" + std::to_string(nextIndex) + outFs.extension().string()))
             .string();
-    // Per-segment progress rebasing: local fraction -> whole-job fraction.
+    // Per-segment execution: the range run writes ITS OWN artifact file
+    // (validated + committed below); the final output only appears at
+    // assembly. Without this redirect every segment would overwrite the
+    // final output and the artifact validation would fail on a file that
+    // was never written.
     ExecuteParams segParams = params;
+    segParams.outputPath = segPath;
+    // Per-segment progress rebasing: local fraction -> whole-job fraction.
     segParams.onProgress =
         [params, segStart, segEnd,
          totalUs](const backend::ProgressReport &report) {
@@ -2122,8 +2139,16 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
       info.position = segEnd;
       info.artifactPath = segPath;
       if (!params.checkpoints->commit(info)) {
-        result.error = Error::make(ErrorCode::ExecutionFailed,
-                                   "checkpoint commit failed", "ffmpeg");
+        // A commit that lands while the token fires is a cancel, not a
+        // durability failure; report it as such (the state machine
+        // finalizes Canceled either way, the message keeps logs honest).
+        const bool tokenFired =
+            params.cancel && params.cancel->isCancelled();
+        result.error = Error::make(
+            tokenFired ? ErrorCode::Cancelled : ErrorCode::ExecutionFailed,
+            tokenFired ? "transcode cancelled (segments committed)"
+                       : "checkpoint commit failed",
+            "ffmpeg");
         return result;
       }
     }

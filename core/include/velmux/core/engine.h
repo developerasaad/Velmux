@@ -56,6 +56,11 @@ public:
   Result<bool> deleteJob(const std::string &jobId);
   std::optional<JobSnapshot> getJob(const std::string &jobId);
   std::vector<JobSnapshot> listJobs();
+  // True while a worker is executing/finalizing the job. Durable state
+  // may already show Canceled/Paused while this is still true (control
+  // paths persist intent immediately); artifact inspection must wait for
+  // the worker to unwind (false) first.
+  bool isJobActive(const std::string &jobId);
   std::vector<std::string> describeBackends();
 
   // Resource updates from the platform host (thermal, power, memory).

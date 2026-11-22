@@ -475,12 +475,16 @@ Error JobStore::insertJob(const JobRecord &record) {
 
 Error JobStore::updateJob(const JobRecord &record) {
   // Simplest correct approach: delete + insert in one transaction (the
-  // record is small and updates are rare relative to reads).
+  // record is small and updates are rare relative to reads). Only the
+  // jobs row is replaced here — the checkpoint rows belong to the
+  // recovery system and must survive every state/progress persist
+  // (cancel/pause/retry rely on them; wiping them here silently
+  // destroyed resumability).
   Error error;
   if (!db_.exec("BEGIN IMMEDIATE", error)) {
     return error;
   }
-  if (!deleteJob(record.id).ok()) {
+  if (!deleteJobRow(record.id).ok()) {
     db_.exec("ROLLBACK", error);
     return Error::make(ErrorCode::InternalError, "update transaction failed");
   }
@@ -538,9 +542,15 @@ std::vector<JobRecord> JobStore::loadResumableJobs(Error &error) {
 
 Error JobStore::deleteJob(const std::string &id) {
   Error error;
+  // Checkpoint rows are meaningless without the job: cascade.
   if (!db_.exec("DELETE FROM checkpoints WHERE job_id = '" + id + "'", error)) {
     return error;
   }
+  return deleteJobRow(id);
+}
+
+Error JobStore::deleteJobRow(const std::string &id) {
+  Error error;
   if (!db_.exec("DELETE FROM jobs WHERE id = '" + id + "'", error)) {
     return error;
   }

@@ -85,7 +85,12 @@ class CheckpointCoordinator final : public backend::ICheckpointCoordinator {
 public:
   CheckpointCoordinator(CheckpointStore &store, std::string jobId,
                         std::shared_ptr<backend::CancelToken> cancel)
-      : store_(store), jobId_(std::move(jobId)), cancel_(std::move(cancel)) {}
+      : store_(store), jobId_(std::move(jobId)), cancel_(std::move(cancel)) {
+    // (job_id, sequence) is UNIQUE and rows from earlier runs of this job
+    // legitimately survive (they ARE the resume data): continue numbering
+    // after the persisted maximum instead of restarting at 1.
+    sequence_ = store_.maxSequence(jobId_);
+  }
 
   bool commit(const backend::CheckpointInfo &info) override {
     if (cancel_ && cancel_->isCancelled()) {
@@ -348,6 +353,11 @@ std::vector<JobSnapshot> JobManager::snapshots() {
 std::optional<JobRecord> JobManager::record(const std::string &jobId) {
   Error loadError;
   return store_.loadJob(jobId, loadError);
+}
+
+bool JobManager::isActive(const std::string &jobId) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return running_.find(jobId) != running_.end();
 }
 
 std::vector<RecoveryDecision> JobManager::recoverInterruptedJobs() {
@@ -700,6 +710,10 @@ void JobManager::executeJob(const std::string &jobId) {
     running_.erase(jobId);
     persistAndEmit(final, "completed");
   }
+  // Completed work is the output itself: the executor already removed the
+  // segment scratch, so the checkpoint rows must not outlive their
+  // artifacts (updateJob deliberately no longer cascades here).
+  (void)checkpoints_.deleteCheckpoints(jobId);
 }
 
 void JobManager::finishFailure(JobRecord &record) {
