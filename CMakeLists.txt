@@ -148,10 +148,17 @@ endif()
 # ---------------------------------------------------------------------------
 # Platform backend skeletons (honest availability reporting)
 # ---------------------------------------------------------------------------
-add_library(velmux_backend_android backends/android/cpp/android_backend.cpp)
+add_library(velmux_backend_android
+  backends/android/cpp/android_backend.cpp
+  backends/android/cpp/media_transcoder.cpp)
 target_link_libraries(velmux_backend_android PUBLIC velmux::core ${CMAKE_DL_LIBS})
 target_include_directories(velmux_backend_android
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/android/cpp>)
+if(ANDROID)
+  # NDK media APIs for the real MediaCodec pipeline (media_transcoder.cpp).
+  target_link_libraries(velmux_backend_android PUBLIC mediandk android
+                        nativewindow log)
+endif()
 
 add_library(velmux_backend_apple backends/apple/objcpp/apple_backend.cpp)
 target_link_libraries(velmux_backend_apple PUBLIC velmux::core)

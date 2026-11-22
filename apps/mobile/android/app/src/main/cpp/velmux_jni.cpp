@@ -12,6 +12,10 @@
 
 #include "velmux_bridge.h"
 
+// Android backend: the JavaVM registered here lets the backend query
+// MediaCodecList at engine startup (capability reporting, spec §28).
+extern "C" void velmux_android_set_java_vm(void *vm);
+
 namespace {
 
 VelmuxEngineHandle *asEngine(jlong handle) {
@@ -220,6 +224,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
   if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
     return JNI_ERR;
   }
+  // MediaCodecList enumeration (Android backend capabilities) attaches to
+  // this VM at engine startup.
+  velmux_android_set_java_vm(vm);
   jclass clazz = env->FindClass("com/velmux/mobile/VelmuxJni");
   if (clazz == nullptr) {
     return JNI_ERR;

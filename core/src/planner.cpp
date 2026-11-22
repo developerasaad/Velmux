@@ -240,6 +240,48 @@ PlanResult Planner::plan(const MediaInfo &source,
         return;
       }
     }
+    // Processing capabilities: geometry / rate / audio-format changes and
+    // subtitle work only route to backends that actually implement them
+    // (reported via BackendCapabilities; executors double-check).
+    if (!streamCopy) {
+      const bool geometryChange =
+          wantsVideo && request.video.resolutionHeight.has_value() &&
+          *request.video.resolutionHeight !=
+              (source.hasVideo() ? source.video.front().height : 0);
+      const bool rateChange =
+          wantsVideo && request.video.frameRate.has_value() &&
+          source.hasVideo() && source.video.front().frameRate > 0.0 &&
+          std::abs(*request.video.frameRate -
+                   source.video.front().frameRate) > 0.01;
+      if ((geometryChange || rateChange) && !caps->videoScaling) {
+        return;
+      }
+      const bool sampleRateChange =
+          wantsAudio && request.audio.sampleRate.has_value() &&
+          source.hasAudio() && source.audio.front().sampleRate > 0 &&
+          *request.audio.sampleRate != source.audio.front().sampleRate;
+      const bool channelChange =
+          wantsAudio && request.audio.channels.has_value() &&
+          source.hasAudio() && source.audio.front().channels > 0 &&
+          *request.audio.channels != source.audio.front().channels;
+      if ((sampleRateChange || channelChange) && !caps->audioResampling) {
+        return;
+      }
+    }
+    // Subtitle work: passthrough needs subtitlePassthrough, burn-in needs
+    // subtitleBurnIn. Sources with subtitles under a Preserve policy must
+    // not lose them by routing to a backend that silently drops text
+    // tracks.
+    const bool burnIn = request.subtitles.policy == SubtitlePolicy::BurnIn;
+    const bool preserveWithSubtitles =
+        request.subtitles.policy == SubtitlePolicy::Preserve &&
+        source.hasSubtitles();
+    if (burnIn && !caps->subtitleBurnIn) {
+      return;
+    }
+    if (preserveWithSubtitles && !caps->subtitlePassthrough) {
+      return;
+    }
 
     Candidate candidate;
     Pipeline &pipeline = candidate.pipeline;

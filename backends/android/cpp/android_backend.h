@@ -1,24 +1,26 @@
 // Android native backend — MediaCodec / AMediaExtractor / AMediaMuxer
-// implementation of the Velmux backend contracts.
+// implementation of the Velmux backend contracts (Milestone 1).
 //
-// STATUS (honest): This is the platform skeleton. The real codec execution
-// (Milestone 1) is implemented in the Android build (CMake toolchain +
-// JNI), which compiles this file with the NDK. On non-Android hosts the
-// factory below reports the backend as unavailable instead of pretending.
+// The real codec execution lives in media_transcoder.cpp (compiled for the
+// Android NDK; host builds compile to honest unavailable stubs). This file
+// implements the backend contracts on top of it.
 //
 // Ownership (docs/BACKEND_POLICY.md): this backend executes native codec
 // work; it NEVER decides fallbacks. It reports capabilities and errors; the
 // C++ core decides.
 #pragma once
 
+#include "media_transcoder.h"
 #include "velmux/backend/contracts.h"
 
 namespace velmux::android {
 
-// True when the process is actually running on Android with the media APIs
-// linkable (determined at runtime via dlopen so the core library stays
-// loadable everywhere for development).
-bool androidMediaAvailable();
+class AndroidBackend;
+
+// Registers the process JavaVM for MediaCodecList enumeration. Called from
+// the host app's JNI_OnLoad (extern "C" for direct linkage inside the
+// single engine library).
+extern "C" void velmux_android_set_java_vm(void *vm);
 
 class AndroidInspector final : public velmux::backend::IInspector {
 public:
@@ -28,14 +30,26 @@ public:
 
 class AndroidExecutor final : public velmux::backend::IPipelineExecutor {
 public:
+  explicit AndroidExecutor(const AndroidBackend *backend) : backend_(backend) {}
+
   bool canExecute(const velmux::core::Pipeline &pipeline,
                   const velmux::core::ConversionRequest &request) const override;
   velmux::backend::ExecuteResult
   execute(const velmux::backend::ExecuteParams &params) override;
+
+private:
+  const media::CodecEntry *findVideo(
+      velmux::core::VideoCodec codec) const;
+  const media::CodecEntry *findAudio(
+      velmux::core::AudioCodec codec) const;
+
+  const AndroidBackend *backend_;
 };
 
 class AndroidBackend final : public velmux::backend::IBackend {
 public:
+  AndroidBackend() : executor_(this) {}
+
   velmux::core::BackendId id() const override {
     return velmux::core::BackendId::Android;
   }
@@ -51,8 +65,29 @@ private:
   AndroidInspector inspector_;
   AndroidExecutor executor_;
   bool mediaAvailable_ = false;
-  // Codec lists discovered during initialize() (MediaCodecList queries).
-  std::string discoveredSummary_;
+  media::NativeSupport support_;
+
+  friend class AndroidExecutor;
 };
+
+inline const media::CodecEntry *
+AndroidExecutor::findVideo(velmux::core::VideoCodec codec) const {
+  for (const auto &[candidate, entry] : backend_->support_.video) {
+    if (candidate == codec) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+inline const media::CodecEntry *
+AndroidExecutor::findAudio(velmux::core::AudioCodec codec) const {
+  for (const auto &[candidate, entry] : backend_->support_.audio) {
+    if (candidate == codec) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
 
 } // namespace velmux::android

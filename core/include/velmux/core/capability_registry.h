@@ -41,6 +41,16 @@ struct BackendCapabilities {
   // True when the backend can inspect media (demux metadata without
   // decoding).
   bool canInspect = false;
+  // Can the backend change video geometry/frame-rate during a transcode
+  // (scale/rotate/crop/temporal resample)? When false, the planner only
+  // routes 1:1-geometry native pipelines to it.
+  bool videoScaling = false;
+  // Can the backend resample audio (sample rate / channel changes)?
+  bool audioResampling = false;
+  // Can the backend carry subtitle tracks through without decoding them?
+  bool subtitlePassthrough = false;
+  // Can the backend render (burn in) subtitles onto the video?
+  bool subtitleBurnIn = false;
   // Free-form implementation label, e.g. "ffmpeg 7.1.1 (static, feature
   // selected)" or "MediaCodec (OMX.qcom.video.encoder.avc)".
   std::string implementation;

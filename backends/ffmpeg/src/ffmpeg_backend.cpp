@@ -2203,6 +2203,12 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   caps.implementation = implementationLabel_.empty() ? "ffmpeg"
                                                      : implementationLabel_;
   caps.canInspect = true;
+  // libswscale/libswresample handle geometry and audio format changes; the
+  // subtitle streams copy through containers and libass burns text in.
+  caps.videoScaling = true;
+  caps.audioResampling = true;
+  caps.subtitlePassthrough = true;
+  caps.subtitleBurnIn = true;
 
   const auto &features = FeatureRegistry::instance();
 
