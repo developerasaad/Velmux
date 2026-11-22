@@ -12,7 +12,7 @@ the ultimate truth.
 | 2 | Capability system and planner | In progress (core-level, host-validated) |
 | 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | In progress: build-android.sh + build-ios.sh written; artifacts building in CI (manual dispatch) |
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
-| 5 | Complete V1 media support | Not started (host FFmpeg backend covers the codec catalog) |
+| 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending) |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
 | 7 | Persistence/recovery | Partial (SQLite job store + checkpoint model + shutdown-to-recovery contract; fault-injection pending) |
 | 8 | Background and notifications | Not started |
@@ -30,6 +30,14 @@ the ultimate truth.
 - FFmpeg backend performs REAL conversions through libav* libraries directly
   (demux → decode → process → encode → mux) on host, with output validation via
   the core validator and an independent ffprobe cross-check.
+- Subtitles are first-class in the FFmpeg backend: PRESERVE copies every
+  subtitle track through transcodes (language metadata + dispositions kept,
+  planner-guaranteed container compatibility); BURN-IN renders embedded or
+  external text subtitles into the video through a libavfilter graph with the
+  pinned libass (fonts discovered per platform, VELMUX_FONTS_DIR override);
+  timing offsets are applied to preserved packets or via SRT/ASS/VTT
+  timestamp shifting for burn-in (subtitle_tools). Pixel-level tests verify
+  rendered text; malformed inputs are refused, never mangled.
 - The bridge C facade is complete and tested: JSON request parsing, plan,
   startJob, cancel/pause/resume, getJob/listJobs, describeBackends and
   event polling; bridge integration tests run a REAL conversion end-to-end
