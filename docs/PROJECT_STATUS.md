@@ -8,7 +8,7 @@ the ultimate truth.
 | # | Milestone | State |
 |---|---|---|
 | 0 | Foundation (monorepo, RN app, C++ engine, bridge, backend skeletons, FFmpeg builder foundation, docs, CI) | Mostly complete; FFmpeg mobile artifacts pending (M3) |
-| 1 | First real Android conversion (MP4/H.264/AAC via native APIs) | Not started (Android backend is an honest skeleton) |
+| 1 | First real Android conversion (MP4/H.264/AAC via native APIs) | Implemented (MediaCodec surface-path transcode, MediaExtractor inspection, MediaMuxer remux, MediaCodecList capability reporting via JNI); device/emulator validation pending (instrumented tests written; emulator CI infra pending) |
 | 2 | Capability system and planner | In progress (core-level, host-validated) |
 | 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | In progress: build-android.sh + build-ios.sh written; artifacts building in CI (manual dispatch) |
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
@@ -46,6 +46,18 @@ the ultimate truth.
   monorepo CMake, embedded public-domain SQLite for the NDK) with a JNI
   adapter and a TurboModule (`VelmuxEngine`) implementing the codegen'd spec;
   durable engine storage under filesDir; event polling at UI cadence.
+- The Android backend is a REAL MediaCodec engine (M1 implemented):
+  MediaCodecList enumerated through JNI (the app's JNI_OnLoad registers
+  the JavaVM), AMediaExtractor inspection, extractor→AMediaMuxer stream
+  copy, and the zero-copy surface transcode (decoder renders into the
+  encoder's input surface; audio through ByteBuffer PCM with cumulative
+  PTS; cancel + stall guards; the muxer starts when both encoder formats
+  are known). The planner routes to it only for pipelines it can truly
+  serve (no scaling/rate/audio-format changes, no burn-in, no subtitle
+  passthrough — capability flags enforced at both plan and execute time).
+  Instrumented tests (real on-device transcode + remux + inspection with
+  independent MediaExtractor validation) are written; they await device /
+  emulator execution.
 - iOS app builds in CI (CocoaPods + simulator build); engine wiring for iOS
   is the next integration step.
 - Pinned host FFmpeg builds through `tools/ffmpeg-builder/build-host.sh`
