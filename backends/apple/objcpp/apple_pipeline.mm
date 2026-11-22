@@ -47,9 +47,6 @@ std::optional<VideoCodec> videoCodecFromFourCC(FourCharCode code) {
   case 'ap4h':
   case 'ap4x':
     return VideoCodec::ProRes;
-  case 'dvc ':
-  case 'dvcp':
-    return VideoCodec::DvcPro;
   case 'mjpa':
   case 'mjpb':
     return VideoCodec::Mjpeg;
@@ -195,11 +192,8 @@ bool enumerateSupport(NativeSupport &out) {
   const bool hwProRes =
       VTIsHardwareEncodeSupported(kCMVideoCodecType_ProRes422);
   addVideo(VideoCodec::ProRes, true, true, hwProRes);
-  if (@available(macOS 11.0, iOS 14.0, *)) {
-    addVideo(VideoCodec::VP9,
-             VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9), false,
-             false);
-  }
+  // VP9 decode availability is hardware-dependent and not exposed through
+  // a portable public probe; not reported rather than guessed.
   // Audio: AudioToolbox software encoders, available everywhere.
   addAudio(AudioCodec::Aac, true, true);
   addAudio(AudioCodec::HeAac, true, false);
