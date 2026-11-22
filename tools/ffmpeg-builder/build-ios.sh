@@ -106,6 +106,22 @@ make_wrappers() {
   local bin="$build_tmp/bin-$SLICE_TAG"
   rm -rf "$bin"
   mkdir -p "$bin"
+  # Resolve the slice's SDK path once. The compiler wrappers re-assert it
+  # TRAILING, after the caller's own flags: some upstream configure logic
+  # (notably libvpx's arm*-darwin-* toolchain, used for the simulator
+  # slices because libvpx has no arm64 simulator target) appends its own
+  # -isysroot plus -m*-version-min AFTER the wrapper's leading flags —
+  # the iphoneos SDK on arm64 and the macosx SDK on x86_64-darwin18 —
+  # into both CFLAGS and LDFLAGS. clang resolves conflicting -isysroot /
+  # -m*-version-min by the LAST occurrence, so a trailing re-assertion of
+  # the slice's SDK and min-version keeps every compile AND link on the
+  # correct target regardless of what upstream build systems inject
+  # (observed CI failure: "building for 'iOS', but linking in object
+  # file ... built for 'iOS-simulator'" in libvpx's link check).
+  local sdk_path
+  sdk_path="$(xcrun -sdk "$SLICE_SDK" --show-sdk-path)" ||
+    die "cannot resolve the $SLICE_SDK SDK path"
+  [ -d "$sdk_path" ] || die "the $SLICE_SDK SDK path does not exist: $sdk_path"
   # Binutils-style wrappers: xcrun selects SDK + sysroot, no extra flags.
   for tool in ar ranlib strip nm ld; do
     cat > "$bin/$tool" <<EOF
@@ -114,14 +130,15 @@ exec xcrun -sdk $SLICE_SDK $tool "\$@"
 EOF
     chmod +x "$bin/$tool"
   done
-  # Compiler wrappers additionally inject the slice arch/min-version flags.
+  # Compiler wrappers: leading arch/min-version flags plus the trailing
+  # sysroot/min-version re-assertion that wins flag conflicts.
   cat > "$bin/clang" <<EOF
 #!/bin/sh
-exec xcrun -sdk $SLICE_SDK clang -arch $SLICE_ARCH $SLICE_MIN_FLAG "\$@"
+exec xcrun -sdk $SLICE_SDK clang -arch $SLICE_ARCH $SLICE_MIN_FLAG "\$@" -isysroot $sdk_path $SLICE_MIN_FLAG
 EOF
   cat > "$bin/clang++" <<EOF
 #!/bin/sh
-exec xcrun -sdk $SLICE_SDK clang++ -arch $SLICE_ARCH $SLICE_MIN_FLAG "\$@"
+exec xcrun -sdk $SLICE_SDK clang++ -arch $SLICE_ARCH $SLICE_MIN_FLAG "\$@" -isysroot $sdk_path $SLICE_MIN_FLAG
 EOF
   chmod +x "$bin/clang" "$bin/clang++"
   ln -sf "$bin/clang" "$bin/cc"
