@@ -141,10 +141,20 @@ struct ExecuteParams {
   core::Pipeline pipeline;       // complete stage assignment (policy decided)
   core::ConversionRequest request; // what the user asked for
   std::string outputPath;        // final output location (core-owned)
+  // Stable identity of the job across runs (retries/resumes produce the
+  // same id). Executors use it to keep recovery artifacts (e.g. transcode
+  // segments) at stable paths.
+  std::string jobId;
   std::shared_ptr<CancelToken> cancel;
   ProgressCallback onProgress;
   // May be null for short jobs where checkpointing is not warranted.
   ICheckpointCoordinator *checkpoints = nullptr;
+  // Checkpoints committed by earlier runs of this job (empty for fresh
+  // jobs). On recovery/pause-resume the core loads them from the durable
+  // store; the executor must skip work already covered by valid artifacts
+  // and reuse them instead of redoing it. Artifacts must be cheaply
+  // re-validated (open + duration sanity) before being trusted.
+  std::vector<CheckpointInfo> resumeFrom;
 };
 
 struct ExecuteResult {

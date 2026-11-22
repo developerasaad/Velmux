@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sys/stat.h>
 #include <unordered_map>
@@ -59,6 +60,12 @@ std::optional<std::string> localPathForUri(const std::string &uri) {
 }
 
 namespace {
+
+// Target duration of one independently finalized transcode segment
+// (spec §25: video transcode -> independently finalized segments). Actual
+// boundaries land on the closest frame; the checkpoint records the real
+// position reached.
+constexpr std::int64_t kSegmentTargetUs = 10'000'000;
 
 std::once_flag g_ffmpegInit;
 std::string g_ffmpegVersion;
@@ -775,6 +782,59 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
 }
 
 ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
+  // Decide between the single-pass path (short jobs, exotic containers,
+  // unknown duration) and the segmented path (long jobs: independently
+  // finalized, validated, committed segments + assembly; resumable).
+  const ConversionRequest &request = params.request;
+
+  bool segmentable = request.video.enabled &&
+                     params.pipeline.videoStreamCopy == false;
+  std::int64_t durationUs = 0;
+  std::string inPathStr;
+  if (segmentable) {
+    // Cheap metadata-only open: the source duration decides.
+    if (const std::optional<std::string> inPath = localPathFor(request.source);
+        inPath.has_value()) {
+      inPathStr = *inPath;
+      AVFormatContext *probe = nullptr;
+      if (avformat_open_input(&probe, inPath->c_str(), nullptr, nullptr) == 0 &&
+          avformat_find_stream_info(probe, nullptr) >= 0 &&
+          probe->duration != AV_NOPTS_VALUE && probe->duration > 0) {
+        durationUs = av_rescale_q(probe->duration, AVRational{1, AV_TIME_BASE},
+                                  AVRational{1, 1000000});
+      }
+      if (probe != nullptr) {
+        avformat_close_input(&probe);
+      }
+    }
+    switch (params.pipeline.container) {
+      case Container::Mp4:
+      case Container::Mkv:
+      case Container::WebM:
+      case Container::MpegTs:
+      case Container::M4a:
+      case Container::Mp3:
+      case Container::Ogg:
+        break; // concat-friendly
+      default:
+        segmentable = false;
+        break;
+    }
+    if (durationUs < 4 * kSegmentTargetUs) {
+      // Short jobs: checkpointing overhead is not warranted (spec §26:
+      // recovery protects LONG work; a fresh pass costs little here).
+      segmentable = false;
+    }
+  }
+  if (segmentable && !params.jobId.empty()) {
+    return executeTranscodeSegmented(params);
+  }
+  return executeTranscodeRange(params, 0, 0, false);
+}
+
+ExecuteResult FfmpegExecutor::executeTranscodeRange(
+    const ExecuteParams &params, std::int64_t rangeStartUs,
+    std::int64_t rangeEndUs, bool rangeActive) {
   ExecuteResult result;
   initFfmpegLabel();
   const ConversionRequest &request = params.request;
@@ -808,6 +868,31 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
       audioIn = int(i);
     }
   }
+
+  // Range playback: seek to the keyframe at/before the range start; decoded
+  // content before the boundary is skipped below (segment starts are
+  // IDR-clean because every range run opens fresh encoders and decoders).
+  if (rangeActive && rangeStartUs > 0) {
+    const int seekStream = videoIn >= 0 ? videoIn : 0;
+    const std::int64_t target = av_rescale_q(
+        rangeStartUs, AVRational{1, 1000000},
+        cleanup.in->streams[seekStream]->time_base);
+    if (avformat_seek_file(cleanup.in, seekStream, INT64_MIN, target,
+                           INT64_MAX, AVSEEK_FLAG_BACKWARD) < 0) {
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "cannot seek to the segment boundary",
+                                 "ffmpeg");
+      return result;
+    }
+  }
+  const bool rangeBounded = rangeActive;
+  // Frame/packet timestamps are compared against the range in microseconds.
+  auto frameUs = [&](const AVFrame *f, const AVCodecContext *dec) -> std::int64_t {
+    if (f->pts == AV_NOPTS_VALUE || dec->time_base.num <= 0) {
+      return -1;
+    }
+    return av_rescale_q(f->pts, dec->time_base, AVRational{1, 1000000});
+  };
 
   rc = avformat_alloc_output_context2(
       &cleanup.out, nullptr, avFormatNameFor(pipeline.container),
@@ -1463,7 +1548,9 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     av_packet_free(&encPacket);
   };
 
-  while (!writeFailed && av_read_frame(cleanup.in, cleanup.packet) >= 0) {
+  bool rangeDone = false; // crossed the range end; stop reading input
+  while (!writeFailed && !rangeDone &&
+         av_read_frame(cleanup.in, cleanup.packet) >= 0) {
     if (params.cancel && params.cancel->isCancelled()) {
       cancelled = true;
       av_packet_unref(cleanup.packet);
@@ -1471,10 +1558,43 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     }
     const bool isVideo = cleanup.packet->stream_index == videoIn;
     const bool isAudio = cleanup.packet->stream_index == audioIn;
+    // Range gate on the demux side: packets at/after the end stop the run
+    // (their content belongs to the next segment); packets before the
+    // start are dropped (their content is covered by earlier segments).
+    if (rangeBounded) {
+      const AVStream *pktStream =
+          cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
+      const std::int64_t pktUs =
+          cleanup.packet->pts == AV_NOPTS_VALUE
+              ? -1
+              : av_rescale_q(cleanup.packet->pts, pktStream->time_base,
+                             AVRational{1, 1000000});
+      if (pktUs >= rangeEndUs && (isVideo || isAudio)) {
+        rangeDone = true;
+        av_packet_unref(cleanup.packet);
+        break;
+      }
+      if (pktUs >= 0 && pktUs < rangeStartUs && (isVideo || isAudio)) {
+        av_packet_unref(cleanup.packet);
+        continue;
+      }
+    }
 
     if (isVideo && cleanup.videoDec != nullptr && cleanup.videoEnc != nullptr) {
       if (avcodec_send_packet(cleanup.videoDec, cleanup.packet) == 0) {
         while (avcodec_receive_frame(cleanup.videoDec, cleanup.frame) == 0) {
+          const std::int64_t srcUs = frameUs(cleanup.frame, cleanup.videoDec);
+          if (rangeBounded) {
+            if (srcUs >= 0 && srcUs < rangeStartUs) {
+              av_frame_unref(cleanup.frame); // seek overshoot content
+              continue;
+            }
+            if (srcUs >= rangeEndUs) {
+              rangeDone = true;
+              av_frame_unref(cleanup.frame);
+              break;
+            }
+          }
           if (burnSrc != nullptr && burnSink != nullptr) {
             // Burn-in path: the graph scales, renders subtitles (libass) and
             // converts to the encoder's pixel format. Frame pts are
@@ -1491,11 +1611,23 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
               AVFrame *filt = av_frame_alloc();
               while (av_buffersink_get_frame(burnSink, filt) >= 0) {
                 filt->pict_type = AV_PICTURE_TYPE_NONE;
-                filt->pts = av_rescale_q_rnd(
-                    filt->pts, av_buffersink_get_time_base(burnSink),
-                    cleanup.videoEnc->time_base,
-                    static_cast<AVRounding>(
-                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                if (rangeBounded && filt->pts != AV_NOPTS_VALUE) {
+                  // Segment-local timeline: rebase into [0, rangeEnd-start)
+                  // and convert to the encoder's time base in one step.
+                  const std::int64_t outUs = av_rescale_q(
+                      filt->pts, av_buffersink_get_time_base(burnSink),
+                      AVRational{1, 1000000});
+                  filt->pts = av_rescale_q(
+                      std::max<std::int64_t>(0, outUs - rangeStartUs),
+                      AVRational{1, 1000000},
+                      cleanup.videoEnc->time_base);
+                } else {
+                  filt->pts = av_rescale_q_rnd(
+                      filt->pts, av_buffersink_get_time_base(burnSink),
+                      cleanup.videoEnc->time_base,
+                      static_cast<AVRounding>(
+                          AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                }
                 sendVideoFrameToEncoder(filt);
                 av_frame_unref(filt);
               }
@@ -1506,11 +1638,24 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
             sws_scale(cleanup.sws, cleanup.frame->data,
                       cleanup.frame->linesize, 0, cleanup.videoDec->height,
                       videoFrame->data, videoFrame->linesize);
-            videoFrame->pts = av_rescale_q_rnd(
-                cleanup.frame->pts, cleanup.videoDec->time_base,
-                cleanup.videoEnc->time_base,
-                static_cast<AVRounding>(
-                    AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            if (rangeBounded && cleanup.frame->pts != AV_NOPTS_VALUE) {
+              // Segment-local timeline: subtract the range start (in the
+              // decoder's time base) before handing pts to the encoder.
+              const std::int64_t startTb = av_rescale_q(
+                  rangeStartUs, AVRational{1, 1000000},
+                  cleanup.videoDec->time_base);
+              videoFrame->pts = av_rescale_q_rnd(
+                  cleanup.frame->pts - startTb, cleanup.videoDec->time_base,
+                  cleanup.videoEnc->time_base,
+                  static_cast<AVRounding>(
+                      AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            } else {
+              videoFrame->pts = av_rescale_q_rnd(
+                  cleanup.frame->pts, cleanup.videoDec->time_base,
+                  cleanup.videoEnc->time_base,
+                  static_cast<AVRounding>(
+                      AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            }
             sendVideoFrameToEncoder(videoFrame);
           }
           if (params.onProgress && totalDurationUs > 0 &&
@@ -1521,8 +1666,17 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
             ProgressReport report;
             report.processedDurationUs = doneUs;
             report.totalDurationUs = totalDurationUs;
-            report.fraction = std::clamp(double(doneUs) / double(totalDurationUs),
-                                         0.0, 1.0);
+            if (rangeBounded && rangeEndUs > rangeStartUs) {
+              // Range-relative fraction: the segmented wrapper rebases it
+              // onto the whole-job timeline.
+              report.fraction = std::clamp(
+                  double(doneUs - rangeStartUs) /
+                      double(rangeEndUs - rangeStartUs),
+                  0.0, 1.0);
+            } else {
+              report.fraction =
+                  std::clamp(double(doneUs) / double(totalDurationUs), 0.0, 1.0);
+            }
             params.onProgress(report);
           }
           av_frame_unref(cleanup.frame);
@@ -1532,6 +1686,19 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
                cleanup.audioEnc != nullptr) {
       if (avcodec_send_packet(cleanup.audioDec, cleanup.packet) == 0) {
         while (avcodec_receive_frame(cleanup.audioDec, cleanup.frame) == 0) {
+          if (rangeBounded) {
+            const std::int64_t audioUs =
+                frameUs(cleanup.frame, cleanup.audioDec);
+            if (audioUs >= 0 && audioUs < rangeStartUs) {
+              av_frame_unref(cleanup.frame);
+              continue;
+            }
+            if (audioUs >= rangeEndUs) {
+              rangeDone = true;
+              av_frame_unref(cleanup.frame);
+              break;
+            }
+          }
           const int maxOutSamples =
               cleanup.audioEnc->frame_size > 0
                   ? cleanup.audioEnc->frame_size
@@ -1587,6 +1754,21 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
         }
       }
       if (subOut >= 0) {
+        // Cues at/after the range end belong to a later segment; cues that
+        // merely START before this segment keep flowing (clamped to the
+        // segment-local zero) so nothing is dropped.
+        bool skipSub = false;
+        if (rangeBounded && cleanup.packet->pts != AV_NOPTS_VALUE) {
+          const AVStream *srcSub =
+              cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
+          const std::int64_t subUs =
+              av_rescale_q(cleanup.packet->pts, srcSub->time_base,
+                           AVRational{1, 1000000});
+          if (subUs >= rangeEndUs) {
+            skipSub = true;
+          }
+        }
+        if (!skipSub) {
         AVPacket *outPacket = av_packet_alloc();
         av_packet_move_ref(outPacket, cleanup.packet);
         // outPacket->stream_index is still the input stream index here
@@ -1602,6 +1784,12 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
                                               srcStream->time_base,
                                               dstStream->time_base, rounding) +
                              subOffsetOutUnits;
+          if (rangeBounded) {
+            // Segment-local timeline for preserved subtitles.
+            const std::int64_t startDst = av_rescale_q(
+                rangeStartUs, AVRational{1, 1000000}, dstStream->time_base);
+            pts -= startDst;
+          }
           if (pts < 0) {
             pts = 0; // offset clamps cue starts, never emits negative pts
           }
@@ -1623,6 +1811,7 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
           writeFailed = true;
         }
         av_packet_free(&outPacket);
+        }
       }
     }
     av_packet_unref(cleanup.packet);
@@ -1650,6 +1839,325 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
   if (::stat(params.outputPath.c_str(), &st) == 0) {
     result.bytesWritten = st.st_size;
   }
+  result.success = true;
+  return result;
+}
+
+// Cheap artifact validation for resume: the file must open, yield stream
+// info and have a positive duration. Full validation happens on the final
+// assembled output (the core's OutputValidator + independent checks).
+bool segmentArtifactUsable(const std::string &path) {
+  if (path.empty()) {
+    return false;
+  }
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec) ||
+      std::filesystem::file_size(path, ec) == 0) {
+    return false;
+  }
+  AVFormatContext *probe = nullptr;
+  bool usable = false;
+  if (avformat_open_input(&probe, path.c_str(), nullptr, nullptr) == 0 &&
+      avformat_find_stream_info(probe, nullptr) >= 0) {
+    usable = probe->duration != AV_NOPTS_VALUE && probe->duration > 0;
+  }
+  if (probe != nullptr) {
+    avformat_close_input(&probe);
+  }
+  return usable;
+}
+
+// Stream-copy assembly of finalized segments through the concat demuxer.
+// Each segment carries its own timeline starting at 0; concat chains them
+// by cumulative duration (spec §25: final assembly from validated pieces).
+bool assembleSegments(const std::vector<std::string> &segments,
+                      const std::string &outputPath, Container container) {
+  const std::filesystem::path outFs(outputPath);
+  const std::filesystem::path listPath =
+      outFs.parent_path() / (outFs.filename().string() + ".concat.txt");
+  {
+    std::ofstream list(listPath, std::ios::binary | std::ios::trunc);
+    if (!list) {
+      return false;
+    }
+    for (const std::string &seg : segments) {
+      // concat-list escaping: single quotes, with ' doubled inside.
+      std::string escaped;
+      for (const char c : seg) {
+        if (c == '\'') {
+          escaped += "''";
+        } else if (c != '\n' && c != '\r') {
+          escaped += c;
+        }
+      }
+      list << "file '" << escaped << "'\n";
+    }
+    if (!list.good()) {
+      return false;
+    }
+  }
+
+  AVFormatContext *in = nullptr;
+  AVFormatContext *out = nullptr;
+  bool ok = false;
+  do {
+    const AVInputFormat *concatFormat = av_find_input_format("concat");
+    if (concatFormat == nullptr ||
+        avformat_open_input(&in, listPath.string().c_str(), concatFormat,
+                            nullptr) < 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      break;
+    }
+    if (avformat_alloc_output_context2(&out, nullptr,
+                                       avFormatNameFor(container),
+                                       outputPath.c_str()) < 0 ||
+        out == nullptr) {
+      break;
+    }
+    std::vector<int> outIndexOfIn;
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      AVStream *outStream = avformat_new_stream(out, nullptr);
+      if (outStream == nullptr) {
+        break;
+      }
+      avcodec_parameters_copy(outStream->codecpar, in->streams[i]->codecpar);
+      outStream->codecpar->codec_tag = 0;
+      outIndexOfIn.push_back(outStream->index);
+    }
+    if (outIndexOfIn.size() != in->nb_streams) {
+      break;
+    }
+    if (!(out->oformat->flags & AVFMT_NOFILE) &&
+        avio_open(&out->pb, outputPath.c_str(), AVIO_FLAG_WRITE) < 0) {
+      break;
+    }
+    if (avformat_write_header(out, nullptr) < 0) {
+      break;
+    }
+    AVPacket *pkt = av_packet_alloc();
+    bool writeFailed = false;
+    while (!writeFailed && av_read_frame(in, pkt) >= 0) {
+      const unsigned inIndex = std::size_t(pkt->stream_index);
+      const AVStream *srcStream = in->streams[inIndex];
+      AVStream *dstStream = out->streams[std::size_t(outIndexOfIn[inIndex])];
+      pkt->stream_index = outIndexOfIn[inIndex];
+      const AVRounding rounding = static_cast<AVRounding>(
+          AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+      pkt->pts = av_rescale_q_rnd(pkt->pts, srcStream->time_base,
+                                  dstStream->time_base, rounding);
+      pkt->dts = av_rescale_q_rnd(pkt->dts, srcStream->time_base,
+                                  dstStream->time_base, rounding);
+      pkt->duration =
+          av_rescale_q(pkt->duration, srcStream->time_base,
+                       dstStream->time_base);
+      pkt->pos = -1;
+      if (av_interleaved_write_frame(out, pkt) < 0) {
+        writeFailed = true;
+      }
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    if (writeFailed) {
+      break;
+    }
+    av_write_trailer(out);
+    ok = true;
+  } while (false);
+  if (out != nullptr) {
+    if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb != nullptr) {
+      avio_closep(&out->pb);
+    }
+    avformat_free_context(out);
+  }
+  if (in != nullptr) {
+    avformat_close_input(&in);
+  }
+  std::error_code ec;
+  std::filesystem::remove(listPath, ec);
+  return ok;
+}
+
+ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
+    const ExecuteParams &params) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  // Whole-job duration (the decision path verified it is known and long).
+  std::int64_t totalUs = 0;
+  {
+    const std::optional<std::string> inPath = localPathFor(params.request.source);
+    if (!inPath.has_value()) {
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "unsupported source URI", "ffmpeg");
+      return result;
+    }
+    AVFormatContext *probe = nullptr;
+    if (avformat_open_input(&probe, inPath->c_str(), nullptr, nullptr) == 0 &&
+        avformat_find_stream_info(probe, nullptr) >= 0 &&
+        probe->duration != AV_NOPTS_VALUE && probe->duration > 0) {
+      totalUs = av_rescale_q(probe->duration, AVRational{1, AV_TIME_BASE},
+                             AVRational{1, 1000000});
+    }
+    if (probe != nullptr) {
+      avformat_close_input(&probe);
+    }
+    if (totalUs <= 0) {
+      // Duration became unknown between the decision and now: fall back to
+      // a single honest pass (no checkpoints, no resume).
+      return executeTranscodeRange(params, 0, 0, false);
+    }
+  }
+
+  // Durable segment directory, stable across runs of the same job.
+  const std::filesystem::path outFs(params.outputPath);
+  const std::filesystem::path segDir =
+      outFs.parent_path() / ("velmux-seg-" + params.jobId);
+  std::error_code ec;
+  std::filesystem::create_directories(segDir, ec);
+
+  // Resume: keep the ordered prefix of still-valid artifacts; drop the rest.
+  struct ValidSegment {
+    std::string path;
+    std::int64_t endUs;
+  };
+  std::vector<ValidSegment> committed;
+  {
+    std::vector<backend::CheckpointInfo> sorted = params.resumeFrom;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto &a, const auto &b) { return a.position < b.position; });
+    std::int64_t expectedStart = 0;
+    for (const auto &info : sorted) {
+      if (info.position <= expectedStart || info.position > totalUs) {
+        continue; // overlapping or out-of-range record
+      }
+      if (!segmentArtifactUsable(info.artifactPath)) {
+        break; // prefix ends here; redo the rest
+      }
+      committed.push_back({info.artifactPath, info.position});
+      expectedStart = info.position;
+    }
+  }
+  std::int64_t resumeUs =
+      committed.empty() ? 0 : committed.back().endUs;
+  if (resumeUs >= totalUs) {
+    // Everything is already committed: just assemble.
+    if (committed.size() == 1) {
+      std::filesystem::rename(committed.front().path, params.outputPath, ec);
+      if (ec) {
+        std::filesystem::copy_file(committed.front().path, params.outputPath,
+                                   ec);
+      }
+    } else if (!assembleSegments(
+                   std::vector<std::string>([](const std::vector<ValidSegment> &c) {
+                     std::vector<std::string> paths;
+                     paths.reserve(c.size());
+                     for (const auto &v : c) {
+                       paths.push_back(v.path);
+                     }
+                     return paths;
+                   }(committed)),
+                   params.outputPath, params.pipeline.container)) {
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "cannot assemble committed segments", "ffmpeg");
+      return result;
+    }
+    std::filesystem::remove_all(segDir, ec);
+    result.success = true;
+    return result;
+  }
+
+  // Progress spans the whole job (committed prefix included).
+  const auto baseProgress = std::int64_t(committed.size());
+  std::int64_t nextIndex = baseProgress;
+  std::int64_t segStart = resumeUs;
+  while (segStart < totalUs) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      result.error = Error::make(ErrorCode::Cancelled,
+                                 "transcode cancelled (segments committed)",
+                                 "ffmpeg");
+      return result;
+    }
+    const std::int64_t segEnd = std::min(segStart + kSegmentTargetUs, totalUs);
+    const std::string segPath =
+        (segDir / ("seg-" + std::to_string(nextIndex) + outFs.extension().string()))
+            .string();
+    // Per-segment progress rebasing: local fraction -> whole-job fraction.
+    ExecuteParams segParams = params;
+    segParams.onProgress =
+        [params, segStart, segEnd,
+         totalUs](const backend::ProgressReport &report) {
+          if (!params.onProgress || report.fraction < 0) {
+            return;
+          }
+          ProgressReport global;
+          const double local =
+              std::clamp(report.fraction, 0.0, 1.0);
+          global.processedDurationUs =
+              segStart +
+              std::int64_t(local * double(segEnd - segStart));
+          global.totalDurationUs = totalUs;
+          global.fraction =
+              std::clamp(double(global.processedDurationUs) / double(totalUs),
+                         0.0, 1.0);
+          params.onProgress(global);
+        };
+    const ExecuteResult seg =
+        executeTranscodeRange(segParams, segStart, segEnd, true);
+    if (!seg.success) {
+      // Partial segment files are never committed: remove and surface the
+      // error; committed segments stay durable for the next resume.
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      return seg;
+    }
+    if (!segmentArtifactUsable(segPath)) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "segment failed artifact validation", "ffmpeg");
+      return result;
+    }
+    if (params.checkpoints != nullptr) {
+      backend::CheckpointInfo info;
+      info.stage = StageId::Encode;
+      info.position = segEnd;
+      info.artifactPath = segPath;
+      if (!params.checkpoints->commit(info)) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "checkpoint commit failed", "ffmpeg");
+        return result;
+      }
+    }
+    committed.push_back({segPath, segEnd});
+    ++nextIndex;
+    segStart = segEnd;
+  }
+
+  // Final assembly from validated pieces (spec §26: promote/commit safely).
+  if (committed.size() == 1) {
+    std::filesystem::rename(committed.front().path, params.outputPath, ec);
+    if (ec) {
+      std::filesystem::copy_file(committed.front().path, params.outputPath, ec);
+      if (ec) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "cannot promote the finished output", "ffmpeg");
+        return result;
+      }
+    }
+  } else {
+    std::vector<std::string> paths;
+    paths.reserve(committed.size());
+    for (const auto &v : committed) {
+      paths.push_back(v.path);
+    }
+    if (!assembleSegments(paths, params.outputPath,
+                          params.pipeline.container)) {
+      result.error =
+          Error::make(ErrorCode::ExecutionFailed,
+                      "cannot assemble the finished segments", "ffmpeg");
+      return result;
+    }
+  }
+  std::filesystem::remove_all(segDir, ec);
   result.success = true;
   return result;
 }

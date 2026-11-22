@@ -575,6 +575,7 @@ void JobManager::executeJob(const std::string &jobId) {
   params.pipeline = pipeline;
   params.request = record->request;
   params.outputPath = record->outputPath;
+  params.jobId = jobId;
   std::shared_ptr<backend::CancelToken> cancel;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -590,6 +591,23 @@ void JobManager::executeJob(const std::string &jobId) {
       };
   CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
   params.checkpoints = &coordinator;
+  // Recovery input: checkpoints committed by earlier runs of this job.
+  // Fresh jobs have none; paused/resumed/recovered jobs get the durable
+  // set and the executor skips work covered by valid artifacts.
+  {
+    Error checkpointError;
+    for (const CheckpointRecord &record :
+         checkpoints_.loadCheckpoints(jobId, checkpointError)) {
+      if (record.artifactPath.empty()) {
+        continue; // position-only marks carry nothing resumable for executors
+      }
+      backend::CheckpointInfo info;
+      info.stage = record.stage;
+      info.position = record.position;
+      info.artifactPath = record.artifactPath;
+      params.resumeFrom.push_back(std::move(info));
+    }
+  }
 
   const backend::ExecuteResult execResult = backend->executor()->execute(params);
 

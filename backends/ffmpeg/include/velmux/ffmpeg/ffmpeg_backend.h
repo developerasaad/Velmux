@@ -41,6 +41,16 @@ private:
   velmux::backend::ExecuteResult executeRemux(const velmux::backend::ExecuteParams &params);
   velmux::backend::ExecuteResult
   executeTranscode(const velmux::backend::ExecuteParams &params);
+  // Single pass over [rangeStartUs, rangeEndUs) of the source; used directly
+  // for whole-file transcodes and once per segment by the segmented path.
+  velmux::backend::ExecuteResult
+  executeTranscodeRange(const velmux::backend::ExecuteParams &params,
+                        std::int64_t rangeStartUs, std::int64_t rangeEndUs,
+                        bool rangeActive);
+  // Long-job path: transcode in independently finalized, validated and
+  // committed segments, then assemble. Resumes from committed artifacts.
+  velmux::backend::ExecuteResult
+  executeTranscodeSegmented(const velmux::backend::ExecuteParams &params);
 };
 
 class FfmpegBackend final : public velmux::backend::IBackend {

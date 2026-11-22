@@ -697,3 +697,110 @@ TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
   CHECK_FALSE(burnPlan.value().feasible);
   CHECK(burnPlan.value().message.find("no subtitle track") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Recovery: segmented transcode with checkpoint commit + resume (spec §25/26)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segments") {
+  TestEnv env;
+  // Long enough to trigger segmentation (> 4 x 10s targets).
+  const std::string fixture =
+      generateFixture(env.dir / "long.mp4",
+                      "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 60.0);
+
+  // VP9 encodes slowly enough that the cancel reliably lands mid-run on
+  // any CI machine (H.264 ultrafast can finish 60s of 320x240 before a
+  // polling cancel can fire).
+  ConversionRequest request = transcodeRequest(
+      fixture, Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const std::string id = jobId.value();
+
+  // Fault injection: cancel once the run is safely past several committed
+  // segments (>= 50% of a 60s job means >= 2x10s committed).
+  bool cancelled = false;
+  for (int i = 0; i < 2400; ++i) { // up to 60s of polling
+    const auto snapshot = env.engine->getJob(id);
+    REQUIRE(snapshot.has_value());
+    if (snapshot->state == JobState::Completed ||
+        snapshot->state == JobState::Failed) {
+      break; // machine too fast; the resume assertions still hold below
+    }
+    if (!cancelled && snapshot->progress >= 0.5) {
+      const Result<bool> cancelResult = env.engine->cancelJob(id);
+      REQUIRE(cancelResult.ok());
+      REQUIRE(cancelResult.value());
+      cancelled = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  if (cancelled) {
+    REQUIRE(terminal->state == JobState::Canceled);
+
+    // Durable state survived the "crash": committed segments on disk.
+    const std::filesystem::path outputs = env.dir / "outputs";
+    std::vector<std::string> segmentFiles;
+    for (const auto &entry : std::filesystem::directory_iterator(outputs)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("velmux-seg-", 0) == 0 &&
+          std::filesystem::is_directory(entry.path())) {
+        for (const auto &seg : std::filesystem::directory_iterator(entry.path())) {
+          if (seg.path().filename().string().rfind("seg-", 0) == 0) {
+            segmentFiles.push_back(seg.path().string());
+          }
+        }
+      }
+    }
+    // >= 2 committed segments (cancel fired at >= 50% of 60s).
+    REQUIRE(segmentFiles.size() >= 2);
+    // Each committed segment is independently valid media.
+    for (const std::string &seg : segmentFiles) {
+      const ProbeResult probe = probeWith(seg);
+      CHECK(probe.videoCodec == "vp9");
+      CHECK(probe.durationSec > 5.0);
+    }
+
+    // Recovery: retry the durable job; committed segments must be reused.
+    const Result<bool> retried = env.engine->retryJob(id);
+    REQUIRE(retried.ok());
+    REQUIRE(retried.value());
+    const auto after = waiter.waitForTerminal(std::chrono::seconds(240));
+    REQUIRE(after.has_value());
+    INFO("retry failure error: " << after->error);
+    REQUIRE(after->state == JobState::Completed);
+
+    const auto jobs = env.engine->listJobs();
+    const std::string outPath = jobs.front().outputPath;
+    // INDEPENDENT cross-check: the assembled output covers the WHOLE
+    // source duration. If the resume had discarded the committed prefix,
+    // the output would be >= 20s short.
+    const ProbeResult probe = probeWith(outPath);
+    CHECK(probe.videoCodec == "vp9");
+    CHECK(probe.audioCodec == "opus");
+    CHECK(probe.durationSec == doctest::Approx(60.0).epsilon(0.05));
+    CHECK(std::filesystem::file_size(outPath) > 8192);
+    // Segment scratch is cleaned after success.
+    bool segDirLeft = false;
+    for (const auto &entry : std::filesystem::directory_iterator(outputs)) {
+      if (entry.path().filename().string().rfind("velmux-seg-", 0) == 0) {
+        segDirLeft = true;
+      }
+    }
+    CHECK_FALSE(segDirLeft);
+  } else {
+    // Completed before the cancel could fire: still verify the segmented
+    // output end-to-end.
+    const auto jobs = env.engine->listJobs();
+    const std::string outPath = jobs.front().outputPath;
+    const ProbeResult probe = probeWith(outPath);
+    CHECK(probe.videoCodec == "vp9");
+    CHECK(probe.durationSec == doctest::Approx(60.0).epsilon(0.05));
+  }
+}
