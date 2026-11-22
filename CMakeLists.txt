@@ -160,7 +160,19 @@ if(ANDROID)
                         nativewindow log)
 endif()
 
-add_library(velmux_backend_apple backends/apple/objcpp/apple_backend.cpp)
+add_library(velmux_backend_apple
+  backends/apple/objcpp/apple_backend.cpp)
+if(APPLE)
+  target_sources(velmux_backend_apple PRIVATE
+    backends/apple/objcpp/apple_pipeline.mm)
+  set_source_files_properties(backends/apple/objcpp/apple_pipeline.mm
+    PROPERTIES LANGUAGE OBJCXX)
+  # AVFoundation/VideoToolbox/CoreMedia/CoreVideo for the native pipeline.
+  target_link_libraries(velmux_backend_apple PUBLIC
+    "-framework AVFoundation" "-framework VideoToolbox"
+    "-framework CoreMedia" "-framework CoreVideo"
+    "-framework Foundation" "-framework CoreFoundation")
+endif()
 target_link_libraries(velmux_backend_apple PUBLIC velmux::core)
 target_include_directories(velmux_backend_apple
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/backends/apple/objcpp>)

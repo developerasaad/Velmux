@@ -17,6 +17,11 @@ end
 target 'Velmux' do
   config = use_native_modules!
 
+  # The shared C++ engine (core + bridge facade + Apple backend), compiled
+  # straight from the repository root — the same sources the Android app
+  # builds through gradle/CMake. Single source of truth.
+  pod 'VelmuxEngine', :path => '../../..'
+
   use_react_native!(
     :path => config[:reactNativePath],
     # An absolute path to your application root.
