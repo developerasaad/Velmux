@@ -572,7 +572,9 @@ ZPC
     exempt="--exempt libsvtav1"
   fi
   log "[$abi] validating build"
-  python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest"
+  # stdout stays reserved for the ABI name (captured by the caller for the
+  # aggregate manifest); validation output belongs to the build log.
+  python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest" >&2
 
   # Unset per-ABI exports so the next ABI starts clean.
   unset CC CXX AR RANLIB STRIP NM PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
