@@ -563,7 +563,7 @@ ZPC
   if [ ! -f "$manifest" ] || [ "$BUILDER_ROOT/manifest-from-config.py" -nt "$manifest" ]; then
     log "[$abi] generating capability manifest"
     python3 "$BUILDER_ROOT/manifest-from-config.py" \
-      "$ffbuild" "$ffmpeg_src" "$FFMPEG_VERSION" "$manifest"
+      "$ffbuild" "$ffmpeg_src" "$FFMPEG_VERSION" "$manifest" >&2
   fi
 
   # --- Validate the real build against the Velmux feature requirements ----------------------

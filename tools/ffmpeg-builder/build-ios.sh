@@ -444,26 +444,22 @@ ZPC
     hb_src="$(extract_tarball "$hb_tb")"
     hb_build="$build_tmp/harfbuzz"
     rm -rf "$hb_build"
-    # The SDK must be a find root for harfbuzz: its find_library() calls
-    # resolve CoreText/CoreGraphics/CoreFoundation from the SDK, and the
-    # results are recorded in harfbuzz.pc's Libs.private. Without them
-    # harfbuzz.a still builds (static archives defer resolution), but
+    # harfbuzz 10.2.0's CMake port has a dead HB_IOS branch: the variable is
+    # never defined anywhere in its build files, so iOS builds fall into the
+    # macOS else-branch, whose ApplicationServices framework does not exist
+    # in the iOS SDK. find_library then records no frameworks at all, and
     # FFmpeg's --static pkg-config check fails with undefined _CTFont*
-    # symbols. The cache variables are pre-seeded with the exact framework
-    # paths because find_library() never overwrites an existing value and
-    # root-path semantics for frameworks differ across CMake versions.
-    local sdk_path
-    sdk_path="$(xcrun -sdk "$SLICE_SDK" --show-sdk-path)"
+    # symbols (static archives defer resolution, so harfbuzz itself builds).
+    # CoreText integration is disabled instead: harfbuzz's internal shaper —
+    # the one libass drives with its own font sources — is unaffected.
     cmake -G Ninja -S "$hb_src" -B "$hb_build" \
       -DCMAKE_SYSTEM_NAME=iOS \
       -DCMAKE_OSX_SYSROOT="$SLICE_SDK" \
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
-      -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX;$sdk_path" \
-      -DCORETEXT="$sdk_path/System/Library/Frameworks/CoreText.framework" \
-      -DCOREFOUNDATION="$sdk_path/System/Library/Frameworks/CoreFoundation.framework" \
-      -DCOREGRAPHICS="$sdk_path/System/Library/Frameworks/CoreGraphics.framework" \
+      -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
+      -DHB_HAVE_CORETEXT=OFF \
       -DBUILD_SHARED_LIBS=OFF -DHB_BUILD_UTILS=OFF -DHB_BUILD_TESTS=OFF \
       -DHB_HAVE_GLIB=OFF -DHB_HAVE_FREETYPE=ON >/dev/null
     cmake --build "$hb_build" >/dev/null
@@ -588,7 +584,7 @@ ZPC
   if [ ! -f "$manifest" ] || [ "$BUILDER_ROOT/manifest-from-config.py" -nt "$manifest" ]; then
     log "[$slice] generating capability manifest"
     python3 "$BUILDER_ROOT/manifest-from-config.py" \
-      "$ffbuild" "$ffmpeg_src" "$FFMPEG_VERSION" "$manifest"
+      "$ffbuild" "$ffmpeg_src" "$FFMPEG_VERSION" "$manifest" >&2
   fi
 
   # --- Validate against the Velmux feature requirements ------------------------------------------------------------
