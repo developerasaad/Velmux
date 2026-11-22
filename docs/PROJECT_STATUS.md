@@ -14,7 +14,7 @@ the ultimate truth.
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
 | 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending) |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
-| 7 | Persistence/recovery | Partial (SQLite job store + checkpoint model + shutdown-to-recovery contract; fault-injection pending) |
+| 7 | Persistence/recovery | Complete at the engine level (segmented transcode + crash-safe checkpoint commit + durable resume; REAL cancel/resume fault-injection test passes on CI and locally with ffprobe-verified full-length output) |
 | 8 | Background and notifications | Not started |
 | 9 | Batch scheduler | Partial (resource-aware scheduler implemented + unit tested) |
 | 10 | Premium UX polish | In progress (design system + screens scaffolded) |
@@ -52,6 +52,18 @@ the ultimate truth.
   (all 16 pinned sources fetch+checksum-verified from automation-friendly
   mirrors; SourceForge/code.videolan.org are avoided because they block or
   serve byte-unstable content to CI).
+- Recovery is REAL end-to-end (M7 engine-level): long transcodes run in
+  independently finalized, validated, checkpoint-committed segments; a
+  mid-run cancel leaves the committed prefix durable on disk and in
+  SQLite; retry (or post-crash recovery) resumes from the still-valid
+  prefix and re-encodes only the remainder; final assembly stream-copies
+  the validated pieces through the concat demuxer (safe=0, core-generated
+  paths); the whole flow is covered by a fault-injection test that cancels
+  a real VP9 transcode at >=50%, verifies every committed segment with
+  ffprobe, retries, and independently verifies the assembled output
+  covers the FULL source duration. Checkpoint rows survive every state
+  persist, never collide across runs (monotonic sequences), and are
+  cleaned on completion and job deletion.
 - React Native app: Home/Convert/Queue/History/Settings; tsc + eslint + jest
   green; durable SAF document picking (requestLongTermAccess).
 - CI on GitHub Actions: core+tests (Linux, with the pinned FFmpeg built
@@ -72,7 +84,10 @@ the ultimate truth.
 - FFmpeg mobile artifacts (out/android, out/ios) are being validated in CI
   for the first time; armeabi-v7a honestly omits SVT-AV1 (32-bit unsupported
   upstream), as does the x86_64 iOS simulator slice.
-- Recovery fault-injection test suite not yet implemented (M7 completion).
+- Recovery fault-injection is covered at the executor level (mid-run
+  cancel, durable resume, ffprobe-verified assembly); a full process-kill
+  + restart end-to-end test is still pending (the reconcile/requeue logic
+  itself is unit tested).
 
 ## Environment notes
 
