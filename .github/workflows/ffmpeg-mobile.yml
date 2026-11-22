@@ -106,9 +106,14 @@ jobs:
       - name: Install build tools
         run: |
           # meson: dav1d/fribidi cross builds. cmake/ninja/pkg-config are
-          # preinstalled on macOS runners; nasm is not needed (x86 asm off).
+          # preinstalled on macOS runners. nasm assembles libvpx's x86_64
+          # code for the Intel simulator slice (FFmpeg itself keeps
+          # --disable-x86asm; libvpx has no such switch for its asm).
           if ! command -v meson >/dev/null 2>&1; then
             brew install meson
+          fi
+          if ! command -v nasm >/dev/null 2>&1; then
+            brew install nasm
           fi
 
       - name: Restore FFmpeg source cache

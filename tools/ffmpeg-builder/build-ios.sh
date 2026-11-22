@@ -184,6 +184,17 @@ build_one_slice() {
   local build_tmp="$SRC_DIR/build-$SLICE_TAG"
   mkdir -p "$build_tmp" "$SLICE_PREFIX"
   make_wrappers
+
+  # Hermetic pkg-config resolution for the whole slice build: every
+  # cmake/meson find-module that consults pkg-config (notably CMake's FindPNG
+  # inside freetype) must only ever see this slice's prefix. Without
+  # PKG_CONFIG_LIBDIR, Homebrew packages on the CI runner leak into generated
+  # .pc files: observed failure was freetype2.pc gaining "Requires: libpng"
+  # (Homebrew's), which then broke FFmpeg's --static harfbuzz check with
+  # "Package 'libpng', required by 'freetype2', not found".
+  export PKG_CONFIG_PATH="$SLICE_PREFIX/lib/pkgconfig"
+  export PKG_CONFIG_LIBDIR="$SLICE_PREFIX/lib/pkgconfig"
+
   log "[$slice] building (sdk=$SLICE_SDK arch=$SLICE_ARCH)"
 
   # --- zlib (cmake iOS) --------------------------------------------------------
@@ -398,7 +409,7 @@ ZPC
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
       -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_ZLIB=FALSE \
       -DFT_REQUIRE_ZLIB=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE \
-      -DFT_DISABLE_HARFBUZZ=TRUE >/dev/null
+      -DFT_DISABLE_HARFBUZZ=TRUE -DFT_DISABLE_PNG=TRUE >/dev/null
     cmake --build "$ft_build" >/dev/null
     cmake --install "$ft_build" >/dev/null
     log "[$slice] freetype installed"
@@ -419,7 +430,8 @@ ZPC
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
       -DBUILD_SHARED_LIBS=OFF -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
-      -DPNG_SHARED=OFF -DPNG_EXECUTABLES=OFF >/dev/null
+      -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_FRAMEWORK=OFF \
+      -DPNG_EXECUTABLES=OFF >/dev/null
     cmake --build "$png_build" >/dev/null
     cmake --install "$png_build" >/dev/null
     log "[$slice] libpng installed"
@@ -574,7 +586,7 @@ ZPC
   log "[$slice] validating build"
   python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest"
 
-  unset CC CXX AR RANLIB STRIP NM
+  unset CC CXX AR RANLIB STRIP NM PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
   log "[$slice] build complete: $SLICE_PREFIX"
 }
 

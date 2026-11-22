@@ -173,6 +173,14 @@ build_one_abi() {
   # autoconf flags, and the NDK wrappers already target the right arch.
   export CC CXX AR RANLIB STRIP NM
 
+  # Hermetic pkg-config resolution for the whole ABI build: every cmake/meson
+  # find-module that consults pkg-config (notably CMake's FindPNG inside
+  # freetype) must only ever see this prefix. Without PKG_CONFIG_LIBDIR, a
+  # dev-package installed on the build host (e.g. libpng) would leak into
+  # generated .pc files as an unresolvable requirement for the cross build.
+  export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+  export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
+
   # --- zlib (cmake; no system zlib on android) -----------------------------
   if [ ! -f "$prefix/lib/libz.a" ]; then
     log "[$abi] building zlib"
@@ -392,7 +400,7 @@ ZPC
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_ZLIB=FALSE \
       -DFT_REQUIRE_ZLIB=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE \
-      -DFT_DISABLE_HARFBUZZ=TRUE >/dev/null
+      -DFT_DISABLE_HARFBUZZ=TRUE -DFT_DISABLE_PNG=TRUE >/dev/null
     cmake --build "$ft_build" >/dev/null
     cmake --install "$ft_build" >/dev/null
     log "[$abi] freetype installed"
@@ -411,7 +419,8 @@ ZPC
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
-      -DPNG_SHARED=OFF -DPNG_EXECUTABLES=OFF >/dev/null
+      -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_FRAMEWORK=OFF \
+      -DPNG_EXECUTABLES=OFF >/dev/null
     cmake --build "$png_build" >/dev/null
     cmake --install "$png_build" >/dev/null
     log "[$abi] libpng installed"
@@ -566,7 +575,7 @@ ZPC
   python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest"
 
   # Unset per-ABI exports so the next ABI starts clean.
-  unset CC CXX AR RANLIB STRIP NM
+  unset CC CXX AR RANLIB STRIP NM PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
 
   log "[$abi] build complete: $prefix"
   echo "$abi"
