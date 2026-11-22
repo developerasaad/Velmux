@@ -959,6 +959,13 @@ char *velmux_get_job(VelmuxEngineHandle *handle, const char *jobId) {
   return allocString(bridgeNS::snapshotToJson(*snapshot));
 }
 
+int velmux_is_job_active(VelmuxEngineHandle *handle, const char *jobId) {
+  if (handle == nullptr || jobId == nullptr) {
+    return -1;
+  }
+  return handle->engine->isJobActive(jobId) ? 1 : 0;
+}
+
 char *velmux_describe_backends(VelmuxEngineHandle *handle) {
   if (handle == nullptr) {
     return allocString(errorJson("engine is null"));

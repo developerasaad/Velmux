@@ -21,6 +21,7 @@ object VelmuxJni {
   external fun nativePlan(handle: Long, requestJson: String): ByteArray
   external fun nativeStartJob(handle: Long, requestJson: String): ByteArray
   external fun nativeGetJob(handle: Long, jobId: String): ByteArray
+  external fun nativeIsJobActive(handle: Long, jobId: String): Boolean
   external fun nativeListJobs(handle: Long): ByteArray
   external fun nativeDescribeBackends(handle: Long): ByteArray
   external fun nativePollEvents(handle: Long): ByteArray

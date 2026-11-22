@@ -171,6 +171,10 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
     complete(promise, json)
   }
 
+  override fun isJobActive(jobId: String, promise: Promise) {
+    promise.resolve(VelmuxJni.nativeIsJobActive(engine(), jobId))
+  }
+
   override fun listJobs(promise: Promise) {
     val json = callJson { handle -> VelmuxJni.nativeListJobs(handle) }
     try {

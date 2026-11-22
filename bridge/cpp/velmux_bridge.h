@@ -65,6 +65,11 @@ char *velmux_start_job(VelmuxEngineHandle *engine, const char *requestJson);
 
 char *velmux_list_jobs(VelmuxEngineHandle *engine);
 char *velmux_get_job(VelmuxEngineHandle *engine, const char *jobId);
+// 1 while a worker is executing/finalizing the job, 0 when idle, -1 on a
+// bad handle/id. Durable state may already read Canceled/Paused while a
+// worker is still unwinding; hosts use this to distinguish "cancel
+// recorded" from "cancel completed" before touching artifacts.
+int velmux_is_job_active(VelmuxEngineHandle *engine, const char *jobId);
 char *velmux_describe_backends(VelmuxEngineHandle *engine);
 int velmux_cancel_job(VelmuxEngineHandle *engine, const char *jobId);
 int velmux_pause_job(VelmuxEngineHandle *engine, const char *jobId);

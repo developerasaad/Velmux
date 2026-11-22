@@ -112,6 +112,10 @@ export interface Spec extends TurboModule {
   deleteJob(jobId: string): Promise<boolean>;
   updateResources(resources: ResourceUpdate): Promise<boolean>;
   getJob(jobId: string): Promise<JobSnapshot | null>;
+  // 1 while a worker is executing/finalizing the job, 0 when idle. Durable
+  // state may already read canceled/paused while the worker unwinds; UIs
+  // use this to tell "cancel recorded" from "cancel completed".
+  isJobActive(jobId: string): Promise<boolean>;
   listJobs(): Promise<JobSnapshot[]>;
   describeBackends(): Promise<string[]>;
   addListener(eventName: string): Promise<void>;

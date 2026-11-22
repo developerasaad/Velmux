@@ -123,6 +123,12 @@ jbyteArray nativeGetJob(JNIEnv *env, jclass, jlong handle, jstring jobId) {
   return toJsonBytes(env, velmux_get_job(asEngine(handle), id.c_str()));
 }
 
+jboolean nativeIsJobActive(JNIEnv *env, jclass, jlong handle, jstring jobId) {
+  const std::string id = utf16ToUtf8(env, jobId);
+  return velmux_is_job_active(asEngine(handle), id.c_str()) > 0 ? JNI_TRUE
+                                                               : JNI_FALSE;
+}
+
 jbyteArray nativeListJobs(JNIEnv *env, jclass, jlong handle) {
   return toJsonBytes(env, velmux_list_jobs(asEngine(handle)));
 }
@@ -186,6 +192,8 @@ const JNINativeMethod kVelmuxJniMethods[] = {
      reinterpret_cast<void *>(nativeStartJob)},
     {"nativeGetJob", "(JLjava/lang/String;)[B",
      reinterpret_cast<void *>(nativeGetJob)},
+    {"nativeIsJobActive", "(JLjava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeIsJobActive)},
     {"nativeListJobs", "(J)[B", reinterpret_cast<void *>(nativeListJobs)},
     {"nativeDescribeBackends", "(J)[B",
      reinterpret_cast<void *>(nativeDescribeBackends)},

@@ -347,6 +347,13 @@ TEST_CASE("facade: resource updates and job retry/delete") {
   }
   REQUIRE(terminalState == "completed");
 
+  // Worker liveness: a terminal job has no executing worker, unknown ids
+  // fail cleanly, and null arguments are rejected.
+  CHECK(velmux_is_job_active(env.engine, jobId.c_str()) == 0);
+  CHECK(velmux_is_job_active(env.engine, "no-such-job") == 0);
+  CHECK(velmux_is_job_active(nullptr, jobId.c_str()) == -1);
+  CHECK(velmux_is_job_active(env.engine, nullptr) == -1);
+
   // Retrying a completed job is refused (nothing to retry).
   CHECK(velmux_retry_job(env.engine, jobId.c_str()) == -1);
 
