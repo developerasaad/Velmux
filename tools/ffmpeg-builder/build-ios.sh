@@ -444,13 +444,21 @@ ZPC
     hb_src="$(extract_tarball "$hb_tb")"
     hb_build="$build_tmp/harfbuzz"
     rm -rf "$hb_build"
+    # The SDK must be a find root for harfbuzz: its find_library() calls
+    # resolve CoreText/CoreGraphics/CoreFoundation from the SDK, and the
+    # results are recorded in harfbuzz.pc's Libs.private. Without the SDK
+    # root the frameworks are not found, harfbuzz.a still builds (static
+    # archives defer resolution), but FFmpeg's --static pkg-config check
+    # fails with undefined _CTFont* symbols.
+    local sdk_path
+    sdk_path="$(xcrun -sdk "$SLICE_SDK" --show-sdk-path)"
     cmake -G Ninja -S "$hb_src" -B "$hb_build" \
       -DCMAKE_SYSTEM_NAME=iOS \
       -DCMAKE_OSX_SYSROOT="$SLICE_SDK" \
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
-      -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
+      -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX;$sdk_path" \
       -DBUILD_SHARED_LIBS=OFF -DHB_BUILD_UTILS=OFF -DHB_BUILD_TESTS=OFF \
       -DHB_HAVE_GLIB=OFF -DHB_HAVE_FREETYPE=ON >/dev/null
     cmake --build "$hb_build" >/dev/null
