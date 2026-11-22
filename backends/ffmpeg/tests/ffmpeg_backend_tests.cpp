@@ -5,6 +5,7 @@
 // tool of the pinned prefix) from deterministic lavfi inputs, so the suite
 // is self-contained and reproducible.
 #include "velmux/ffmpeg/ffmpeg_backend.h"
+#include "subtitle_tools.h"
 
 #include "velmux/core/engine.h"
 
@@ -198,6 +199,105 @@ private:
   std::condition_variable done;
   std::optional<JobEvent> last;
 };
+
+void writeFile(const std::filesystem::path &path, const std::string &content) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out << content;
+  REQUIRE(out.good());
+}
+
+std::string readFile(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  return buffer.str();
+}
+
+// Muxes an A/V fixture with a subtitle sidecar into Matroska (all streams
+// copied — the standard fixture for subtitle behavior).
+std::string muxWithSubtitles(const std::filesystem::path &avPath,
+                             const std::filesystem::path &subPath,
+                             const std::filesystem::path &outPath) {
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+      avPath.string() + "\" -i \"" + subPath.string() +
+      "\" -map 0:v -map 0:a -map 1:0 -c:v copy -c:a copy -c:s copy " +
+      outPath.string();
+  REQUIRE(std::system(cmd.c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(outPath) > 1024);
+  return outPath.string();
+}
+
+const char *kSampleSrt =
+    "1\n"
+    "00:00:00,500 --> 00:00:02,500\n"
+    "BURNMARKERTEXT\n\n"
+    "2\n"
+    "00:00:03,000 --> 00:00:04,500\n"
+    "Second cue\n\n";
+
+// Measures the maximum luma of the bottom quarter of the frame at a given
+// timestamp using the pinned ffmpeg binary (independent of the backend).
+// Burned-in white text on a black fixture drives this far above black.
+int bottomQuarterYMax(const std::string &path, double atSeconds) {
+  const std::string cmd =
+      ffmpegBin() + " -hide_banner -v info -ss " + std::to_string(atSeconds) +
+      " -i \"" + path + "\" -frames:v 1 -vf "
+      "\"crop=iw:ih/4:0:ih*3/4,signalstats,metadata=print:key=lavfi.signalstats.YMAX\" "
+      "-f null - 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  int yMax = -1;
+  char line[512];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    const std::string entry = line;
+    const auto pos = entry.find("lavfi.signalstats.YMAX=");
+    if (pos != std::string::npos) {
+      yMax = std::max(yMax, std::atoi(entry.c_str() + pos + 23));
+    }
+  }
+  ::pclose(pipe);
+  return yMax;
+}
+
+int countStreams(const std::string &path, const std::string &codecType) {
+  const std::string cmd =
+      ffprobeBin() + " -v error -select_streams " + codecType +
+      " -show_entries stream=index -of csv=p=0 \"" + path + "\" 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  int count = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    if (line[0] >= '0' && line[0] <= '9') {
+      ++count;
+    }
+  }
+  ::pclose(pipe);
+  return count;
+}
+
+std::string subtitleCodecName(const std::string &path) {
+  const std::string cmd =
+      ffprobeBin() +
+      " -v error -select_streams s -show_entries stream=codec_name "
+      "-of csv=p=0 \"" + path + "\" 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  std::string name;
+  char line[256];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    std::string entry = line;
+    while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
+      entry.pop_back();
+    }
+    if (!entry.empty()) {
+      name = entry;
+    }
+  }
+  ::pclose(pipe);
+  return name;
+}
 
 } // namespace
 
@@ -406,4 +506,194 @@ TEST_CASE("fit-under-size jobs receive a real bitrate budget") {
   REQUIRE(plan.value().feasible);
   REQUIRE(plan.value().best.has_value());
   CHECK(plan.value().best->estimatedOutputBytes.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Subtitle behavior (spec §14: subtitles are first-class streams)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("subtitle timestamp shifting: SRT golden cases") {
+  TestEnv env;
+  const auto src = env.dir / "in.srt";
+  const auto dst = env.dir / "shifted.srt";
+  writeFile(src, kSampleSrt);
+  std::string reason;
+  REQUIRE(velmux::ffmpeg::subtitles::shiftSubtitleFile(
+      src.string(), dst.string(), /*offsetMs=*/2000, reason));
+  const std::string shifted = readFile(dst);
+  // 00:00:00,500 + 2s -> 00:00:02,500 ; 00:00:02,500 -> 00:00:04,500
+  CHECK(shifted.find("00:00:02,500 --> 00:00:04,500") != std::string::npos);
+  CHECK(shifted.find("00:00:05,000 --> 00:00:06,500") != std::string::npos);
+  CHECK(shifted.find("BURNMARKERTEXT") != std::string::npos);
+}
+
+TEST_CASE("subtitle timestamp shifting: negative offsets clamp to zero") {
+  TestEnv env;
+  const auto src = env.dir / "in.srt";
+  const auto dst = env.dir / "shifted.srt";
+  writeFile(src, kSampleSrt);
+  std::string reason;
+  REQUIRE(velmux::ffmpeg::subtitles::shiftSubtitleFile(
+      src.string(), dst.string(), /*offsetMs=*/-1000, reason));
+  const std::string shifted = readFile(dst);
+  // 500ms - 1000ms clamps to 0; 2500ms - 1000ms = 1500ms.
+  CHECK(shifted.find("00:00:00,000 --> 00:00:01,500") != std::string::npos);
+  CHECK(shifted.find("00:00:02,000 --> 00:00:03,500") != std::string::npos);
+}
+
+TEST_CASE("subtitle timestamp shifting: ASS and malformed input") {
+  TestEnv env;
+  const auto ass = env.dir / "in.ass";
+  const auto assOut = env.dir / "shifted.ass";
+  writeFile(ass,
+            "[Script Info]\nScriptType: v4.00+\n\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
+            "MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello, world\n");
+  std::string reason;
+  REQUIRE(velmux::ffmpeg::subtitles::shiftSubtitleFile(
+      ass.string(), assOut.string(), 1500, reason));
+  const std::string shifted = readFile(assOut);
+  CHECK(shifted.find("0:00:02.50,0:00:03.50") != std::string::npos);
+  CHECK(shifted.find("Hello, world") != std::string::npos);
+
+  const auto bad = env.dir / "bad.txt";
+  const auto badOut = env.dir / "bad-out.txt";
+  writeFile(bad, "this file has no cues at all\n");
+  CHECK_FALSE(velmux::ffmpeg::subtitles::shiftSubtitleFile(
+      bad.string(), badOut.string(), 500, reason));
+  CHECK_FALSE(std::filesystem::exists(badOut));
+}
+
+TEST_CASE("REAL transcode preserves subtitle tracks (MKV/H.264+SRT -> HEVC? no: H.264 re-encode, MKV)") {
+  TestEnv env;
+  const std::string av = generateFixture(env.dir / "av.mp4",
+                                         "color=c=black:size=320x240:rate=12",
+                                         "sine=frequency=440:sample_rate=44100", 5.0);
+  const auto srt = env.dir / "subs.srt";
+  writeFile(srt, kSampleSrt);
+  const std::string mkv = muxWithSubtitles(av, srt, env.dir / "in.mkv");
+  REQUIRE(subtitleCodecName(mkv) == "subrip");
+
+  // Force a real re-encode (resolution change) with the default Preserve
+  // policy: the subtitle track must survive the transcode.
+  ConversionRequest request =
+      transcodeRequest(mkv, Container::Mkv, VideoCodec::H264, AudioCodec::Aac,
+                       /*height=*/144);
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  REQUIRE(jobs.size() == 1);
+  const std::string outPath = jobs.front().outputPath;
+  // INDEPENDENT cross-checks: video re-encoded, subtitle preserved.
+  const ProbeResult probe = probeWith(outPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.height == 144);
+  CHECK(countStreams(outPath, "s") == 1);
+  CHECK(subtitleCodecName(outPath) == "subrip");
+}
+
+TEST_CASE("REAL burn-in: embedded SRT rendered into the video (libass)") {
+  TestEnv env;
+  const std::string av = generateFixture(env.dir / "av.mp4",
+                                         "color=c=black:size=320x240:rate=12",
+                                         "sine=frequency=440:sample_rate=44100", 5.0);
+  const auto srt = env.dir / "subs.srt";
+  writeFile(srt, kSampleSrt);
+  const std::string mkv = muxWithSubtitles(av, srt, env.dir / "in.mkv");
+
+  ConversionRequest request = transcodeRequest(mkv, Container::Mp4,
+                                                VideoCodec::H264, AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  const std::string outPath = jobs.front().outputPath;
+  // Burn-in: no subtitle stream in the output...
+  CHECK(countStreams(outPath, "s") == 0);
+  // ...and text pixels ARE present in the bottom quarter while the cue is
+  // active (black fixture: any bright luma is rendered text).
+  const int duringCue = bottomQuarterYMax(outPath, 1.0);
+  INFO("YMAX during cue: " << duringCue);
+  CHECK(duringCue > 100);
+}
+
+TEST_CASE("REAL burn-in: external SRT with timing offset") {
+  TestEnv env;
+  const std::string av = generateFixture(env.dir / "av.mp4",
+                                         "color=c=black:size=320x240:rate=12",
+                                         "sine=frequency=440:sample_rate=44100", 6.0);
+  const auto srt = env.dir / "external.srt";
+  // Cue becomes active only after the +2000 ms offset: 2.0s -> 4.0s.
+  writeFile(srt,
+            "1\n"
+            "00:00:02,000 --> 00:00:05,000\n"
+            "OFFSETMARKERTEXT\n\n");
+
+  ConversionRequest request = transcodeRequest(av, Container::Mp4,
+                                                VideoCodec::H264, AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  request.subtitles.externalUri = srt.string();
+  request.subtitles.timingOffsetMs = 2000;
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  const std::string outPath = jobs.front().outputPath;
+  CHECK(countStreams(outPath, "s") == 0);
+  // Before the shifted cue start: pure black.
+  const int beforeCue = bottomQuarterYMax(outPath, 2.5);
+  INFO("YMAX before shifted cue: " << beforeCue);
+  CHECK(beforeCue <= 48);
+  // While the shifted cue is active: rendered text.
+  const int duringCue = bottomQuarterYMax(outPath, 4.5);
+  INFO("YMAX during shifted cue: " << duringCue);
+  CHECK(duringCue > 100);
+}
+
+TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
+  TestEnv env;
+  const std::string av = generateFixture(env.dir / "av.mp4",
+                                         "testsrc2=size=320x240:rate=12",
+                                         "sine=frequency=440:sample_rate=44100", 2.0);
+
+  // Extraction is not implemented: the plan must refuse rather than drop.
+  ConversionRequest extract =
+      transcodeRequest(av, Container::Mkv, VideoCodec::H264, AudioCodec::Aac);
+  extract.subtitles.policy = SubtitlePolicy::Extract;
+  const Result<PlanResult> plan = env.engine->plan(
+      MediaSource{av, "av.mp4"}, extract);
+  REQUIRE(plan.ok());
+  CHECK_FALSE(plan.value().feasible);
+  CHECK(plan.value().message.find("extraction") != std::string::npos);
+
+  // Burn-in without any subtitle source is invalid.
+  ConversionRequest burnNothing =
+      transcodeRequest(av, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
+  burnNothing.subtitles.policy = SubtitlePolicy::BurnIn;
+  const Result<PlanResult> burnPlan = env.engine->plan(
+      MediaSource{av, "av.mp4"}, burnNothing);
+  REQUIRE(burnPlan.ok());
+  CHECK_FALSE(burnPlan.value().feasible);
+  CHECK(burnPlan.value().message.find("no subtitle track") != std::string::npos);
 }

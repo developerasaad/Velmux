@@ -105,14 +105,14 @@ if(VELMUX_FFMPEG_FOUND)
   execute_process(
     COMMAND ${CMAKE_COMMAND} -E env ${_pc_env}
             ${PKG_CONFIG_EXECUTABLE} --static --cflags
-            libavcodec libavformat libavutil libswscale libswresample
+            libavcodec libavformat libavutil libavfilter libswscale libswresample
     OUTPUT_VARIABLE VELMUX_FFMPEG_CFLAGS
     OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE _cflags_ok)
   execute_process(
     COMMAND ${CMAKE_COMMAND} -E env ${_pc_env}
             ${PKG_CONFIG_EXECUTABLE} --static --libs
-            libavcodec libavformat libavutil libswscale libswresample
+            libavcodec libavformat libavutil libavfilter libswscale libswresample
     OUTPUT_VARIABLE VELMUX_FFMPEG_LIBS
     OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE _libs_ok)
@@ -123,6 +123,7 @@ if(VELMUX_FFMPEG_FOUND)
     add_library(velmux_backend_ffmpeg
       backends/ffmpeg/src/codec_mapping.cpp
       backends/ffmpeg/src/ffmpeg_backend.cpp
+      backends/ffmpeg/src/subtitle_tools.cpp
     )
     add_library(velmux::backend-ffmpeg ALIAS velmux_backend_ffmpeg)
     target_include_directories(velmux_backend_ffmpeg

@@ -122,6 +122,23 @@ PlanResult Planner::plan(const MediaInfo &source,
 
   // Subtitle policy constraints (never silently discard: removal must be
   // explicit).
+  if (request.subtitles.policy == SubtitlePolicy::Extract) {
+    // Extraction to sidecar files is not implemented yet. Reject honestly
+    // instead of silently dropping the tracks (D-013).
+    result.feasible = false;
+    result.message =
+        "Subtitle extraction is not implemented in this build yet; tracks "
+        "can be preserved, removed, or burned in.";
+    return result;
+  }
+  if (request.subtitles.policy == SubtitlePolicy::BurnIn &&
+      !request.subtitles.externalUri.has_value() && !source.hasSubtitles()) {
+    result.feasible = false;
+    result.message =
+        "Burn-in requested but the source has no subtitle track and no "
+        "external subtitle file was provided.";
+    return result;
+  }
   if (source.hasSubtitles() &&
       request.subtitles.policy == SubtitlePolicy::Preserve) {
     for (const auto &sub : source.subtitles) {
@@ -158,7 +175,9 @@ PlanResult Planner::plan(const MediaInfo &source,
       // No transformation requested: stream copy is only valid when the
       // output streams are identical to the input.
       !request.video.resolutionHeight.has_value() &&
-      !request.video.frameRate.has_value();
+      !request.video.frameRate.has_value() &&
+      // Burn-in rewrites the video pixels: it can never stream-copy.
+      request.subtitles.policy != SubtitlePolicy::BurnIn;
   const bool canStreamCopyAudio =
       wantsAudio && source.audio.front().codec == outAudioCodec &&
       features_.audioSupport(outAudioCodec).streamCopy &&
@@ -235,7 +254,7 @@ PlanResult Planner::plan(const MediaInfo &source,
     if (wantsAudio) {
       assign(StageId::AudioProcessing);
     }
-    if (source.hasSubtitles() &&
+    if ((source.hasSubtitles() || request.subtitles.externalUri.has_value()) &&
         request.subtitles.policy == SubtitlePolicy::BurnIn) {
       assign(StageId::SubtitleProcessing);
     }

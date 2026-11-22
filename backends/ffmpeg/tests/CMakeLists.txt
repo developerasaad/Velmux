@@ -16,6 +16,9 @@ function(velmux_ffmpeg_test name)
                  ${CMAKE_SOURCE_DIR}/core/tests/doctest_main.cpp)
   target_link_libraries(${name} PRIVATE velmux::core velmux::backend-ffmpeg
                                         doctest)
+  # Internal backend headers (e.g. subtitle_tools.h) live in src/.
+  target_include_directories(${name} PRIVATE
+    ${CMAKE_SOURCE_DIR}/backends/ffmpeg/src)
   target_compile_definitions(${name} PRIVATE
     VELMUX_TEST_FFPROBE="${FFPROBE}"
     VELMUX_TEST_FFMPEG_PREFIX="${VELMUX_FFMPEG_PREFIX}")

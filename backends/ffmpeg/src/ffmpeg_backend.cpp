@@ -1,5 +1,6 @@
 #include "velmux/ffmpeg/ffmpeg_backend.h"
 #include "velmux/ffmpeg/codec_mapping.h"
+#include "subtitle_tools.h"
 
 #include "velmux/core/compression.h"
 #include "velmux/core/feature_registry.h"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <sys/stat.h>
 #include <unordered_map>
@@ -14,6 +16,9 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/opt.h>
@@ -39,6 +44,16 @@ std::optional<std::string> localPathFor(const MediaSource &source) {
   }
   if (source.uri.rfind('/', 0) == 0) {
     return source.uri;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> localPathForUri(const std::string &uri) {
+  if (uri.rfind("file://", 0) == 0) {
+    return uri.substr(7);
+  }
+  if (uri.rfind('/', 0) == 0) {
+    return uri;
   }
   return std::nullopt;
 }
@@ -138,6 +153,7 @@ struct CodecCleanup {
     av_packet_free(&packet);
     sws_freeContext(sws);
     swr_free(&swr);
+    avfilter_graph_free(&filterGraph);
     avcodec_free_context(&videoDec);
     avcodec_free_context(&audioDec);
     avcodec_free_context(&videoEnc);
@@ -151,6 +167,10 @@ struct CodecCleanup {
     if (in != nullptr) {
       avformat_close_input(&in);
     }
+    for (const auto &temp : tempFiles) {
+      std::error_code ec;
+      std::filesystem::remove(temp, ec);
+    }
   }
   AVFormatContext *in = nullptr;
   AVFormatContext *out = nullptr;
@@ -162,7 +182,212 @@ struct CodecCleanup {
   SwrContext *swr = nullptr;
   AVFrame *frame = nullptr;
   AVPacket *packet = nullptr;
+  AVFilterGraph *filterGraph = nullptr;
+  // Scratch files materialized for burn-in (shifted subtitle copies).
+  std::vector<std::string> tempFiles;
 };
+
+// Escapes a filesystem path for use as a single-quoted option value inside
+// a libavfilter graph description (ffmpeg-utils "Quoting and escaping"):
+// within '...' only \\ and ' need escaping at the option level, and the
+// graph-level parser additionally treats : as an option separator, so both
+// are escaped. The caller wraps the result in quotes.
+std::string escapeFilterPath(const std::string &path) {
+  std::string out;
+  out.reserve(path.size() + 8);
+  for (const char c : path) {
+    if (c == '\\' || c == ':' || c == '\'') {
+      out += '\\';
+    }
+    out += c;
+  }
+  return out;
+}
+
+// True when the directory contains at least one regular font file directly
+// (libass loads the FILES inside fontsdir; nested trees are not scanned).
+bool dirContainsFontFile(const std::string &dir) {
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+    std::string name = entry.path().filename().string();
+    for (auto &c : name) {
+      c = char(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (name.size() > 4 &&
+        (name.rfind(".ttf") == name.size() - 4 ||
+         name.rfind(".otf") == name.size() - 4 ||
+         name.rfind(".ttc") == name.size() - 4)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Font source for libass (burn-in rendering). libass loads the font FILES
+// in the given directory (no recursion) and — without a system font
+// provider, which hermetic static builds never have — can only match fonts
+// by family name. The SRT-to-ASS conversion requests "Arial" by default,
+// so the discovered family is applied via force_style for SRT-like sources;
+// ASS/SSA files keep their authored styling (embedded fonts still work via
+// the embedded provider).
+struct FontSource {
+  std::string dir;
+  std::string family; // empty = unknown, do not force
+};
+
+FontSource findFontSource() {
+  if (const char *env = ::getenv("VELMUX_FONTS_DIR");
+      env != nullptr && *env != '\0' && dirContainsFontFile(env)) {
+    const char *family = ::getenv("VELMUX_FONT_FAMILY");
+    return FontSource{env, family != nullptr ? family : ""};
+  }
+  struct Candidate {
+    const char *dir;
+    const char *family;
+  };
+  static const Candidate candidates[] = {
+      {"/usr/share/fonts/truetype/dejavu", "DejaVu Sans"}, // Debian/Ubuntu
+      {"/usr/share/fonts/truetype", "DejaVu Sans"},        // Linux, flat tree
+      {"/System/Library/Fonts", "Helvetica Neue"},         // iOS / macOS
+      {"/system/fonts", "Roboto"},                         // Android
+      {"/usr/share/fonts", ""},                            // unknown layout
+      {"/usr/local/share/fonts", ""},                      // manual installs
+  };
+  for (const auto &c : candidates) {
+    if (dirContainsFontFile(c.dir)) {
+      return FontSource{c.dir, c.family};
+    }
+  }
+  // One level deeper (e.g. /usr/share/fonts/<family>/Font.ttf): family
+  // unknown.
+  std::error_code ec;
+  for (const char *root : {"/usr/share/fonts", "/usr/local/share/fonts"}) {
+    for (const auto &entry : std::filesystem::directory_iterator(root, ec)) {
+      if (entry.is_directory(ec) && dirContainsFontFile(entry.path().string())) {
+        return FontSource{entry.path().string(), ""};
+      }
+    }
+  }
+  return {};
+}
+
+// Text subtitle codec ids the libass-backed `subtitles` filter can render.
+bool isBurnableSubtitleCodec(AVCodecID id) {
+  switch (id) {
+    case AV_CODEC_ID_SUBRIP:
+    case AV_CODEC_ID_ASS:
+    case AV_CODEC_ID_SSA:
+    case AV_CODEC_ID_WEBVTT:
+    case AV_CODEC_ID_MOV_TEXT:
+    case AV_CODEC_ID_TEXT:
+      return true;
+    default:
+      return false; // PGS/DVB/VobSub are bitmap formats (libass cannot)
+  }
+}
+
+// File extension for a stream-copyable extraction of a text subtitle codec.
+const char *subtitleFileExtensionFor(AVCodecID id) {
+  switch (id) {
+    case AV_CODEC_ID_SUBRIP:
+    case AV_CODEC_ID_TEXT:
+      return ".srt";
+    case AV_CODEC_ID_ASS:
+    case AV_CODEC_ID_SSA:
+      return ".ass";
+    case AV_CODEC_ID_WEBVTT:
+      return ".vtt";
+    default:
+      return nullptr;
+  }
+}
+
+// Extracts one subtitle stream into a standalone text subtitle file via
+// demux + packet-copy remux (valid for text formats whose packets are the
+// file's native cue representation). Used to materialize a burn-in source
+// when a timing offset must be applied first.
+bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
+                                 const std::string &outPath) {
+  AVFormatContext *in = nullptr;
+  AVFormatContext *out = nullptr;
+  bool ok = false;
+  do {
+    if (avformat_open_input(&in, inPath.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      break;
+    }
+    if (streamIndex < 0 ||
+        static_cast<unsigned>(streamIndex) >= in->nb_streams) {
+      break;
+    }
+    const AVCodecID cid = in->streams[streamIndex]->codecpar->codec_id;
+    const char *ext = subtitleFileExtensionFor(cid);
+    if (ext == nullptr) {
+      break; // cannot stream-copy this codec into a sidecar file
+    }
+    if (avformat_alloc_output_context2(&out, nullptr, nullptr,
+                                       outPath.c_str()) < 0 ||
+        out == nullptr) {
+      break;
+    }
+    AVStream *outStream = avformat_new_stream(out, nullptr);
+    if (outStream == nullptr) {
+      break;
+    }
+    avcodec_parameters_copy(outStream->codecpar, in->streams[streamIndex]->codecpar);
+    outStream->codecpar->codec_tag = 0;
+    av_dict_copy(&outStream->metadata, in->streams[streamIndex]->metadata, 0);
+    if (!(out->oformat->flags & AVFMT_NOFILE) &&
+        avio_open(&out->pb, outPath.c_str(), AVIO_FLAG_WRITE) < 0) {
+      break;
+    }
+    if (avformat_write_header(out, nullptr) < 0) {
+      break;
+    }
+    AVPacket *pkt = av_packet_alloc();
+    bool writeFailed = false;
+    while (!writeFailed && av_read_frame(in, pkt) >= 0) {
+      if (pkt->stream_index != streamIndex) {
+        av_packet_unref(pkt);
+        continue;
+      }
+      const AVStream *src = in->streams[streamIndex];
+      const AVRounding rounding = static_cast<AVRounding>(
+          AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+      pkt->pts = av_rescale_q_rnd(pkt->pts, src->time_base,
+                                  outStream->time_base, rounding);
+      pkt->dts = av_rescale_q_rnd(pkt->dts, src->time_base,
+                                  outStream->time_base, rounding);
+      pkt->duration =
+          av_rescale_q(pkt->duration, src->time_base, outStream->time_base);
+      pkt->pos = -1;
+      pkt->stream_index = 0;
+      if (av_interleaved_write_frame(out, pkt) < 0) {
+        writeFailed = true;
+      }
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    if (writeFailed) {
+      break;
+    }
+    av_write_trailer(out);
+    ok = true;
+  } while (false);
+  if (out != nullptr) {
+    if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb != nullptr) {
+      avio_closep(&out->pb);
+    }
+    avformat_free_context(out);
+  }
+  if (in != nullptr) {
+    avformat_close_input(&in);
+  }
+  return ok;
+}
 
 } // namespace
 
@@ -316,6 +541,15 @@ bool FfmpegExecutor::canExecute(const Pipeline &pipeline,
 
 ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
   if (params.pipeline.videoStreamCopy && params.pipeline.audioStreamCopy) {
+    // Burn-in rewrites video pixels; a copy pipeline can never serve it
+    // (the planner enforces this; the executor refuses defensively).
+    if (params.request.subtitles.policy == SubtitlePolicy::BurnIn) {
+      ExecuteResult result;
+      result.error = Error::make(
+          ErrorCode::InvalidArgument,
+          "internal: burn-in cannot run on a stream-copy pipeline", "ffmpeg");
+      return result;
+    }
     return executeRemux(params);
   }
   return executeTranscode(params);
@@ -355,6 +589,7 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   // Decide which input streams survive (policy decided by the core:
   // video/audio preserve; subtitles per the user's explicit policy).
   std::vector<int> inIndexOfOut;
+  std::vector<int> outIndexOfSub; // output indices of subtitle streams
   std::vector<AVBSFContext *> bitstreamFilters;
   for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
     const AVStream *inStream = cleanup.in->streams[i];
@@ -372,6 +607,9 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
     AVStream *outStream = avformat_new_stream(cleanup.out, nullptr);
     if (outStream == nullptr) {
       continue;
+    }
+    if (type == AVMEDIA_TYPE_SUBTITLE) {
+      outIndexOfSub.push_back(outStream->index);
     }
     avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
     outStream->codecpar->codec_tag = 0;
@@ -481,6 +719,19 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
         av_rescale_q(outPacket->duration, srcStream->time_base,
                      cleanup.out->streams[outIndex]->time_base);
     outPacket->pos = -1;
+    // Timing offset on preserved subtitle tracks (spec §14: adjust
+    // subtitle timing — applied, never silently ignored).
+    if (outPacket->pts != AV_NOPTS_VALUE &&
+        params.request.subtitles.timingOffsetMs != 0 &&
+        std::find(outIndexOfSub.begin(), outIndexOfSub.end(), outIndex) !=
+            outIndexOfSub.end()) {
+      outPacket->pts += av_rescale_q(
+          params.request.subtitles.timingOffsetMs, AVRational{1, 1000},
+          cleanup.out->streams[outIndex]->time_base);
+      if (outPacket->pts < 0) {
+        outPacket->pts = 0;
+      }
+    }
 
     if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
       writeFailed = true;
@@ -570,6 +821,14 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
   // ---- Video setup ---------------------------------------------------------
   int videoOut = -1;
   AVFrame *videoFrame = nullptr; // owned locally, freed at exit
+  // Burn-in routing: when subtitles are burned, decoded frames pass through
+  // a libavfilter graph (scale -> subtitles[libass] -> buffersink) instead of
+  // the direct sws path. Owned by cleanup.filterGraph.
+  AVFilterContext *burnSrc = nullptr;
+  AVFilterContext *burnSink = nullptr;
+  // Time base the buffersrc was declared with; pushed frames' pts are
+  // normalized into it (decoders may adjust their own time base mid-stream).
+  AVRational burnGraphTb{0, 1};
   if (videoIn >= 0 && request.video.enabled) {
     const AVStream *inVideo = cleanup.in->streams[videoIn];
     const AVCodec *decCodec =
@@ -584,10 +843,24 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     }
     cleanup.videoDec = avcodec_alloc_context3(decCodec);
     avcodec_parameters_to_context(cleanup.videoDec, inVideo->codecpar);
+    // Demuxed packet timestamps arrive in the stream's time base: declare
+    // that to the decoder (the documented contract) and pin the decoder's
+    // output time base so filter-graph creation cannot see the 0/1
+    // placeholder some decoders leave until the first frame.
+    cleanup.videoDec->pkt_timebase = inVideo->time_base;
+    if (cleanup.videoDec->time_base.num <= 0 ||
+        cleanup.videoDec->time_base.den <= 0) {
+      cleanup.videoDec->time_base = inVideo->time_base;
+    }
     if (avcodec_open2(cleanup.videoDec, decCodec, nullptr) < 0) {
       result.error = Error::make(ErrorCode::ExecutionFailed,
                                  "cannot open video decoder", "ffmpeg");
       return result;
+    }
+    if (cleanup.videoDec->time_base.num <= 0 ||
+        cleanup.videoDec->time_base.den <= 0) {
+      // A few decoders still reset it during open.
+      cleanup.videoDec->time_base = inVideo->time_base;
     }
 
     const char *encName = encoderNameFor(pipeline.videoCodec);
@@ -664,24 +937,259 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     avcodec_parameters_from_context(outVideo->codecpar, cleanup.videoEnc);
     outVideo->time_base = cleanup.videoEnc->time_base;
 
-    cleanup.sws = sws_getContext(
-        cleanup.videoDec->width, cleanup.videoDec->height,
-        static_cast<AVPixelFormat>(cleanup.videoDec->pix_fmt), outW, outH,
-        cleanup.videoEnc->pix_fmt, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (cleanup.sws == nullptr) {
-      result.error = Error::make(ErrorCode::ExecutionFailed,
-                                 "cannot create pixel converter", "ffmpeg");
-      return result;
-    }
-    videoFrame = av_frame_alloc();
-    videoFrame->format = cleanup.videoEnc->pix_fmt;
-    videoFrame->width = outW;
-    videoFrame->height = outH;
-    if (av_frame_get_buffer(videoFrame, 0) < 0) {
-      av_frame_free(&videoFrame);
-      result.error = Error::make(ErrorCode::ExecutionFailed,
-                                 "cannot allocate video frame", "ffmpeg");
-      return result;
+    if (request.subtitles.policy == SubtitlePolicy::BurnIn) {
+      // Resolve the burn-in source: explicit external file, else the first
+      // embedded subtitle stream.
+      std::string subPath;
+      int subGlobalIndex = -1; // stream index in the input container
+      int subOrdinal = -1;     // subtitle-stream ordinal (the filter's `si`)
+      if (request.subtitles.externalUri.has_value()) {
+        const std::optional<std::string> ext =
+            localPathForUri(*request.subtitles.externalUri);
+        if (!ext.has_value()) {
+          result.error = Error::make(ErrorCode::SourceUnavailable,
+                                     "external subtitle URI is not a local path",
+                                     "ffmpeg");
+          return result;
+        }
+        subPath = *ext;
+      } else {
+        for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
+          if (cleanup.in->streams[i]->codecpar->codec_type ==
+              AVMEDIA_TYPE_SUBTITLE) {
+            subGlobalIndex = int(i);
+            break;
+          }
+        }
+        if (subGlobalIndex < 0) {
+          result.error = Error::make(
+              ErrorCode::InvalidArgument,
+              "burn-in requested but the source has no subtitle track and no "
+              "external subtitle file was provided",
+              "ffmpeg");
+          return result;
+        }
+        const AVCodecID subCodec =
+            cleanup.in->streams[subGlobalIndex]->codecpar->codec_id;
+        if (!isBurnableSubtitleCodec(subCodec)) {
+          result.error = Error::make(
+              ErrorCode::UnsupportedFeature,
+              std::string("burn-in of bitmap subtitle streams (") +
+                  avcodec_get_name(subCodec) +
+                  ") requires rendering support that is not available yet",
+              "ffmpeg");
+          return result;
+        }
+        subPath = *inPath;
+        // The subtitles filter's `si` option counts SUBTITLE streams only:
+        // convert the global stream index into its subtitle ordinal.
+        for (int s = 0; s < subGlobalIndex; ++s) {
+          if (cleanup.in->streams[s]->codecpar->codec_type ==
+              AVMEDIA_TYPE_SUBTITLE) {
+            ++subOrdinal;
+          }
+        }
+        ++subOrdinal; // this stream is the (ordinal+1)-th subtitle stream
+      }
+
+      // Timing offset: materialize a shifted copy before rendering
+      // (spec §14: adjust subtitle timing — never silently ignored).
+      if (request.subtitles.timingOffsetMs != 0) {
+        const std::filesystem::path outFs(params.outputPath);
+        const std::string stem = outFs.stem().string();
+        if (subGlobalIndex >= 0) {
+          const AVCodecID subCodec =
+              cleanup.in->streams[subGlobalIndex]->codecpar->codec_id;
+          const char *ext = subtitleFileExtensionFor(subCodec);
+          if (ext == nullptr) {
+            result.error = Error::make(
+                ErrorCode::UnsupportedFeature,
+                "a timing offset cannot be applied to this embedded subtitle "
+                "codec yet",
+                "ffmpeg");
+            return result;
+          }
+          const std::string extracted =
+              (outFs.parent_path() / ("." + stem + "-subs" + ext)).string();
+          if (!extractSubtitleStreamToFile(*inPath, subGlobalIndex,
+                                           extracted)) {
+            result.error =
+                Error::make(ErrorCode::ExecutionFailed,
+                            "cannot extract the embedded subtitle stream for "
+                            "timing adjustment",
+                            "ffmpeg");
+            return result;
+          }
+          cleanup.tempFiles.push_back(extracted);
+          subPath = extracted;
+          subGlobalIndex = -1; // now a standalone file
+          subOrdinal = -1;
+        }
+        auto subExtOf = [](const std::string &p) {
+          const auto dot = p.rfind('.');
+          return dot == std::string::npos ? std::string(".srt")
+                                          : p.substr(dot);
+        };
+        const std::string shifted =
+            (outFs.parent_path() / ("." + stem + "-shifted" + subExtOf(subPath)))
+                .string();
+        std::string shiftReason;
+        if (!subtitles::shiftSubtitleFile(
+                subPath, shifted, request.subtitles.timingOffsetMs,
+                shiftReason)) {
+          result.error = Error::make(
+              ErrorCode::UnsupportedFeature,
+              "cannot apply the subtitle timing offset: " + shiftReason,
+              "ffmpeg");
+          return result;
+        }
+        cleanup.tempFiles.push_back(shifted);
+        subPath = shifted;
+      }
+
+      const FontSource fontSource = findFontSource();
+      if (fontSource.dir.empty()) {
+        result.error = Error::make(
+            ErrorCode::UnsupportedFeature,
+            "no fonts directory found for subtitle rendering "
+            "(set VELMUX_FONTS_DIR)",
+            "ffmpeg");
+        return result;
+      }
+
+      cleanup.filterGraph = avfilter_graph_alloc();
+      const AVFilter *srcFilter = avfilter_get_by_name("buffer");
+      const AVFilter *sinkFilter = avfilter_get_by_name("buffersink");
+      if (cleanup.filterGraph == nullptr || srcFilter == nullptr ||
+          sinkFilter == nullptr) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "cannot allocate subtitle filter graph",
+                                   "ffmpeg");
+        return result;
+      }
+      char srcArgs[512];
+      AVRational sar = cleanup.videoDec->sample_aspect_ratio;
+      if (sar.num <= 0 || sar.den <= 0) {
+        sar = AVRational{0, 1};
+      }
+      std::snprintf(srcArgs, sizeof(srcArgs),
+                    "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                    ":pixel_aspect=%d/%d",
+                    cleanup.videoDec->width, cleanup.videoDec->height,
+                    cleanup.videoDec->pix_fmt,
+                    // Decoded frames carry pts in the DECODER's time base —
+                    // declaring the stream's here would rescale every frame
+                    // into the wrong timeline and subtitles would never fire.
+                    cleanup.videoDec->time_base.num,
+                    cleanup.videoDec->time_base.den, sar.num, sar.den);
+      burnGraphTb = cleanup.videoDec->time_base;
+      const int srcRc = avfilter_graph_create_filter(
+          &burnSrc, srcFilter, "in", srcArgs, nullptr, cleanup.filterGraph);
+      const int sinkRc =
+          srcRc >= 0
+              ? avfilter_graph_create_filter(&burnSink, sinkFilter, "out",
+                                             nullptr, nullptr,
+                                             cleanup.filterGraph)
+              : srcRc;
+      if (srcRc < 0 || sinkRc < 0) {
+        const int rc = srcRc < 0 ? srcRc : sinkRc;
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot create subtitle filter endpoints (" +
+                std::string(srcArgs) + "): " + avErrorString(rc),
+            "ffmpeg");
+        return result;
+      }
+      const enum AVPixelFormat sinkFmts[] = {cleanup.videoEnc->pix_fmt,
+                                             AV_PIX_FMT_NONE};
+      // The binary blob size must EXCLUDE the AV_PIX_FMT_NONE terminator:
+      // buffersink turns every entry into a format-list item, and a -1 entry
+      // makes later format negotiation dereference a NULL pixel-format
+      // descriptor (hard crash in avfilter_graph_config).
+      if (av_opt_set_bin(burnSink, "pix_fmts",
+                         reinterpret_cast<const uint8_t *>(sinkFmts),
+                         sizeof(sinkFmts) - sizeof(sinkFmts[0]),
+                         AV_OPT_SEARCH_CHILDREN) < 0) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot constrain the subtitle filter output format", "ffmpeg");
+        return result;
+      }
+      std::string graphDesc =
+          "scale=w=" + std::to_string(outW) + ":h=" + std::to_string(outH) +
+          ",subtitles=filename='" + escapeFilterPath(subPath) +
+          "':fontsdir='" + escapeFilterPath(fontSource.dir) + "'";
+      if (subOrdinal >= 0) {
+        graphDesc += ":si=" + std::to_string(subOrdinal);
+      }
+      // SRT-like sources render with libass's default style (family
+      // "Arial"), which never matches the fontsdir contents on a provider-
+      // less static build. Redirect the family to the discovered font so
+      // text actually renders. ASS/SSA keep their authored styling.
+      const bool subIsAss =
+          subGlobalIndex >= 0
+              ? (cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
+                     AV_CODEC_ID_ASS ||
+                 cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
+                     AV_CODEC_ID_SSA)
+              : (subPath.size() > 4 &&
+                 (subPath.compare(subPath.size() - 4, 4, ".ass") == 0 ||
+                  subPath.compare(subPath.size() - 4, 4, ".ssa") == 0 ||
+                  subPath.compare(subPath.size() - 4, 4, ".ASS") == 0 ||
+                  subPath.compare(subPath.size() - 4, 4, ".SSA") == 0));
+      if (!subIsAss && !fontSource.family.empty()) {
+        graphDesc += ":force_style='FontName=" +
+                     escapeFilterPath(fontSource.family) + "'";
+      }
+      AVFilterInOut *outputs = avfilter_inout_alloc();
+      AVFilterInOut *inputs = avfilter_inout_alloc();
+      bool graphOk = outputs != nullptr && inputs != nullptr;
+      if (graphOk) {
+        outputs->name = av_strdup("in");
+        outputs->filter_ctx = burnSrc;
+        outputs->pad_idx = 0;
+        outputs->next = nullptr;
+        inputs->name = av_strdup("out");
+        inputs->filter_ctx = burnSink;
+        inputs->pad_idx = 0;
+        inputs->next = nullptr;
+        graphOk = avfilter_graph_parse_ptr(cleanup.filterGraph,
+                                           graphDesc.c_str(), &inputs,
+                                           &outputs, nullptr) >= 0;
+      }
+      avfilter_inout_free(&inputs);
+      avfilter_inout_free(&outputs);
+      if (graphOk) {
+        graphOk = avfilter_graph_config(cleanup.filterGraph, nullptr) >= 0;
+      }
+      if (!graphOk) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot initialize the subtitle rendering graph (" + graphDesc +
+                ")",
+            "ffmpeg");
+        return result;
+      }
+    } else {
+      cleanup.sws = sws_getContext(
+          cleanup.videoDec->width, cleanup.videoDec->height,
+          static_cast<AVPixelFormat>(cleanup.videoDec->pix_fmt), outW, outH,
+          cleanup.videoEnc->pix_fmt, SWS_BILINEAR, nullptr, nullptr, nullptr);
+      if (cleanup.sws == nullptr) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "cannot create pixel converter", "ffmpeg");
+        return result;
+      }
+      videoFrame = av_frame_alloc();
+      videoFrame->format = cleanup.videoEnc->pix_fmt;
+      videoFrame->width = outW;
+      videoFrame->height = outH;
+      if (av_frame_get_buffer(videoFrame, 0) < 0) {
+        av_frame_free(&videoFrame);
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "cannot allocate video frame", "ffmpeg");
+        return result;
+      }
     }
   }
 
@@ -820,6 +1328,41 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     return result;
   }
 
+  // ---- Subtitle preservation during transcode ------------------------------
+  // The planner guarantees (Preserve) that every source subtitle track's
+  // codec is muxable into the target container, so the tracks are copied
+  // verbatim alongside the re-encoded A/V streams (spec §14: never
+  // silently discard subtitles during ordinary conversion).
+  std::vector<int> subInOfOut;
+  std::vector<int> subOutIndex;
+  if (request.subtitles.policy == SubtitlePolicy::Preserve) {
+    for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
+      const AVStream *st = cleanup.in->streams[i];
+      if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+        continue;
+      }
+      AVStream *outSub = avformat_new_stream(cleanup.out, nullptr);
+      if (outSub == nullptr) {
+        continue;
+      }
+      avcodec_parameters_copy(outSub->codecpar, st->codecpar);
+      outSub->codecpar->codec_tag = 0;
+      av_dict_copy(&outSub->metadata, st->metadata, 0); // language etc.
+      outSub->disposition = st->disposition;            // default/forced flags
+      subInOfOut.push_back(int(i));
+      subOutIndex.push_back(int(cleanup.out->nb_streams) - 1);
+    }
+  }
+  // Timing offset applied to preserved tracks, in output time base.
+  std::int64_t subOffsetOutUnits = 0;
+  if (!subInOfOut.empty() && request.subtitles.timingOffsetMs != 0) {
+    const AVRational outTb =
+        cleanup.out->streams[std::size_t(subOutIndex.front())]->time_base;
+    subOffsetOutUnits =
+        av_rescale_q(request.subtitles.timingOffsetMs, AVRational{1, 1000},
+                     outTb);
+  }
+
   if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
                    AVIO_FLAG_WRITE);
@@ -849,9 +1392,45 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
   // Timestamp bookkeeping for continuous output audio (resampler delay).
   std::int64_t audioSamplesOut = 0;
 
+  // Encodes one prepared frame (already in encoder time base) and writes
+  // the resulting packets. Shared by the direct, burn-in and drain paths.
+  const auto sendVideoFrameToEncoder = [&](AVFrame *f) {
+    if (avcodec_send_frame(cleanup.videoEnc, f) == 0) {
+      AVPacket *encPacket = av_packet_alloc();
+      while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
+        encPacket->stream_index = videoOut;
+        av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
+                             cleanup.out->streams[videoOut]->time_base);
+        if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+          writeFailed = true;
+        }
+        ++framesDone;
+        av_packet_unref(encPacket);
+      }
+      av_packet_free(&encPacket);
+    }
+  };
+
   const auto drainVideoEncoder = [&]() {
     if (cleanup.videoEnc == nullptr) {
       return;
+    }
+    // Flush the subtitle rendering graph first so its tail frames reach
+    // the encoder before EOF is signaled.
+    if (burnSrc != nullptr && burnSink != nullptr) {
+      if (av_buffersrc_add_frame(burnSrc, nullptr) >= 0) {
+        AVFrame *filt = av_frame_alloc();
+        while (av_buffersink_get_frame(burnSink, filt) >= 0) {
+          filt->pict_type = AV_PICTURE_TYPE_NONE;
+          filt->pts = av_rescale_q_rnd(
+              filt->pts, av_buffersink_get_time_base(burnSink),
+              cleanup.videoEnc->time_base,
+              static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+          sendVideoFrameToEncoder(filt);
+          av_frame_unref(filt);
+        }
+        av_frame_free(&filt);
+      }
     }
     avcodec_send_frame(cleanup.videoEnc, nullptr);
     AVPacket *encPacket = av_packet_alloc();
@@ -896,28 +1475,43 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     if (isVideo && cleanup.videoDec != nullptr && cleanup.videoEnc != nullptr) {
       if (avcodec_send_packet(cleanup.videoDec, cleanup.packet) == 0) {
         while (avcodec_receive_frame(cleanup.videoDec, cleanup.frame) == 0) {
-          av_frame_make_writable(videoFrame);
-          sws_scale(cleanup.sws, cleanup.frame->data, cleanup.frame->linesize,
-                    0, cleanup.videoDec->height, videoFrame->data,
-                    videoFrame->linesize);
-          videoFrame->pts =
-              av_rescale_q_rnd(cleanup.frame->pts, cleanup.videoDec->time_base,
-                               cleanup.videoEnc->time_base,
-                               static_cast<AVRounding>(
-                                   AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
-          if (avcodec_send_frame(cleanup.videoEnc, videoFrame) == 0) {
-            AVPacket *encPacket = av_packet_alloc();
-            while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
-              encPacket->stream_index = videoOut;
-              av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
-                                   cleanup.out->streams[videoOut]->time_base);
-              if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
-                writeFailed = true;
-              }
-              ++framesDone;
-              av_packet_unref(encPacket);
+          if (burnSrc != nullptr && burnSink != nullptr) {
+            // Burn-in path: the graph scales, renders subtitles (libass) and
+            // converts to the encoder's pixel format. Frame pts are
+            // normalized into the time base the buffersrc was declared with.
+            if (cleanup.frame->pts != AV_NOPTS_VALUE) {
+              cleanup.frame->pts = av_rescale_q_rnd(
+                  cleanup.frame->pts, cleanup.videoDec->time_base, burnGraphTb,
+                  static_cast<AVRounding>(
+                      AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
             }
-            av_packet_free(&encPacket);
+            if (av_buffersrc_add_frame_flags(
+                    burnSrc, cleanup.frame,
+                    AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+              AVFrame *filt = av_frame_alloc();
+              while (av_buffersink_get_frame(burnSink, filt) >= 0) {
+                filt->pict_type = AV_PICTURE_TYPE_NONE;
+                filt->pts = av_rescale_q_rnd(
+                    filt->pts, av_buffersink_get_time_base(burnSink),
+                    cleanup.videoEnc->time_base,
+                    static_cast<AVRounding>(
+                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                sendVideoFrameToEncoder(filt);
+                av_frame_unref(filt);
+              }
+              av_frame_free(&filt);
+            }
+          } else {
+            av_frame_make_writable(videoFrame);
+            sws_scale(cleanup.sws, cleanup.frame->data,
+                      cleanup.frame->linesize, 0, cleanup.videoDec->height,
+                      videoFrame->data, videoFrame->linesize);
+            videoFrame->pts = av_rescale_q_rnd(
+                cleanup.frame->pts, cleanup.videoDec->time_base,
+                cleanup.videoEnc->time_base,
+                static_cast<AVRounding>(
+                    AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+            sendVideoFrameToEncoder(videoFrame);
           }
           if (params.onProgress && totalDurationUs > 0 &&
               (framesDone % 16) == 0) {
@@ -980,6 +1574,55 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
           av_frame_free(&audioFrame);
           av_frame_unref(cleanup.frame);
         }
+      }
+    } else if (!isVideo && !isAudio) {
+      // Subtitle (or other) packet: forwarded only when preserved.
+      // Remove/BurnIn drop it here by explicit user policy — never a
+      // silent default.
+      int subOut = -1;
+      for (std::size_t k = 0; k < subInOfOut.size(); ++k) {
+        if (subInOfOut[k] == cleanup.packet->stream_index) {
+          subOut = subOutIndex[k];
+          break;
+        }
+      }
+      if (subOut >= 0) {
+        AVPacket *outPacket = av_packet_alloc();
+        av_packet_move_ref(outPacket, cleanup.packet);
+        // outPacket->stream_index is still the input stream index here
+        // (move_ref preserves the fields; only the reference moved).
+        const AVStream *srcStream =
+            cleanup.in->streams[std::size_t(outPacket->stream_index)];
+        const AVStream *dstStream =
+            cleanup.out->streams[std::size_t(subOut)];
+        const AVRounding rounding = static_cast<AVRounding>(
+            AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        if (outPacket->pts != AV_NOPTS_VALUE) {
+          std::int64_t pts = av_rescale_q_rnd(outPacket->pts,
+                                              srcStream->time_base,
+                                              dstStream->time_base, rounding) +
+                             subOffsetOutUnits;
+          if (pts < 0) {
+            pts = 0; // offset clamps cue starts, never emits negative pts
+          }
+          outPacket->pts = pts;
+        }
+        if (outPacket->dts != AV_NOPTS_VALUE) {
+          outPacket->dts = av_rescale_q_rnd(outPacket->dts,
+                                            srcStream->time_base,
+                                            dstStream->time_base, rounding);
+        }
+        if (outPacket->duration > 0) {
+          outPacket->duration =
+              av_rescale_q(outPacket->duration, srcStream->time_base,
+                           dstStream->time_base);
+        }
+        outPacket->pos = -1;
+        outPacket->stream_index = subOut;
+        if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+          writeFailed = true;
+        }
+        av_packet_free(&outPacket);
       }
     }
     av_packet_unref(cleanup.packet);
