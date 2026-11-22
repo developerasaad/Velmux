@@ -67,7 +67,18 @@ slice_settings() {
       SLICE_SDK="iphonesimulator"
       SLICE_ARCH="arm64"
       SLICE_MIN_FLAG="-mios-simulator-version-min=$DEPLOYMENT_TARGET"
-      SLICE_VPX_TARGET="arm64-darwin-gcc"
+      # libvpx has no arm64 simulator toolchain, and its arm64-darwin-gcc
+      # target HARD-OVERRIDES CC/CXX/AS/LD with `xcrun --sdk iphoneos
+      # --find ...` (the DEVICE toolchain) inside configure, ignoring the
+      # environment entirely — observed as "building for 'iOS', but
+      # linking in object file built for 'iOS-simulator'". The versioned
+      # darwin20 target takes the same arm*-darwin-* flag path (device
+      # sysroot + min-version in cflags/ldflags) but RESPECTS the env
+      # toolchain, so the slice's compiler wrappers (with trailing SDK
+      # re-assertion) win every flag conflict. arm64 needs no .asm
+      # assembly (neon_asm is armv7-only), so clang-as-AS without -c is
+      # fine here.
+      SLICE_VPX_TARGET="arm64-darwin20-gcc"
       SLICE_AUTOCONF_HOST="aarch64-apple-darwin"
       SLICE_MESON_CPU_FAMILY="aarch64"
       SLICE_MESON_CPU="aarch64"
