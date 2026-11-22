@@ -90,7 +90,15 @@ slice_settings() {
       SLICE_SDK="iphonesimulator"
       SLICE_ARCH="x86_64"
       SLICE_MIN_FLAG="-mios-simulator-version-min=$DEPLOYMENT_TARGET"
-      SLICE_VPX_TARGET="x86_64-darwin18-gcc"
+      # The official x86_64 simulator toolchain: darwin18 would inject
+      # -mmacosx-version-min + the MacOSX sysroot, which clang REJECTS when
+      # combined with the simulator min-version ("invalid argument
+      # '-mmacosx-version-min=10.14' not allowed with
+      # '-mios-simulator-version-min=15.0'"). iphonesimulator injects
+      # -miphoneos-version-min=7.0 + the simulator sysroot instead; the
+      # wrapper's trailing re-assertion wins the min-version conflict (the
+      # proven arm64 behavior).
+      SLICE_VPX_TARGET="x86_64-iphonesimulator-gcc"
       SLICE_AUTOCONF_HOST="x86_64-apple-darwin"
       SLICE_MESON_CPU_FAMILY="x86_64"
       SLICE_MESON_CPU="x86_64"
