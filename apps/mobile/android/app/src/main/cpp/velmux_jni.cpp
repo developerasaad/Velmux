@@ -153,6 +153,26 @@ jboolean nativeResumeJob(JNIEnv *env, jclass, jlong handle, jstring jobId) {
                                                              : JNI_FALSE;
 }
 
+jboolean nativeRetryJob(JNIEnv *env, jclass, jlong handle, jstring jobId) {
+  const std::string id = utf16ToUtf8(env, jobId);
+  return velmux_retry_job(asEngine(handle), id.c_str()) > 0 ? JNI_TRUE
+                                                            : JNI_FALSE;
+}
+
+jboolean nativeDeleteJob(JNIEnv *env, jclass, jlong handle, jstring jobId) {
+  const std::string id = utf16ToUtf8(env, jobId);
+  return velmux_delete_job(asEngine(handle), id.c_str()) > 0 ? JNI_TRUE
+                                                             : JNI_FALSE;
+}
+
+jboolean nativeUpdateResources(JNIEnv *env, jclass, jlong handle,
+                               jstring resourcesJson) {
+  const std::string payload = utf16ToUtf8(env, resourcesJson);
+  return velmux_update_resources(asEngine(handle), payload.c_str()) == 0
+             ? JNI_TRUE
+             : JNI_FALSE;
+}
+
 const JNINativeMethod kVelmuxJniMethods[] = {
     {"nativeCreateEngine", "(Ljava/lang/String;)J",
      reinterpret_cast<void *>(nativeCreateEngine)},
@@ -177,6 +197,12 @@ const JNINativeMethod kVelmuxJniMethods[] = {
      reinterpret_cast<void *>(nativePauseJob)},
     {"nativeResumeJob", "(JLjava/lang/String;)Z",
      reinterpret_cast<void *>(nativeResumeJob)},
+    {"nativeRetryJob", "(JLjava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeRetryJob)},
+    {"nativeDeleteJob", "(JLjava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeDeleteJob)},
+    {"nativeUpdateResources", "(JLjava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeUpdateResources)},
 };
 
 } // namespace

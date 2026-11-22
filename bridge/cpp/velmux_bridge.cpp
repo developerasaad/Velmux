@@ -11,6 +11,7 @@
 #include "apple_backend.h"
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -996,6 +997,63 @@ int velmux_resume_job(VelmuxEngineHandle *handle, const char *jobId) {
   }
   const Result<bool> result = handle->engine->resumeJob(jobId);
   return result.ok() ? (result.value() ? 1 : 0) : -1;
+}
+
+int velmux_retry_job(VelmuxEngineHandle *handle, const char *jobId) {
+  if (handle == nullptr || jobId == nullptr) {
+    return -1;
+  }
+  const Result<bool> result = handle->engine->retryJob(jobId);
+  return result.ok() ? (result.value() ? 1 : 0) : -1;
+}
+
+int velmux_delete_job(VelmuxEngineHandle *handle, const char *jobId) {
+  if (handle == nullptr || jobId == nullptr) {
+    return -1;
+  }
+  const Result<bool> result = handle->engine->deleteJob(jobId);
+  return result.ok() ? (result.value() ? 1 : 0) : -1;
+}
+
+int velmux_update_resources(VelmuxEngineHandle *handle, const char *json) {
+  if (handle == nullptr || json == nullptr) {
+    return -1;
+  }
+  bridgeNS::JsonValue root;
+  // The reader stores a const reference: materialize the std::string so it
+  // outlives the reader (binding directly to `json` would dangle on the
+  // implicit temporary and read freed memory for non-SSO payloads).
+  const std::string jsonText(json);
+  bridgeNS::JsonReader reader(jsonText);
+  const std::string parseError = reader.parse(root);
+  if (!parseError.empty() || root.kind != bridgeNS::JsonValue::Kind::Object) {
+    return -1;
+  }
+  ResourceSnapshot snapshot;
+  if (const bridgeNS::JsonValue *cores = root.find("cpuCores");
+      cores != nullptr && cores->isNumberLike()) {
+    snapshot.cpuCores = std::int32_t(cores->asInt());
+  }
+  if (const bridgeNS::JsonValue *memory = root.find("memoryAvailableMb");
+      memory != nullptr && memory->isNumberLike()) {
+    snapshot.memoryAvailableMb = memory->asInt();
+  }
+  if (const bridgeNS::JsonValue *thermal = root.find("thermalPressure");
+      thermal != nullptr && thermal->isNumberLike()) {
+    snapshot.thermalPressure = thermal->asDouble();
+  }
+  if (const bridgeNS::JsonValue *battery = root.find("onBattery");
+      battery != nullptr &&
+      battery->kind == bridgeNS::JsonValue::Kind::Bool) {
+    snapshot.onBattery = battery->boolValue;
+  }
+  if (const bridgeNS::JsonValue *hardware = root.find("hardwareCodecAvailable");
+      hardware != nullptr &&
+      hardware->kind == bridgeNS::JsonValue::Kind::Bool) {
+    snapshot.hardwareCodecAvailable = hardware->boolValue;
+  }
+  handle->engine->updateResources(snapshot);
+  return 0;
 }
 
 char *velmux_poll_events(VelmuxEngineHandle *handle) {

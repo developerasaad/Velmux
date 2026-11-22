@@ -50,6 +50,10 @@ public:
   Result<bool> cancelJob(const std::string &jobId);
   Result<bool> pauseJob(const std::string &jobId);
   Result<bool> resumeJob(const std::string &jobId);
+  // Re-queue a failed/canceled/interrupted durable job.
+  Result<bool> retryJob(const std::string &jobId);
+  // Delete a terminal job's durable record (outputs are not touched).
+  Result<bool> deleteJob(const std::string &jobId);
   std::optional<JobSnapshot> getJob(const std::string &jobId);
   std::vector<JobSnapshot> listJobs();
   std::vector<std::string> describeBackends();

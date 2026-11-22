@@ -290,6 +290,28 @@ Result<void> JobManager::retry(const std::string &jobId) {
   return Result<void>();
 }
 
+Result<void> JobManager::remove(const std::string &jobId) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  Error loadError;
+  auto record = store_.loadJob(jobId, loadError);
+  if (!record.has_value()) {
+    return Result<void>(Error::make(ErrorCode::InvalidArgument,
+                                    "unknown job: " + jobId));
+  }
+  if (record->state != JobState::Completed &&
+      record->state != JobState::Failed &&
+      record->state != JobState::Canceled) {
+    return Result<void>(Error::make(
+        ErrorCode::InvalidArgument,
+        "job is still active (cancel or pause it first)"));
+  }
+  const Error deleteError = store_.deleteJob(jobId);
+  if (!deleteError.ok()) {
+    return Result<void>(deleteError);
+  }
+  return Result<void>();
+}
+
 std::optional<JobSnapshot> JobManager::snapshot(const std::string &jobId) {
   std::lock_guard<std::mutex> lock(mutex_);
   Error loadError;

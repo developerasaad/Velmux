@@ -145,6 +145,23 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
     promise.resolve(result)
   }
 
+  override fun retryJob(jobId: String, promise: Promise) {
+    val result = VelmuxJni.nativeRetryJob(engine(), jobId)
+    if (result) {
+      ensurePolling()
+    }
+    promise.resolve(result)
+  }
+
+  override fun deleteJob(jobId: String, promise: Promise) {
+    promise.resolve(VelmuxJni.nativeDeleteJob(engine(), jobId))
+  }
+
+  override fun updateResources(resources: ReadableMap, promise: Promise) {
+    promise.resolve(
+        VelmuxJni.nativeUpdateResources(engine(), JsonBridge.toJsonString(resources)))
+  }
+
   override fun getJob(jobId: String, promise: Promise) {
     val json = callJson { handle -> VelmuxJni.nativeGetJob(handle, jobId) }
     if (json.trim() == "null") {

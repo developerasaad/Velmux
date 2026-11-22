@@ -69,6 +69,17 @@ char *velmux_describe_backends(VelmuxEngineHandle *engine);
 int velmux_cancel_job(VelmuxEngineHandle *engine, const char *jobId);
 int velmux_pause_job(VelmuxEngineHandle *engine, const char *jobId);
 int velmux_resume_job(VelmuxEngineHandle *engine, const char *jobId);
+// Re-queue a failed/canceled/interrupted durable job at high priority.
+int velmux_retry_job(VelmuxEngineHandle *engine, const char *jobId);
+// Delete a terminal job's durable record (outputs are not touched).
+int velmux_delete_job(VelmuxEngineHandle *engine, const char *jobId);
+
+// Update the resource snapshot the scheduler adapts to (thermal, power,
+// memory, hardware availability). Payload:
+// {"cpuCores":int,"memoryAvailableMb":int,"thermalPressure":0..1,
+//  "onBattery":bool,"hardwareCodecAvailable":bool} (all fields optional).
+// Returns 0 on success, -1 on a malformed payload.
+int velmux_update_resources(VelmuxEngineHandle *engine, const char *json);
 
 // Drain queued job events (oldest first) as a JSON array of event objects.
 // Hosts poll this at UI cadence; the queue is bounded and drops the oldest

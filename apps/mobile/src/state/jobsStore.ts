@@ -40,6 +40,7 @@ export interface JobsState {
   pauseJob: (jobId: string) => Promise<boolean>;
   resumeJob: (jobId: string) => Promise<boolean>;
   retryJob: (jobId: string) => Promise<string | null>;
+  deleteJob: (jobId: string) => Promise<boolean>;
   /** Internal: applied by the event coalescer. */
   applyEvents: (
     events: Map<string, engineClient.JobEventPayload>,
@@ -214,11 +215,35 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
   },
 
   retryJob: async jobId => {
-    const request = get().requests[jobId];
-    if (!request) {
-      return null;
+    // Durable engine-side retry: the original request lives in the C++
+    // store, so retries work across app restarts (not just for jobs
+    // started in this JS session). Falls back to a fresh submit when the
+    // engine no longer knows the job (record already deleted).
+    const retried = await engineClient.retryJob(jobId);
+    if (!retried) {
+      const request = get().requests[jobId];
+      if (!request) {
+        return null;
+      }
+      return get().startJob(request);
     }
-    return get().startJob(request);
+    await get().refresh();
+    return jobId;
+  },
+
+  deleteJob: async jobId => {
+    const deleted = await engineClient.deleteJob(jobId);
+    if (deleted) {
+      set(state => {
+        const requests = {...state.requests};
+        delete requests[jobId];
+        return {
+          jobs: state.jobs.filter(job => job.id !== jobId),
+          requests,
+        };
+      });
+    }
+    return deleted;
   },
 
   applyEvents: (events, unknownIds) => {

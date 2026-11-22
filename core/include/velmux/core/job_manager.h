@@ -82,6 +82,9 @@ public:
   Result<void> pause(const std::string &jobId);
   Result<void> resume(const std::string &jobId);
   Result<void> retry(const std::string &jobId);
+  // Delete a terminal job's durable record. Active jobs must be
+  // canceled/paused first; output files are not touched.
+  Result<void> remove(const std::string &jobId);
 
   // Queries.
   std::optional<JobSnapshot> snapshot(const std::string &jobId);

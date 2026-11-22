@@ -89,6 +89,13 @@ export interface JobSnapshot {
   inputSizeBytes: number | null;
   pipelineSummary: string | null;
 }
+export interface ResourceUpdate {
+  cpuCores?: number;
+  memoryAvailableMb?: number;
+  thermalPressure?: number; // 0..1, higher = more constrained
+  onBattery?: boolean;
+  hardwareCodecAvailable?: boolean;
+}
 export interface Spec extends TurboModule {
   inspect(source: MediaSource): Promise<MediaInfo>;
   plan(request: ConversionRequest): Promise<{
@@ -101,6 +108,9 @@ export interface Spec extends TurboModule {
   cancelJob(jobId: string): Promise<boolean>;
   pauseJob(jobId: string): Promise<boolean>;
   resumeJob(jobId: string): Promise<boolean>;
+  retryJob(jobId: string): Promise<boolean>;
+  deleteJob(jobId: string): Promise<boolean>;
+  updateResources(resources: ResourceUpdate): Promise<boolean>;
   getJob(jobId: string): Promise<JobSnapshot | null>;
   listJobs(): Promise<JobSnapshot[]>;
   describeBackends(): Promise<string[]>;

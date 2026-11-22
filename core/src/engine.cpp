@@ -178,6 +178,25 @@ Result<bool> VelmuxEngine::resumeJob(const std::string &jobId) {
   return Result<bool>(true);
 }
 
+Result<bool> VelmuxEngine::retryJob(const std::string &jobId) {
+  const Result<void> result = jobs_->retry(jobId);
+  if (!result.ok()) {
+    return Result<bool>(result.error());
+  }
+  // The durable record is Queued again; hand it to the scheduler at high
+  // priority so an explicit retry wins the queue.
+  scheduler_->submit(jobId, 9);
+  return Result<bool>(true);
+}
+
+Result<bool> VelmuxEngine::deleteJob(const std::string &jobId) {
+  const Result<void> result = jobs_->remove(jobId);
+  if (!result.ok()) {
+    return Result<bool>(result.error());
+  }
+  return Result<bool>(true);
+}
+
 std::optional<JobSnapshot> VelmuxEngine::getJob(const std::string &jobId) {
   return jobs_->snapshot(jobId);
 }

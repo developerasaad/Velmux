@@ -5,6 +5,7 @@ import type {
   JobSnapshot,
   MediaInfo,
   MediaSource,
+  ResourceUpdate,
   Spec,
 } from './NativeVelmux';
 
@@ -91,6 +92,20 @@ export function pauseJob(jobId: string): Promise<boolean> {
 
 export function resumeJob(jobId: string): Promise<boolean> {
   return requireModule().resumeJob(jobId);
+}
+
+export function retryJob(jobId: string): Promise<boolean> {
+  return requireModule().retryJob(jobId);
+}
+
+export function deleteJob(jobId: string): Promise<boolean> {
+  return requireModule().deleteJob(jobId);
+}
+
+export function updateResources(
+  resources: ResourceUpdate,
+): Promise<boolean> {
+  return requireModule().updateResources(resources);
 }
 
 export function getJob(jobId: string): Promise<JobSnapshot | null> {

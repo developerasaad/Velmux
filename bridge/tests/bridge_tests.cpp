@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -295,4 +296,68 @@ TEST_CASE("facade: listJobs and describeBackends speak JSON") {
   const std::string jobsText = jobs;
   velmux_free_string(jobs);
   CHECK(jobsText == "[]");
+}
+
+TEST_CASE("facade: resource updates and job retry/delete") {
+  BridgeEnv env;
+
+  // Resource updates: well-formed payloads apply, garbage is rejected.
+  CHECK(velmux_update_resources(env.engine,
+                                "{\"cpuCores\":4,\"thermalPressure\":0.8,"
+                                "\"onBattery\":true}") == 0);
+  CHECK(velmux_update_resources(env.engine, "{\"cpuCores\":\"many\"}") == 0);
+  CHECK(velmux_update_resources(env.engine, "not json") == -1);
+  CHECK(velmux_update_resources(env.engine, nullptr) == -1);
+
+  // A fake-but-complete request produces a durable job through JSON.
+  const std::string fixture = generateFixture(env.dir / "in.mp4", 1.0);
+  const std::string requestJson = R"({
+    "source": {"uri": ")" + fixture + R"(", "displayName": "in.mp4"},
+    "outputContainer": "mp4",
+    "goal": {"kind": "custom"},
+    "video": {"codec": "h264", "enabled": true},
+    "audio": {"codec": "aac", "enabled": true},
+    "subtitles": {"policy": "remove"},
+    "processingMode": "auto"
+  })";
+  char *started = velmux_start_job(env.engine, requestJson.c_str());
+  REQUIRE(started != nullptr);
+  const std::string startedText = started;
+  velmux_free_string(started);
+  REQUIRE(startedText.find("\"jobId\"") != std::string::npos);
+  const auto idBegin = startedText.find("\"jobId\":\"") + 9;
+  const auto idEnd = startedText.find('"', idBegin);
+  REQUIRE(idEnd != std::string::npos);
+  const std::string jobId = startedText.substr(idBegin, idEnd - idBegin);
+
+  // Wait for terminal state through the event tap.
+  std::string terminalState;
+  for (int i = 0; i < 600 && terminalState.empty(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    char *events = velmux_poll_events(env.engine);
+    if (events != nullptr) {
+      const std::string text = events;
+      velmux_free_string(events);
+      if (text.find("\"completed\"") != std::string::npos) {
+        terminalState = "completed";
+      } else if (text.find("\"failed\"") != std::string::npos) {
+        terminalState = "failed";
+      }
+    }
+  }
+  REQUIRE(terminalState == "completed");
+
+  // Retrying a completed job is refused (nothing to retry).
+  CHECK(velmux_retry_job(env.engine, jobId.c_str()) == -1);
+
+  // Deleting a terminal job removes the durable record.
+  CHECK(velmux_delete_job(env.engine, jobId.c_str()) == 1);
+  char *after = velmux_list_jobs(env.engine);
+  REQUIRE(after != nullptr);
+  const std::string afterText = after;
+  velmux_free_string(after);
+  CHECK(afterText == "[]");
+  // Unknown/already-deleted jobs fail cleanly.
+  CHECK(velmux_delete_job(env.engine, jobId.c_str()) == -1);
+  CHECK(velmux_retry_job(env.engine, "no-such-job") == -1);
 }

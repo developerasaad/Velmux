@@ -27,6 +27,9 @@ object VelmuxJni {
   external fun nativeCancelJob(handle: Long, jobId: String): Boolean
   external fun nativePauseJob(handle: Long, jobId: String): Boolean
   external fun nativeResumeJob(handle: Long, jobId: String): Boolean
+  external fun nativeRetryJob(handle: Long, jobId: String): Boolean
+  external fun nativeDeleteJob(handle: Long, jobId: String): Boolean
+  external fun nativeUpdateResources(handle: Long, resourcesJson: String): Boolean
 
   /** Creates the engine in the app's durable (non-cache) storage. */
   fun createEngine(dataDir: File): Long = nativeCreateEngine(dataDir.absolutePath)
