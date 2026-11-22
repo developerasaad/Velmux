@@ -10,7 +10,9 @@
 
 #include <android/native_window.h>
 #include <jni.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -604,6 +606,13 @@ void reportProgress(const RunContext &ctx, double fraction) {
   }
 }
 
+// Opens a writable file descriptor for AMediaMuxer (the NDK muxer is
+// fd-based; the path-based constructor is Java-only). Returns -1 on
+// failure.
+static int openMuxerFd(const std::string &path) {
+  return ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -615,12 +624,18 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
   RunResult result;
   AMediaExtractor *extractor = AMediaExtractor_new();
   AMediaMuxer *muxer = nullptr;
+  int muxerFd = -1;
   auto cleanup = [&] {
     if (extractor != nullptr) {
       AMediaExtractor_delete(extractor);
     }
     if (muxer != nullptr) {
       AMediaMuxer_delete(muxer);
+    }
+    // The muxer keeps the fd for its lifetime; the caller closes it.
+    if (muxerFd >= 0) {
+      ::close(muxerFd);
+      muxerFd = -1;
     }
   };
   if (AMediaExtractor_setDataSource(extractor, inPath.c_str()) !=
@@ -636,7 +651,13 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
     cleanup();
     return result;
   }
-  muxer = AMediaMuxer_new(outPath.c_str(), AMEDIAMUXER_FORMAT_MPEG_4);
+  muxerFd = openMuxerFd(outPath);
+  if (muxerFd < 0) {
+    result.error = "cannot create the output file";
+    cleanup();
+    return result;
+  }
+  muxer = AMediaMuxer_new(muxerFd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
   if (muxer == nullptr) {
     result.error = "cannot create the output muxer";
     cleanup();
@@ -714,7 +735,7 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
       info.size = sampleSize;
       info.presentationTimeUs = ptsUs;
       info.flags = (flags & AMEDIAEXTRACTOR_SAMPLE_FLAG_SYNC)
-                       ? AMEDIACODEC_BUFFER_FLAG_SYNCFRAME
+                       ? AMEDIACODEC_BUFFER_FLAG_KEY_FRAME
                        : 0;
       if (AMediaMuxer_writeSampleData(muxer, size_t(track.mux),
                                       sample.data(), &info) == AMEDIA_OK) {
@@ -774,6 +795,7 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   AMediaCodec *audioDecoder = nullptr;
   AMediaCodec *audioEncoder = nullptr;
   AMediaMuxer *muxer = nullptr;
+  int muxerFd = -1;
   auto cleanup = [&] {
     if (extractor != nullptr) {
       AMediaExtractor_delete(extractor);
@@ -799,6 +821,11 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     }
     if (muxer != nullptr) {
       AMediaMuxer_delete(muxer);
+    }
+    // The muxer keeps the fd for its lifetime; the caller closes it.
+    if (muxerFd >= 0) {
+      ::close(muxerFd);
+      muxerFd = -1;
     }
   };
   if (AMediaExtractor_setDataSource(extractor, inPath.c_str()) !=
@@ -828,9 +855,16 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   }
 
   const OutputFormat muxerFormat =
-      (pipeline.container == Container::WebM) ? AMEDIAMUXER_FORMAT_WEBM
-                                              : AMEDIAMUXER_FORMAT_MPEG_4;
-  muxer = AMediaMuxer_new(outPath.c_str(), muxerFormat);
+      (pipeline.container == Container::WebM)
+          ? AMEDIAMUXER_OUTPUT_FORMAT_WEBM
+          : AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4;
+  muxerFd = openMuxerFd(outPath);
+  if (muxerFd < 0) {
+    result.error = "cannot create the output file";
+    cleanup();
+    return result;
+  }
+  muxer = AMediaMuxer_new(muxerFd, muxerFormat);
   if (muxer == nullptr) {
     result.error = "cannot create the output muxer";
     cleanup();
