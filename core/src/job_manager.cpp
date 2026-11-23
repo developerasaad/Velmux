@@ -306,6 +306,9 @@ Result<SampleResult> JobManager::generateSample(
 
 Result<std::string> JobManager::submit(const ConversionRequest &request,
                                        std::int32_t priority) {
+  // Priority is honored by the scheduler when the engine hands the queued
+  // job over; the manager itself is priority-agnostic.
+  (void)priority;
   // Validate source accessibility first: never enqueue phantom jobs.
   const Result<MediaInfo> inspected = inspect(request.source);
   if (!inspected.ok()) {
@@ -615,11 +618,19 @@ void JobManager::persistAndEmit(JobRecord &record, const char * /*note*/) {
   events_.emit(event);
 }
 
-void JobManager::executeJob(const std::string &jobId) {
+void JobManager::setDispatchHooks(
+    std::function<bool(const std::string &jobId, const Pipeline &pipeline)>
+        gate,
+    std::function<void(const std::string &jobId)> onHardwareStarted) {
+  dispatchGate_ = std::move(gate);
+  hardwareStartedCb_ = std::move(onHardwareStarted);
+}
+
+JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   Error loadError;
   auto record = store_.loadJob(jobId, loadError);
   if (!record.has_value()) {
-    return;
+    return ExecuteOutcome::Finished;
   }
   if (record->state == JobState::Canceled ||
       record->state == JobState::Completed ||
@@ -628,7 +639,7 @@ void JobManager::executeJob(const std::string &jobId) {
       record->state == JobState::Interrupted) {
     // Terminal or user-held states never (re)start execution from the
     // scheduler path; resume()/retry() re-queue explicitly.
-    return;
+    return ExecuteOutcome::Finished;
   }
 
   record->state = JobState::Preparing;
@@ -654,14 +665,14 @@ void JobManager::executeJob(const std::string &jobId) {
     if (!inspected.ok()) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!runStillCurrent(jobId, generation)) {
-        return; // superseded by a newer run of this job
+        return ExecuteOutcome::Finished; // superseded by a newer run
       }
       auto &running = running_[jobId];
       running.record.state = JobState::Failed;
       running.record.error =
           "Source became unavailable: " + inspected.error().message;
       finishFailure(running.record);
-      return;
+      return ExecuteOutcome::Finished;
     }
     info = inspected.value();
     // Validation compares the output against the inspection the planner
@@ -675,14 +686,14 @@ void JobManager::executeJob(const std::string &jobId) {
   if (!plan.feasible || !plan.best.has_value()) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
     running.record.error =
         plan.message.empty() ? "no compatible pipeline" : plan.message;
     finishFailure(running.record);
-    return;
+    return ExecuteOutcome::Finished;
   }
 
   const Pipeline pipeline = plan.best->pipeline;
@@ -690,7 +701,7 @@ void JobManager::executeJob(const std::string &jobId) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     running_[jobId].record.pipeline = pipeline;
   }
@@ -702,13 +713,35 @@ void JobManager::executeJob(const std::string &jobId) {
   if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
     running.record.error = "no backend could execute the planned pipeline";
     finishFailure(running.record);
-    return;
+    return ExecuteOutcome::Finished;
+  }
+
+  // Hardware-codec scarcity gate (spec §21): a hardware pipeline defers
+  // while the scheduler reports hardware capacity saturated. The durable
+  // state returns to Queued; the engine re-queues the job, and the
+  // scheduler holds it (not busy-spins) until capacity frees.
+  if (pipeline.usesHardware && dispatchGate_ &&
+      !dispatchGate_(jobId, pipeline)) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!runStillCurrent(jobId, generation)) {
+        return ExecuteOutcome::Finished; // superseded by a newer run
+      }
+      running_.erase(jobId);
+    }
+    record->state = JobState::Queued;
+    record->progress = 0.0;
+    persistAndEmit(*record, "queued");
+    return ExecuteOutcome::Deferred;
+  }
+  if (pipeline.usesHardware && hardwareStartedCb_) {
+    hardwareStartedCb_(jobId);
   }
 
   // Output path: sanitized, never overwrites the original.
@@ -716,7 +749,7 @@ void JobManager::executeJob(const std::string &jobId) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     running_[jobId].record.outputPath = record->outputPath;
     running_[jobId].record.state = JobState::Running;
@@ -732,7 +765,7 @@ void JobManager::executeJob(const std::string &jobId) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     cancel = running_[jobId].cancel;
   }
@@ -794,8 +827,9 @@ void JobManager::executeJob(const std::string &jobId) {
   if (cancel->isCancelled()) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded (e.g. paused then quickly resumed): the newer
-              // run owns the record; this worker must not touch it.
+      return ExecuteOutcome::Finished; // superseded (e.g. paused then quickly
+                                       // resumed): the newer run owns the
+                                       // record; this worker must not touch it.
     }
     auto &running = running_[jobId];
     // The control path (cancel / pause / engine shutdown) already recorded
@@ -814,13 +848,13 @@ void JobManager::executeJob(const std::string &jobId) {
     JobRecord final = running.record;
     running_.erase(jobId);
     persistAndEmit(final, "final");
-    return;
+    return ExecuteOutcome::Finished;
   }
 
   if (!execResult.success) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
@@ -828,20 +862,21 @@ void JobManager::executeJob(const std::string &jobId) {
                                ? "execution failed"
                                : execResult.error.message;
     finishFailure(running.record);
-    return;
+    return ExecuteOutcome::Finished;
   }
 
   // Validation before completion (never trust pipeline success alone).
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     running_[jobId].record.state = JobState::Validating;
   }
   persistAndEmit(*record, "validating");
   if (!validateOutput(*record, generation)) {
-    return; // finishFailure already ran (or the run was superseded)
+    return ExecuteOutcome::Finished; // finishFailure already ran (or the run
+                                     // was superseded)
   }
 
   std::int64_t outputBytes = -1;
@@ -849,7 +884,7 @@ void JobManager::executeJob(const std::string &jobId) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
-      return; // superseded by a newer run of this job
+      return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Completed;
@@ -864,6 +899,7 @@ void JobManager::executeJob(const std::string &jobId) {
   // segment scratch, so the checkpoint rows must not outlive their
   // artifacts (updateJob deliberately no longer cascades here).
   (void)checkpoints_.deleteCheckpoints(jobId);
+  return ExecuteOutcome::Finished;
 }
 
 void JobManager::finishFailure(JobRecord &record) {

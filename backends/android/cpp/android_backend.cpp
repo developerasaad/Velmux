@@ -144,6 +144,11 @@ bool AndroidExecutor::canExecute(const Pipeline &pipeline,
       return false;
     }
   }
+  // Trim is not implemented on the native path (M1); a trimmed request
+  // must never execute here — it would silently produce full-length output.
+  if (request.trim.startUs != 0 || request.trim.endUs != -1) {
+    return false;
+  }
   // Audio resampling / downmixing is FFmpeg's job in this milestone.
   if (audioActive && !pipeline.audioStreamCopy) {
     if (request.audio.sampleRate.has_value() ||

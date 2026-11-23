@@ -51,7 +51,8 @@ public:
   // the UI thread); output lands under <dataDir>/samples.
   Result<SampleResult> generateSample(const ConversionRequest &request,
                                        std::int32_t sampleSeconds);
-  Result<std::string> startJob(const ConversionRequest &request);
+  Result<std::string> startJob(const ConversionRequest &request,
+                               std::int32_t priority = 5);
   Result<bool> cancelJob(const std::string &jobId);
   Result<bool> pauseJob(const std::string &jobId);
   Result<bool> resumeJob(const std::string &jobId);

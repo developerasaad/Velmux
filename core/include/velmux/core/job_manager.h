@@ -114,9 +114,28 @@ public:
   // Wire the scheduler's run callback: the manager executes the job.
   void attachScheduler(Scheduler &scheduler);
 
+  // Result of one scheduler-driven execution run.
+  enum class ExecuteOutcome {
+    // The job reached a decision (completed / failed / canceled / paused
+    // by the control path, or was superseded by a newer run).
+    Finished,
+    // The dispatch gate deferred the job (hardware codecs saturated,
+    // spec §21). The durable state is Queued again; the caller re-queues.
+    Deferred,
+  };
+
+  // Dispatch hooks (wired by the engine to the scheduler). The gate runs
+  // after planning, before the executor starts: return false to defer a
+  // hardware pipeline while hardware capacity is saturated. onStarted
+  // reports that a hardware pipeline actually began executing.
+  void setDispatchHooks(
+      std::function<bool(const std::string &jobId, const Pipeline &pipeline)>
+          gate,
+      std::function<void(const std::string &jobId)> onHardwareStarted);
+
   // Scheduler entry point: executes one job to completion (worker thread).
   // Called by the engine's scheduler callback when capacity allows.
-  void executeJob(const std::string &jobId);
+  ExecuteOutcome executeJob(const std::string &jobId);
 
   // Progress reporting from the execution path. The generation ties the
   // report to one execution run: a superseded run's late progress must not
@@ -149,6 +168,10 @@ private:
   std::optional<Pipeline> planPipelineFor(const JobRecord &record);
   backend::IBackend *backendFor(const Pipeline &pipeline);
   std::string outputNameFor(const JobRecord &record) const;
+
+  std::function<bool(const std::string &jobId, const Pipeline &pipeline)>
+      dispatchGate_;
+  std::function<void(const std::string &jobId)> hardwareStartedCb_;
 
   EngineConfig config_;
   EventBus &events_;

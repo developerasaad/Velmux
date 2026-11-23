@@ -341,6 +341,13 @@ PlanResult Planner::plan(const MediaInfo &source,
     // Processing capabilities: geometry / rate / audio-format changes and
     // subtitle work only route to backends that actually implement them
     // (reported via BackendCapabilities; executors double-check).
+    const bool wantsTrim = request.trim.startUs != 0 ||
+                           request.trim.endUs != -1;
+    if (wantsTrim && !caps->timeTrim) {
+      // An executor that cannot trim must never receive a trimmed request:
+      // it would silently produce the full-length output.
+      return;
+    }
     if (!streamCopy) {
       const bool geometryChange =
           wantsVideo && request.video.resolutionHeight.has_value() &&
@@ -514,7 +521,11 @@ PlanResult Planner::plan(const MediaInfo &source,
       candidates.begin(), candidates.end(), [](const Candidate &c) {
         return !c.pipeline.videoStreamCopy;
       });
-  if (wantsVideo && !hasTranscodeCandidate) {
+  // Hybrid stage workers do not trim (v1): a trimmed request must not
+  // compose a hybrid route that would silently ignore the window.
+  const bool wantsAnyTrim =
+      request.trim.startUs != 0 || request.trim.endUs != -1;
+  if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&

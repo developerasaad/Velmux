@@ -60,6 +60,9 @@ struct Fixture {
     ffmpeg.writableContainers = {Container::Mp4, Container::Mkv,
                                  Container::WebM, Container::Mov};
     ffmpeg.subtitleExtract = true;
+    ffmpeg.timeTrim = true;
+    ffmpeg.videoScaling = true;
+    ffmpeg.audioResampling = true;
 
     BackendCapabilities android;
     android.backend = BackendId::Android;
@@ -296,6 +299,9 @@ CapabilityRegistry hybridScenarioCaps() {
   ffmpeg.readableContainers = {Container::Mp4};
   ffmpeg.writableContainers = {Container::Mp4};
   ffmpeg.stageDecodeToCpuFrames = true;
+  ffmpeg.timeTrim = true;
+  ffmpeg.videoScaling = true;
+  ffmpeg.audioResampling = true;
 
   BackendCapabilities android;
   android.backend = BackendId::Android;
@@ -354,6 +360,58 @@ TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single ba
   REQUIRE(classic.best.has_value());
   CHECK(classic.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
   CHECK(classic.best->pipeline.assigns(StageId::Encode, BackendId::Ffmpeg));
+}
+
+TEST_CASE_FIXTURE(Fixture, "trimmed requests route only to trim-capable backends") {
+  // A trim window is honored exclusively by backends reporting timeTrim;
+  // anything else would silently produce full-length output.
+  CapabilityRegistry scenario = hybridScenarioCaps();
+  Planner scenarioPlanner{FeatureRegistry::instance(), scenario, nullptr};
+
+  MediaInfo source = h264AacSource();
+  source.video.front().codec = VideoCodec::VP9;
+
+  ConversionRequest request;
+  request.outputContainer = Container::Mp4;
+  request.goal.kind = GoalKind::Custom;
+  request.video.codec = VideoCodec::HEVC;
+  request.audio.codec = AudioCodec::Aac;
+  request.trim.startUs = 500000;
+  request.trim.endUs = 1500000;
+
+  // Without the trim this exact scenario plans a hybrid route (tested
+  // above); with the trim it must refuse rather than mis-execute.
+  const PlanResult hybridShape = scenarioPlanner.plan(source, request);
+  CHECK_FALSE(hybridShape.feasible);
+
+  // Positive control: the Fixture FFmpeg reports timeTrim and serves the
+  // same trimmed request end-to-end.
+  MediaInfo plain = h264AacSource();
+  ConversionRequest routed = request;
+  routed.video.codec = VideoCodec::H264;
+  const PlanResult plan = planner.plan(plain, routed);
+  REQUIRE(plan.feasible);
+  REQUIRE(plan.best.has_value());
+  CHECK(plan.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
+  CHECK(plan.best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
+
+  // A trim-incapable-only registry refuses: native Android alone (no
+  // timeTrim) must never receive the trimmed request.
+  CapabilityRegistry nativeOnly;
+  BackendCapabilities android;
+  android.backend = BackendId::Android;
+  android.implementation = "native";
+  android.canInspect = true;
+  android.video.push_back(
+      VideoCapability{VideoCodec::H264, {true, true, true}, true, 3840, 2160});
+  android.audio.push_back(
+      AudioCapability{AudioCodec::Aac, {true, true, true}});
+  android.readableContainers = {Container::Mp4};
+  android.writableContainers = {Container::Mp4};
+  nativeOnly.registerBackend(android);
+  Planner nativePlanner{FeatureRegistry::instance(), nativeOnly, nullptr};
+  const PlanResult refused = nativePlanner.plan(plain, routed);
+  CHECK_FALSE(refused.feasible);
 }
 
 TEST_CASE_FIXTURE(Fixture, "subtitle extraction plans a sidecar pipeline") {

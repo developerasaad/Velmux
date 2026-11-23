@@ -41,6 +41,11 @@ struct BackendCapabilities {
   // True when the backend can inspect media (demux metadata without
   // decoding).
   bool canInspect = false;
+  // Can the backend honor a trim window (frame-exact transcode trims and
+  // keyframe-snapped stream-copy trims)? When false, the planner must not
+  // route trimmed requests to this backend — an executor that silently
+  // ignores trim would present an untrimmed output as trimmed.
+  bool timeTrim = false;
   // Can the backend change video geometry/frame-rate during a transcode
   // (scale/rotate/crop/temporal resample)? When false, the planner only
   // routes 1:1-geometry native pipelines to it.

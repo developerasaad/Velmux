@@ -1195,6 +1195,14 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   // Time base the buffersrc was declared with; pushed frames' pts are
   // normalized into it (decoders may adjust their own time base mid-stream).
   AVRational burnGraphTb{0, 1};
+  // Frame-rate conversion state (spec §9): output grid in segment-local
+  // microseconds. fpsConvert/outFps are finalized once the video encoder
+  // exists; the grid cursor advances per emitted frame.
+  bool fpsConvert = false;
+  double outFps = 0.0;
+  double outFrameDurUs = 0.0;
+  double fpsNextOutUs = 0.0;
+  double srcFrameDurUs = 33333.0; // 30 fps fallback when unknown
   if (videoIn >= 0 && request.video.enabled) {
     const AVStream *inVideo = cleanup.in->streams[videoIn];
     const AVCodec *decCodec =
@@ -1262,7 +1270,26 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     outW = std::max(outW, 16);
     cleanup.videoEnc->width = outW;
     cleanup.videoEnc->height = outH;
+    // Frame-rate conversion (spec §9): a requested output rate re-times
+    // the video onto a constant output grid (duplication/dropping in the
+    // frame loop below); the encoder carries the OUTPUT rate.
+    fpsConvert = request.video.frameRate.has_value() &&
+                 *request.video.frameRate > 0.0 &&
+                 *request.video.frameRate < 1000.0;
+    outFps = fpsConvert ? *request.video.frameRate : 0.0;
+    if (fpsConvert) {
+      outFrameDurUs = 1000000.0 / outFps;
+    }
+    // Source frame duration fallback (used when frames carry no duration).
     if (inVideo->avg_frame_rate.den > 0 && inVideo->avg_frame_rate.num > 0) {
+      srcFrameDurUs = 1000000.0 * double(inVideo->avg_frame_rate.den) /
+                      double(inVideo->avg_frame_rate.num);
+    }
+    if (fpsConvert) {
+      cleanup.videoEnc->framerate = av_d2q(outFps, 1001000);
+      cleanup.videoEnc->time_base = av_inv_q(cleanup.videoEnc->framerate);
+    } else if (inVideo->avg_frame_rate.den > 0 &&
+               inVideo->avg_frame_rate.num > 0) {
       cleanup.videoEnc->framerate = inVideo->avg_frame_rate;
       cleanup.videoEnc->time_base = AVRational{inVideo->avg_frame_rate.den,
                                                inVideo->avg_frame_rate.num};
@@ -1777,6 +1804,33 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
   };
 
+  // Frame-rate conversion (spec §9): resamples the source timeline onto a
+  // constant output grid. A source frame covering N output slots is sent N
+  // times (duplication); source frames not covering any free slot are
+  // dropped. The grid cursor is segment-local microseconds and snaps
+  // forward across gaps (e.g. after the segment seek overshoot).
+  const auto emitFpsConverted = [&](AVFrame *f, std::int64_t startLocalUs,
+                                    std::int64_t durUs) {
+    if (fpsNextOutUs < double(startLocalUs) - 0.5) {
+      fpsNextOutUs = std::ceil(std::max<double>(double(startLocalUs), 0.0) /
+                               outFrameDurUs) *
+                     outFrameDurUs;
+    }
+    const double spanEnd =
+        double(startLocalUs) +
+        double(durUs > 0 ? durUs : std::int64_t(srcFrameDurUs));
+    bool emitted = false;
+    for (double t = fpsNextOutUs; t < spanEnd - 0.5; t += outFrameDurUs) {
+      f->pts = av_rescale_q(std::int64_t(std::llround(t)),
+                            AVRational{1, 1000000},
+                            cleanup.videoEnc->time_base);
+      sendVideoFrameToEncoder(f);
+      fpsNextOutUs = t + outFrameDurUs;
+      emitted = true;
+    }
+    return emitted;
+  };
+
   const auto drainVideoEncoder = [&]() {
     if (cleanup.videoEnc == nullptr) {
       return;
@@ -1893,7 +1947,30 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
               AVFrame *filt = av_frame_alloc();
               while (av_buffersink_get_frame(burnSink, filt) >= 0) {
                 filt->pict_type = AV_PICTURE_TYPE_NONE;
-                if (rangeBounded && filt->pts != AV_NOPTS_VALUE) {
+                if (fpsConvert) {
+                  // Frame-rate conversion composes with burn-in: grid-emit
+                  // on the segment-local timeline.
+                  std::int64_t filtUs = std::int64_t(
+                      std::llround(fpsNextOutUs)); // NOPTS fallback: continue
+                  if (filt->pts != AV_NOPTS_VALUE) {
+                    const std::int64_t graphUs = av_rescale_q(
+                        filt->pts, av_buffersink_get_time_base(burnSink),
+                        AVRational{1, 1000000});
+                    if (graphUs != AV_NOPTS_VALUE) {
+                      filtUs = rangeBounded
+                                   ? std::max<std::int64_t>(
+                                         0, graphUs - rangeStartUs)
+                                   : graphUs;
+                    }
+                  }
+                  std::int64_t filtDurUs = std::int64_t(srcFrameDurUs);
+                  if (filt->duration > 0) {
+                    filtDurUs = av_rescale_q(
+                        filt->duration, av_buffersink_get_time_base(burnSink),
+                        AVRational{1, 1000000});
+                  }
+                  emitFpsConverted(filt, filtUs, filtDurUs);
+                } else if (rangeBounded && filt->pts != AV_NOPTS_VALUE) {
                   // Segment-local timeline: rebase into [0, rangeEnd-start)
                   // and convert to the encoder's time base in one step.
                   const std::int64_t outUs = av_rescale_q(
@@ -1903,14 +1980,15 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                       std::max<std::int64_t>(0, outUs - rangeStartUs),
                       AVRational{1, 1000000},
                       cleanup.videoEnc->time_base);
+                  sendVideoFrameToEncoder(filt);
                 } else {
                   filt->pts = av_rescale_q_rnd(
                       filt->pts, av_buffersink_get_time_base(burnSink),
                       cleanup.videoEnc->time_base,
                       static_cast<AVRounding>(
                           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+                  sendVideoFrameToEncoder(filt);
                 }
-                sendVideoFrameToEncoder(filt);
                 av_frame_unref(filt);
               }
               av_frame_free(&filt);
@@ -1920,7 +1998,23 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             sws_scale(cleanup.sws, cleanup.frame->data,
                       cleanup.frame->linesize, 0, cleanup.videoDec->height,
                       videoFrame->data, videoFrame->linesize);
-            if (rangeBounded && cleanup.frame->pts != AV_NOPTS_VALUE) {
+            if (fpsConvert) {
+              // Frame-rate conversion on the segment-local timeline.
+              std::int64_t localUs = std::int64_t(std::llround(fpsNextOutUs));
+              if (srcUs >= 0) {
+                localUs = rangeBounded
+                              ? std::max<std::int64_t>(0, srcUs - rangeStartUs)
+                              : srcUs;
+              }
+              std::int64_t durUs = std::int64_t(srcFrameDurUs);
+              if (cleanup.frame->duration > 0) {
+                durUs = av_rescale_q(cleanup.frame->duration,
+                                     cleanup.videoDec->time_base,
+                                     AVRational{1, 1000000});
+              }
+              emitFpsConverted(videoFrame, localUs, durUs);
+            } else if (rangeBounded &&
+                       cleanup.frame->pts != AV_NOPTS_VALUE) {
               // Segment-local timeline: subtract the range start (in the
               // decoder's time base) before handing pts to the encoder.
               const std::int64_t startTb = av_rescale_q(
@@ -1931,14 +2025,15 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                   cleanup.videoEnc->time_base,
                   static_cast<AVRounding>(
                       AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+              sendVideoFrameToEncoder(videoFrame);
             } else {
               videoFrame->pts = av_rescale_q_rnd(
                   cleanup.frame->pts, cleanup.videoDec->time_base,
                   cleanup.videoEnc->time_base,
                   static_cast<AVRounding>(
                       AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+              sendVideoFrameToEncoder(videoFrame);
             }
-            sendVideoFrameToEncoder(videoFrame);
           }
           if (params.onProgress && totalDurationUs > 0 &&
               (framesDone % 16) == 0) {
@@ -2509,6 +2604,7 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   // libswscale/libswresample handle geometry and audio format changes; the
   // subtitle streams copy through containers and libass burns text in.
   caps.videoScaling = true;
+  caps.timeTrim = true;
   caps.audioResampling = true;
   caps.subtitlePassthrough = true;
   caps.subtitleBurnIn = true;

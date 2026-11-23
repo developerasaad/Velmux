@@ -45,6 +45,10 @@ bool HybridExecutor::canExecute(const Pipeline &pipeline,
       request.video.frameRate.has_value()) {
     return false; // v1 hybrid carries source geometry and rate
   }
+  if (request.trim.startUs != 0 || request.trim.endUs != -1) {
+    return false; // v1 hybrid does not trim: no executor may silently
+                  // present an untrimmed output as trimmed
+  }
   if (request.audio.enabled && !pipeline.audioStreamCopy) {
     return false; // audio transcode stays whole-pipeline
   }

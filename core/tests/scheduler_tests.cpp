@@ -9,8 +9,11 @@ namespace {
 
 struct Recorder {
   std::vector<std::string> started;
-  Scheduler::RunJobFn run = [this](const std::string &jobId) {
+  std::vector<std::uint64_t> startedGenerations;
+  Scheduler::RunJobFn run = [this](const std::string &jobId,
+                                  std::uint64_t generation) {
     started.push_back(jobId);
+    startedGenerations.push_back(generation);
   };
 };
 
@@ -140,4 +143,134 @@ TEST_CASE("submit is idempotent per job") {
   scheduler.submit("a");
   CHECK(recorder.started.size() == 1);
   CHECK(scheduler.runningCount() + scheduler.queuedCount() == 1);
+}
+
+TEST_CASE(
+    "runFinished frees the slot on natural completion (the slot-leak fix)") {
+  Recorder recorder;
+  Scheduler scheduler(recorder.run);
+  ResourceSnapshot single = desktopSnapshot();
+  single.cpuCores = 2; // -> 1 concurrent job
+  scheduler.updateResources(single);
+
+  scheduler.submit("a");
+  scheduler.submit("b");
+  scheduler.submit("c");
+  REQUIRE(recorder.started.size() == 1);
+  REQUIRE(recorder.started.front() == "a");
+
+  // The worker for "a" completes naturally: the slot must free without an
+  // explicit finish() (which the engine only issues on cancel).
+  scheduler.runFinished("a", recorder.startedGenerations[0]);
+  CHECK(recorder.started.size() == 2);
+  CHECK(recorder.started[1] == "b");
+
+  scheduler.runFinished("b", recorder.startedGenerations[1]);
+  CHECK(recorder.started.size() == 3);
+  CHECK(recorder.started[2] == "c");
+  CHECK(scheduler.queuedCount() == 0);
+  // "c" was started and its (simulated) worker has not reported yet.
+  CHECK(scheduler.runningCount() == 1);
+  scheduler.runFinished("c", recorder.startedGenerations[2]);
+  CHECK(scheduler.runningCount() == 0);
+}
+
+TEST_CASE("a stale generation must not free or consume the newer slot") {
+  Recorder recorder;
+  Scheduler scheduler(recorder.run);
+  scheduler.updateResources(desktopSnapshot());
+  scheduler.setPolicy(SchedulerPolicy{1, 1, true});
+
+  scheduler.submit("a");
+  REQUIRE(recorder.started.size() == 1);
+  const std::uint64_t staleGeneration = recorder.startedGenerations[0];
+
+  // Cancel + retry while the old worker is still unwinding.
+  scheduler.finish("a");
+  scheduler.submit("a", 9); // new submission, new generation, runs now
+  REQUIRE(recorder.started.size() == 2);
+  REQUIRE(scheduler.runningCount() == 1);
+
+  // The old worker finally reports completion: it must not erase the newer
+  // run's slot (this used to kill the re-queued job's queue entry).
+  scheduler.runFinished("a", staleGeneration);
+  CHECK(scheduler.runningCount() == 1);
+
+  // The current generation frees correctly.
+  scheduler.runFinished("a", recorder.startedGenerations[1]);
+  CHECK(scheduler.runningCount() == 0);
+}
+
+TEST_CASE("hardware cap gates hardware pipelines without blocking software") {
+  Recorder recorder;
+  Scheduler scheduler(recorder.run);
+  scheduler.updateResources(desktopSnapshot());
+  // Plenty of general capacity, exactly one hardware slot.
+  scheduler.setPolicy(SchedulerPolicy{4, 1, true});
+
+  scheduler.submit("hw-a");
+  scheduler.noteHardwareIntent("hw-a");
+  scheduler.submit("hw-b");
+  scheduler.noteHardwareIntent("hw-b");
+  scheduler.submit("sw-a");
+
+  REQUIRE(recorder.started.size() == 3);
+  REQUIRE(scheduler.runningCount() == 3);
+  // hw-a occupies the single hardware slot once dispatch reports it started.
+  scheduler.jobHardwareStarted("hw-a");
+  CHECK_FALSE(scheduler.hardwareSlotAvailable());
+
+  // Capacity still allows a software job.
+  scheduler.submit("sw-b");
+  CHECK(recorder.started.size() == 4);
+
+  // Another hardware job stays queued while the cap is saturated.
+  scheduler.submit("hw-c");
+  scheduler.noteHardwareIntent("hw-c");
+  CHECK(scheduler.queuedJobIds().front() == "hw-c");
+  const std::size_t startedCount = recorder.started.size();
+  scheduler.pump();
+  CHECK(recorder.started.size() == startedCount); // no busy-spin start
+
+  // The running hardware job finishes: the queued hardware job may start.
+  const auto it = std::find(recorder.started.begin(), recorder.started.end(),
+                            "hw-a");
+  REQUIRE(it != recorder.started.end());
+  const std::size_t hwAIndex = std::size_t(it - recorder.started.begin());
+  scheduler.runFinished("hw-a", recorder.startedGenerations[hwAIndex]);
+  CHECK(scheduler.hardwareSlotAvailable());
+  CHECK(recorder.started.size() == startedCount + 1);
+  CHECK(recorder.started.back() == "hw-c");
+}
+
+TEST_CASE("deferred jobs keep hardware intent so re-queueing cannot spin") {
+  Recorder recorder;
+  Scheduler scheduler(recorder.run);
+  scheduler.updateResources(desktopSnapshot());
+  scheduler.setPolicy(SchedulerPolicy{4, 1, true});
+
+  scheduler.submit("hw-run");
+  scheduler.noteHardwareIntent("hw-run");
+  scheduler.jobHardwareStarted("hw-run");
+
+  // First defer cycle: the job starts (no intent known at submit time),
+  // its executeJob hits the saturated hardware gate, defers, and the
+  // engine notes intent + re-queues after the worker unwinds.
+  scheduler.submit("hw-deferred");
+  REQUIRE(recorder.started.size() == 2); // started: no intent known yet
+  scheduler.noteHardwareIntent("hw-deferred");
+  scheduler.runFinished("hw-deferred", recorder.startedGenerations[1],
+                        /*deferred=*/true);
+  scheduler.submit("hw-deferred");
+  // Second cycle: intent known -> stays queued while the cap is saturated.
+  CHECK(scheduler.queuedCount() == 1);
+  CHECK(scheduler.runningCount() == 1);
+  const std::size_t startedCount = recorder.started.size();
+  scheduler.pump();
+  CHECK(recorder.started.size() == startedCount); // no busy-spin
+
+  // Hardware slot frees: the re-queued deferred job starts.
+  scheduler.runFinished("hw-run", recorder.startedGenerations[0]);
+  CHECK(scheduler.runningCount() == 1);
+  CHECK(recorder.started.back() == "hw-deferred");
 }

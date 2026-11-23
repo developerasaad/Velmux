@@ -107,15 +107,43 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
   initial.cpuCores = std::max<std::int32_t>(
       1, std::int32_t(std::thread::hardware_concurrency()));
   engine->scheduler_ = std::make_unique<Scheduler>(
-      [engineRaw = engine.get()](const std::string &jobId) {
+      [engineRaw = engine.get()](const std::string &jobId,
+                                 std::uint64_t generation) {
         // Each job runs on its own worker thread; the scheduler bounds
         // concurrency. UI threads are never blocked (spec §4.1), and the
         // engine joins every worker at shutdown.
-        std::thread worker([engineRaw, jobId] {
-          engineRaw->jobs_->executeJob(jobId);
+        std::thread worker([engineRaw, jobId, generation] {
+          const JobManager::ExecuteOutcome outcome =
+              engineRaw->jobs_->executeJob(jobId);
+          // Release the slot BEFORE re-queueing a deferred job: submit()
+          // is a no-op while the job still counts as running.
+          engineRaw->scheduler_->runFinished(
+              jobId, generation,
+              outcome == JobManager::ExecuteOutcome::Deferred);
+          if (outcome == JobManager::ExecuteOutcome::Deferred) {
+            engineRaw->scheduler_->submit(jobId);
+          }
         });
         std::lock_guard<std::mutex> lock(engineRaw->workersMutex_);
         engineRaw->workers_.push_back(std::move(worker));
+      });
+  // Hardware-codec scarcity gate (spec §21): the scheduler defers hardware
+  // pipelines while the hardware cap is saturated, and accounts running
+  // hardware jobs so the cap is real (it was dead policy before).
+  engine->jobs_->setDispatchHooks(
+      [engineRaw = engine.get()](const std::string &jobId,
+                                 const Pipeline &pipeline) {
+        if (!pipeline.usesHardware) {
+          return true;
+        }
+        if (engineRaw->scheduler_->hardwareSlotAvailable()) {
+          return true;
+        }
+        engineRaw->scheduler_->noteHardwareIntent(jobId);
+        return false;
+      },
+      [engineRaw = engine.get()](const std::string &jobId) {
+        engineRaw->scheduler_->jobHardwareStarted(jobId);
       });
   engine->scheduler_->updateResources(initial);
 
@@ -206,12 +234,13 @@ Result<SampleResult> VelmuxEngine::generateSample(
   return jobs_->generateSample(request, sampleSeconds, outPath);
 }
 
-Result<std::string> VelmuxEngine::startJob(const ConversionRequest &request) {
-  const Result<std::string> submitted = jobs_->submit(request);
+Result<std::string> VelmuxEngine::startJob(const ConversionRequest &request,
+                                        std::int32_t priority) {
+  const Result<std::string> submitted = jobs_->submit(request, priority);
   if (!submitted.ok()) {
     return submitted;
   }
-  scheduler_->submit(submitted.value());
+  scheduler_->submit(submitted.value(), priority);
   return submitted;
 }
 
