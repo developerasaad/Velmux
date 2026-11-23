@@ -915,7 +915,28 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   } else {
     expect.expectAudio = false;
   }
+  // Duration expectation: the source duration minus an active trim window
+  // (a trimmed output is SHORTER by design; the validator used to compare
+  // against the full source and only got away with it while the persisted
+  // sourceInfo was empty and silently disabled this check).
   expect.expectedDurationSec = record.sourceInfo.durationSec;
+  if (record.request.trim.startUs > 0 ||
+      record.request.trim.endUs >= 0) {
+    const std::int64_t trimStartUs = record.request.trim.startUs;
+    const std::int64_t trimEndUs =
+        record.request.trim.endUs >= 0
+            ? record.request.trim.endUs
+            : std::int64_t(record.sourceInfo.durationSec * 1'000'000.0);
+    if (trimEndUs > trimStartUs) {
+      const double trimmedSec =
+          double(trimEndUs - trimStartUs) / 1'000'000.0;
+      expect.expectedDurationSec = trimmedSec;
+      // Stream-copy trims snap their start to the preceding keyframe;
+      // transcode trims are frame-exact. A generous extra second absorbs
+      // the keyframe snap without opening a fake-success window.
+      expect.durationToleranceSec += 1.0;
+    }
+  }
 
   const ValidationReport report =
       validator_->validate(record.outputPath, expect);

@@ -377,6 +377,22 @@ std::string serializeSourceInfo(const MediaInfo &info) {
     out += "asr=" + std::to_string(a.sampleRate) + ";";
     out += std::string("acodec=") + codecName(a.codec) + ";";
   }
+  if (!info.subtitles.empty()) {
+    // The planner's subtitle policies (burn-in/preserve/extract routing
+    // and container compatibility) key off the track list; formats and
+    // languages per track, pipe-separated.
+    out += "subs=";
+    for (std::size_t i = 0; i < info.subtitles.size(); ++i) {
+      if (i > 0) {
+        out += "|";
+      }
+      out += subtitleFormatName(info.subtitles[i].format);
+      if (!info.subtitles[i].language.empty()) {
+        out += "," + info.subtitles[i].language;
+      }
+    }
+    out += ";";
+  }
   return out;
 }
 
@@ -425,6 +441,33 @@ MediaInfo parseSourceInfo(const std::string &data) {
         }
         info.audio.front().codec =
             audioCodecFromName(value).value_or(AudioCodec::Aac);
+      } else if (key == "subs") {
+        std::size_t pos = 0;
+        while (pos <= value.size()) {
+          const std::size_t pipe = value.find('|', pos);
+          const std::string track =
+              value.substr(pos, pipe == std::string::npos
+                                    ? std::string::npos
+                                    : pipe - pos);
+          const std::size_t comma = track.find(',');
+          const std::string fmt = comma == std::string::npos
+                                      ? track
+                                      : track.substr(0, comma);
+          const std::string lang = comma == std::string::npos
+                                       ? ""
+                                       : track.substr(comma + 1);
+          const auto format = subtitleFormatFromName(fmt);
+          if (format.has_value()) {
+            SubtitleStream sub;
+            sub.format = *format;
+            sub.language = lang;
+            info.subtitles.push_back(sub);
+          }
+          if (pipe == std::string::npos) {
+            break;
+          }
+          pos = pipe + 1;
+        }
       }
     } catch (const std::exception &) {
       // A malformed pair must never break job loading.

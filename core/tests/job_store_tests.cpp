@@ -180,6 +180,14 @@ TEST_CASE("source inspection survives the store round-trip (validation gate)") {
   audio.channels = 2;
   audio.sampleRate = 44100;
   record.sourceInfo.audio.push_back(audio);
+  SubtitleStream english;
+  english.format = SubtitleFormat::Srt;
+  english.language = "eng";
+  record.sourceInfo.subtitles.push_back(english);
+  SubtitleStream forced;
+  forced.format = SubtitleFormat::Ass;
+  forced.isForced = true;
+  record.sourceInfo.subtitles.push_back(forced);
 
   REQUIRE(db.jobs().insertJob(record).ok());
   Error error;
@@ -200,6 +208,13 @@ TEST_CASE("source inspection survives the store round-trip (validation gate)") {
   CHECK(loaded->sourceInfo.audio.front().sampleRate == 44100);
   CHECK(loaded->sourceInfo.audio.front().channels == 2);
   CHECK(loaded->sourceInfo.audio.front().codec == AudioCodec::Aac);
+  // Subtitle tracks drive the planner's burn-in/preserve/extract routing
+  // and container compatibility; losing them after a reload broke exactly
+  // those policies.
+  REQUIRE(loaded->sourceInfo.subtitles.size() == 2);
+  CHECK(loaded->sourceInfo.subtitles[0].format == SubtitleFormat::Srt);
+  CHECK(loaded->sourceInfo.subtitles[0].language == "eng");
+  CHECK(loaded->sourceInfo.subtitles[1].format == SubtitleFormat::Ass);
 
   // updateJob (delete+insert) preserves it too.
   JobRecord updated = *loaded;
