@@ -298,15 +298,15 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 
 - (void)registerBackgroundTasks {
   [[BGTaskScheduler sharedScheduler]
-      registerTaskForIdentifier:kVelmuxBGTaskId
-                     usingQueue:nil
-                  launchHandler:^(BGTask *task) {
-                    if ([task isKindOfClass:[BGProcessingTask class]]) {
-                      [self runResumeTask:(BGProcessingTask *)task];
-                    } else {
-                      [task setTaskCompletedWithSuccess:YES];
-                    }
-                  }];
+      registerForTaskWithIdentifier:kVelmuxBGTaskId
+                         usingQueue:nil
+                       launchHandler:^(BGTask *task) {
+                         if ([task isKindOfClass:[BGProcessingTask class]]) {
+                           [self runResumeTask:(BGProcessingTask *)task];
+                         } else {
+                           [task setTaskCompletedWithSuccess:YES];
+                         }
+                       }];
 }
 
 /// BGProcessingTask body: resume INTERRUPTED jobs, keep the task alive
