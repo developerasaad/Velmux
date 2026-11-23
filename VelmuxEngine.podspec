@@ -92,8 +92,13 @@ Pod::Spec.new do |spec|
   spec.source_files = source_files
   if ffmpeg_relative
     spec.vendored_frameworks = ffmpeg_relative + '/VelmuxFFmpeg.xcframework'
+    # libass (inside the merged static archive) calls iconv; the iOS SDK
+    # ships it as usr/lib/libiconv.tbd but the final link must request it
+    # explicitly or _iconv/_iconv_open/_iconv_close stay unresolved.
+    spec.libraries = 'c++', 'z', 'iconv'
+  else
+    spec.libraries = 'c++', 'z'
   end
-  spec.libraries = 'c++', 'z'
   spec.frameworks = 'AVFoundation', 'VideoToolbox', 'CoreMedia',
                     'CoreVideo', 'Foundation', 'CoreFoundation'
   spec.requires_arc = false
