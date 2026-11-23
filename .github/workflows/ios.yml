@@ -93,7 +93,7 @@ jobs:
         if: steps.ffmpeg-artifact.outputs.run-id != ''
         run: |
           if [ -d "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios/iphoneos" ]; then
-            tools/ffmpeg-builder/package-ios-xcframework.sh \
+            bash tools/ffmpeg-builder/package-ios-xcframework.sh \
               "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios" \
               "${GITHUB_WORKSPACE}/ffmpeg-ios-packaged"
             echo "VELMUX_FFMPEG_ROOT=${GITHUB_WORKSPACE}/ffmpeg-ios-packaged" >> "$GITHUB_ENV"
