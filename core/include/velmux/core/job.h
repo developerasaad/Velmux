@@ -77,6 +77,16 @@ struct TimeRange {
   bool active() const { return startUs > 0 || endUs >= 0; }
 };
 
+// Crop rectangle on the SOURCE frame (pre-rotation coordinates, pixels,
+// top-left origin). width/height <= 0 means no crop.
+struct CropRect {
+  std::int32_t x = 0;
+  std::int32_t y = 0;
+  std::int32_t width = 0;
+  std::int32_t height = 0;
+  bool active() const { return width > 0 && height > 0; }
+};
+
 struct VideoRequest {
   bool enabled = true;
   std::optional<VideoCodec> codec;
@@ -86,6 +96,13 @@ struct VideoRequest {
   std::optional<std::int64_t> bitRate; // bits per second
   // Encoder quality parameter, 0..100 scale (higher = better quality).
   std::optional<std::int32_t> quality;
+  // Geometry transforms (spec §9). Order: crop -> rotation -> flips.
+  // Rotation is clockwise, one of 0/90/180/270 (odd values swap width and
+  // height).
+  std::optional<CropRect> crop;
+  std::int32_t rotationDegrees = 0;
+  bool flipHorizontal = false;
+  bool flipVertical = false;
 };
 
 struct AudioRequest {
@@ -94,6 +111,19 @@ struct AudioRequest {
   std::optional<std::int64_t> bitRate;
   std::optional<std::int32_t> sampleRate;
   std::optional<std::int32_t> channels;
+  // Audio DSP chain (spec §10), applied before the output encoder by
+  // backends that report audioDsp. Order: gain -> fades -> loudness
+  // normalization -> speed -> silence removal.
+  std::optional<double> gainDb; // -60..+60 dB volume adjustment
+  std::optional<std::int32_t> fadeInMs;
+  std::optional<std::int32_t> fadeOutMs;
+  bool normalizeLoudness = false; // single-pass loudness normalization
+  // Pitch-preserving time stretching, 0.5..2.0 (1.0 = unchanged). Changes
+  // the output duration; validation expectations account for it.
+  std::optional<double> playbackSpeed;
+  bool removeSilence = false; // shortens pauses; duration-only checks relax
+  // PCM output bit depth (16/24/32); meaningful for PCM/WAV output.
+  std::optional<std::int32_t> pcmBitDepth;
 };
 
 struct SubtitleRequest {

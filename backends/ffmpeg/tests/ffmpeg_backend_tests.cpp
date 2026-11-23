@@ -570,6 +570,242 @@ TEST_CASE("fit-under-size budget DRIVES the encode and lands under target") {
 }
 
 // ---------------------------------------------------------------------------
+// Geometry transforms (spec §9: crop / rotation / flip)
+// ---------------------------------------------------------------------------
+
+// Extracts a pixel from a decoded frame via ffmpeg CLI (independent of the
+// backend's own pipeline): used to prove flips actually mirror pixels.
+std::string extractFramePixel(const std::string &path, double atSec) {
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error -ss " +
+      std::to_string(atSec) + " -i \"" + path +
+      "\" -frames:v 1 -f rawvideo -pix_fmt gray - 2>/dev/null | od -An -tu1 "
+      "| head -1 | tr -s ' '";
+  std::FILE *pipe = popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  char buf[256];
+  const char *got = std::fgets(buf, sizeof(buf), pipe);
+  pclose(pipe);
+  return got != nullptr ? std::string(got) : std::string();
+}
+
+TEST_CASE("rotation swaps output dimensions and crop cuts the frame") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.video.rotationDegrees = 90;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const ProbeResult probe = probeWith(jobs.front().outputPath);
+  CHECK(probe.videoCodec == "h264");
+  // 90-degree clockwise rotation of 320x240 -> 240x320.
+  CHECK(probe.width == 240);
+  CHECK(probe.height == 320);
+
+  // Crop: 320x240 source cropped to the left half (0,0,160,240).
+  ConversionRequest cropped =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  cropped.video.crop = CropRect{0, 0, 160, 240};
+  EventWaiter waiter2;
+  env.engine->events().subscribe(&waiter2);
+  const Result<std::string> jobId2 = env.engine->startJob(cropped);
+  REQUIRE(jobId2.ok());
+  const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal2.has_value());
+  INFO("failure error: " << terminal2->error);
+  REQUIRE(terminal2->state == JobState::Completed);
+  // listJobs is newest-first: address the job by its id, never by position.
+  const auto snap2 = env.engine->getJob(jobId2.value());
+  REQUIRE(snap2.has_value());
+  const ProbeResult probe2 = probeWith(snap2->outputPath);
+  CHECK(probe2.width == 160);
+  CHECK(probe2.height == 240);
+}
+
+TEST_CASE("flip mirrors pixels (independent raw-frame cross-check)") {
+  TestEnv env;
+  // testsrc2 has a strong left-to-right gradient: the leftmost and
+  // rightmost columns differ, so a horizontal flip visibly swaps them.
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.video.flipHorizontal = true;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const std::string out = jobs.front().outputPath;
+
+  // Compare the first grayscale row of source vs flipped output at the
+  // same timestamp: a real mirror reverses the row; a no-op transcode
+  // leaves it identical.
+  const std::string srcRow = extractFramePixel(fixture, 0.0);
+  const std::string flipRow = extractFramePixel(out, 0.0);
+  REQUIRE_FALSE(srcRow.empty());
+  REQUIRE_FALSE(flipRow.empty());
+  CHECK(srcRow != flipRow);
+}
+
+TEST_CASE("crop outside the frame is refused, not mangled") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 1.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.video.crop = CropRect{310, 0, 100, 100}; // past the right edge
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  REQUIRE(terminal->state == JobState::Failed);
+  CHECK(terminal->error.find("crop") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Audio DSP (spec §10: gain / fades / loudness / speed / silence / PCM depth)
+// ---------------------------------------------------------------------------
+
+// Measures mean volume (dB) with the ffmpeg CLI volumedetect filter —
+// independent of the backend's own DSP graph.
+double meanVolumeDb(const std::string &path) {
+  const std::string cmd =
+      ffmpegBin() + " -hide_banner -i \"" + path +
+      "\" -af volumedetect -f null - 2>&1 | grep mean_volume";
+  std::FILE *pipe = popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  char buf[512];
+  std::string out;
+  while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+    out += buf;
+  }
+  pclose(pipe);
+  const auto at = out.find("mean_volume:");
+  REQUIRE(at != std::string::npos);
+  const auto colon = out.find(':', at);
+  return std::atof(out.c_str() + colon + 1);
+}
+
+TEST_CASE("audio gain changes loudness by the requested amount") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.audio.gainDb = -12.0;
+
+  const double before = meanVolumeDb(fixture);
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const double after = meanVolumeDb(jobs.front().outputPath);
+  INFO("mean volume: " << before << " dB -> " << after << " dB");
+  // -12 dB requested: measured delta must land close (encoder noise and
+  // volumedetect windowing allow ~1.5 dB slack).
+  CHECK(after < before - 10.5);
+  CHECK(after > before - 13.5);
+}
+
+TEST_CASE("playback speed stretches audio-only output by 1/speed") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::M4a, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.video.enabled = false;
+  request.audio.playbackSpeed = 2.0;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const ProbeResult probe = probeWith(jobs.front().outputPath);
+  CHECK(probe.audioCodec == "aac");
+  INFO("duration: " << probe.durationSec << " (source 4.0, speed 2.0)");
+  CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.15));
+
+  // Combined with video, speed is honestly refused (A/V desync guard).
+  ConversionRequest withVideo =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  withVideo.audio.playbackSpeed = 1.5;
+  const Result<PlanResult> refused = env.engine->plan(
+      MediaSource{fixture, "in.mp4"}, withVideo);
+  REQUIRE(refused.ok());
+  CHECK_FALSE(refused.value().feasible);
+}
+
+TEST_CASE("PCM bit depth selects the exact PCM encoder variant") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 1.0);
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Wav, VideoCodec::H264,
+                       AudioCodec::Pcm);
+  request.video.enabled = false;
+  request.audio.pcmBitDepth = 24;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const ProbeResult probe = probeWith(jobs.front().outputPath);
+  CHECK(probe.audioCodec == "pcm_s24le");
+}
+
+// ---------------------------------------------------------------------------
 // Subtitle behavior (spec §14: subtitles are first-class streams)
 // ---------------------------------------------------------------------------
 

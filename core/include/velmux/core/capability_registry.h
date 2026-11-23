@@ -52,6 +52,10 @@ struct BackendCapabilities {
   bool videoScaling = false;
   // Can the backend resample audio (sample rate / channel changes)?
   bool audioResampling = false;
+  // Can the backend apply the audio DSP chain (gain, fades, loudness
+  // normalization, pitch-preserving speed, silence removal) before the
+  // output encoder? When false, the planner routes such requests elsewhere.
+  bool audioDsp = false;
   // Can the backend carry subtitle tracks through without decoding them?
   bool subtitlePassthrough = false;
   // Can the backend render (burn in) subtitles onto the video?

@@ -85,6 +85,22 @@ PlanResult Planner::plan(const MediaInfo &source,
   const bool wantsVideo = request.video.enabled && source.hasVideo();
   const bool wantsAudio = request.audio.enabled && source.hasAudio();
 
+  // Timeline-changing audio DSP (pitch-preserving speed, silence removal)
+  // rewrites the audio timeline. With video present that desynchronizes
+  // the streams (V1 has no video speed control to follow along), so the
+  // request is honestly infeasible rather than producing drift. These
+  // operations are for audio-only outputs (extraction, audio conversion).
+  if (wantsVideo && wantsAudio &&
+      (request.audio.playbackSpeed.has_value() ||
+       request.audio.removeSilence)) {
+    result.feasible = false;
+    result.message =
+        "Playback speed and silence removal apply to audio-only outputs; "
+        "they cannot be combined with video in V1 (the streams would "
+        "desynchronize). Disable video or remove the audio timing change.";
+    return result;
+  }
+
   VideoCodec outVideoCodec = VideoCodec::H264;
   if (wantsVideo) {
     outVideoCodec =
@@ -274,6 +290,11 @@ PlanResult Planner::plan(const MediaInfo &source,
       // output streams are identical to the input.
       !request.video.resolutionHeight.has_value() &&
       !request.video.frameRate.has_value() &&
+      // Geometry transforms rewrite pixels (crop/rotate/flip): never a
+      // stream copy, exactly like burn-in.
+      !(request.video.crop.has_value() && request.video.crop->active()) &&
+      request.video.rotationDegrees == 0 && !request.video.flipHorizontal &&
+      !request.video.flipVertical &&
       // Burn-in rewrites the video pixels: it can never stream-copy.
       request.subtitles.policy != SubtitlePolicy::BurnIn;
   const bool canStreamCopyAudio =
@@ -281,7 +302,15 @@ PlanResult Planner::plan(const MediaInfo &source,
       features_.audioSupport(outAudioCodec).streamCopy &&
       !request.audio.sampleRate.has_value() &&
       !request.audio.channels.has_value() &&
-      !request.audio.bitRate.has_value();
+      !request.audio.bitRate.has_value() &&
+      // DSP rewrites audio samples: gain/fades/normalization/speed/silence
+      // removal all require re-encoding.
+      !request.audio.gainDb.has_value() &&
+      !request.audio.fadeInMs.has_value() &&
+      !request.audio.fadeOutMs.has_value() &&
+      !request.audio.normalizeLoudness &&
+      !request.audio.playbackSpeed.has_value() &&
+      !request.audio.removeSilence;
   // Goal sanity: remuxing cannot shrink anything. Stream copy satisfies a
   // size goal only when the source already fits under the target.
   const bool sizeGoalAllowsCopy =
@@ -346,6 +375,27 @@ PlanResult Planner::plan(const MediaInfo &source,
     if (wantsTrim && !caps->timeTrim) {
       // An executor that cannot trim must never receive a trimmed request:
       // it would silently produce the full-length output.
+      return;
+    }
+    // Geometry transforms (spec §9) run through the video-processing
+    // filters: only backends reporting videoScaling execute them (the
+    // capability's documented meaning covers scale/rotate/crop).
+    if (wantsVideo &&
+        ((request.video.crop.has_value() && request.video.crop->active()) ||
+         request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
+         request.video.flipVertical) &&
+        !caps->videoScaling) {
+      return;
+    }
+    // Audio DSP chain (spec §10): only backends reporting audioDsp.
+    if (wantsAudio &&
+        (request.audio.gainDb.has_value() ||
+         request.audio.fadeInMs.has_value() ||
+         request.audio.fadeOutMs.has_value() ||
+         request.audio.normalizeLoudness ||
+         request.audio.playbackSpeed.has_value() ||
+         request.audio.removeSilence) &&
+        !caps->audioDsp) {
       return;
     }
     if (!streamCopy) {
@@ -522,10 +572,22 @@ PlanResult Planner::plan(const MediaInfo &source,
         return !c.pipeline.videoStreamCopy;
       });
   // Hybrid stage workers do not trim (v1): a trimmed request must not
-  // compose a hybrid route that would silently ignore the window.
+  // compose a hybrid route that would silently ignore the window. The same
+  // holds for geometry transforms and the audio DSP chain: the v1 stage
+  // contracts carry plain Yuv420P frames and stream-copied audio only.
   const bool wantsAnyTrim =
       request.trim.startUs != 0 || request.trim.endUs != -1;
-  if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim) {
+  const bool wantsTransform =
+      (request.video.crop.has_value() && request.video.crop->active()) ||
+      request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
+      request.video.flipVertical;
+  const bool wantsAudioDsp =
+      request.audio.gainDb.has_value() ||
+      request.audio.fadeInMs.has_value() ||
+      request.audio.fadeOutMs.has_value() || request.audio.normalizeLoudness ||
+      request.audio.playbackSpeed.has_value() || request.audio.removeSilence;
+  if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim &&
+      !wantsTransform && !wantsAudioDsp) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&

@@ -305,6 +305,21 @@ std::string serializeVideoRequest(const VideoRequest &video) {
   if (video.quality.has_value()) {
     out += "quality=" + std::to_string(*video.quality) + ";";
   }
+  if (video.crop.has_value() && video.crop->active()) {
+    out += "crop=" + std::to_string(video.crop->x) + "," +
+           std::to_string(video.crop->y) + "," +
+           std::to_string(video.crop->width) + "," +
+           std::to_string(video.crop->height) + ";";
+  }
+  if (video.rotationDegrees != 0) {
+    out += "rotate=" + std::to_string(video.rotationDegrees) + ";";
+  }
+  if (video.flipHorizontal) {
+    out += "fliph=1;";
+  }
+  if (video.flipVertical) {
+    out += "flipv=1;";
+  }
   return out;
 }
 
@@ -322,6 +337,27 @@ std::string serializeAudioRequest(const AudioRequest &audio) {
   }
   if (audio.channels.has_value()) {
     out += "channels=" + std::to_string(*audio.channels) + ";";
+  }
+  if (audio.gainDb.has_value()) {
+    out += "gain=" + std::to_string(*audio.gainDb) + ";";
+  }
+  if (audio.fadeInMs.has_value()) {
+    out += "fadein=" + std::to_string(*audio.fadeInMs) + ";";
+  }
+  if (audio.fadeOutMs.has_value()) {
+    out += "fadeout=" + std::to_string(*audio.fadeOutMs) + ";";
+  }
+  if (audio.normalizeLoudness) {
+    out += "norm=1;";
+  }
+  if (audio.playbackSpeed.has_value()) {
+    out += "speed=" + std::to_string(*audio.playbackSpeed) + ";";
+  }
+  if (audio.removeSilence) {
+    out += "desil=1;";
+  }
+  if (audio.pcmBitDepth.has_value()) {
+    out += "depth=" + std::to_string(*audio.pcmBitDepth) + ";";
   }
   return out;
 }
@@ -493,6 +529,28 @@ VideoRequest parseVideoRequest(const std::string &data) {
       video.bitRate = std::stoll(value);
     } else if (key == "quality") {
       video.quality = std::stoi(value);
+    } else if (key == "crop") {
+      // x,y,w,h
+      CropRect crop;
+      const auto comma1 = value.find(',');
+      const auto comma2 = value.find(',', comma1 + 1);
+      const auto comma3 = value.find(',', comma2 + 1);
+      if (comma1 != std::string::npos && comma2 != std::string::npos &&
+          comma3 != std::string::npos) {
+        crop.x = std::stoi(value.substr(0, comma1));
+        crop.y = std::stoi(value.substr(comma1 + 1, comma2 - comma1 - 1));
+        crop.width = std::stoi(value.substr(comma2 + 1, comma3 - comma2 - 1));
+        crop.height = std::stoi(value.substr(comma3 + 1));
+        if (crop.active()) {
+          video.crop = crop;
+        }
+      }
+    } else if (key == "rotate") {
+      video.rotationDegrees = std::stoi(value);
+    } else if (key == "fliph") {
+      video.flipHorizontal = value == "1";
+    } else if (key == "flipv") {
+      video.flipVertical = value == "1";
     }
   });
   return video;
@@ -511,6 +569,20 @@ AudioRequest parseAudioRequest(const std::string &data) {
       audio.sampleRate = std::stoi(value);
     } else if (key == "channels") {
       audio.channels = std::stoi(value);
+    } else if (key == "gain") {
+      audio.gainDb = std::stod(value);
+    } else if (key == "fadein") {
+      audio.fadeInMs = std::stoi(value);
+    } else if (key == "fadeout") {
+      audio.fadeOutMs = std::stoi(value);
+    } else if (key == "norm") {
+      audio.normalizeLoudness = value == "1";
+    } else if (key == "speed") {
+      audio.playbackSpeed = std::stod(value);
+    } else if (key == "desil") {
+      audio.removeSilence = value == "1";
+    } else if (key == "depth") {
+      audio.pcmBitDepth = std::stoi(value);
     }
   });
   return audio;

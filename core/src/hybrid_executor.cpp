@@ -49,6 +49,17 @@ bool HybridExecutor::canExecute(const Pipeline &pipeline,
     return false; // v1 hybrid does not trim: no executor may silently
                   // present an untrimmed output as trimmed
   }
+  if ((request.video.crop.has_value() && request.video.crop->active()) ||
+      request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
+      request.video.flipVertical) {
+    return false; // v1 stage contracts carry plain frames: no transform
+                  // filters on the interchange path
+  }
+  if (request.audio.gainDb.has_value() || request.audio.fadeInMs.has_value() ||
+      request.audio.fadeOutMs.has_value() || request.audio.normalizeLoudness ||
+      request.audio.playbackSpeed.has_value() || request.audio.removeSilence) {
+    return false; // v1 hybrid stream-copies audio: no DSP chain
+  }
   if (request.audio.enabled && !pipeline.audioStreamCopy) {
     return false; // audio transcode stays whole-pipeline
   }

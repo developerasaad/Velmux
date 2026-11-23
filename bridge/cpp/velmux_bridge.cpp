@@ -612,6 +612,40 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
       }
       request.video.quality = std::int32_t(*quality);
     }
+    // crop { x, y, width, height } (source-frame pixels, pre-rotation).
+    if (const JsonValue *crop = video->find("crop");
+        crop != nullptr && crop->kind == JsonValue::Kind::Object) {
+      CropRect rect;
+      rect.x = std::int32_t(getOptInt(*crop, "x").value_or(0));
+      rect.y = std::int32_t(getOptInt(*crop, "y").value_or(0));
+      rect.width = std::int32_t(getOptInt(*crop, "width").value_or(0));
+      rect.height = std::int32_t(getOptInt(*crop, "height").value_or(0));
+      if (rect.width < 0 || rect.height < 0) {
+        error = "crop dimensions must be non-negative";
+        return std::nullopt;
+      }
+      if (rect.active()) {
+        request.video.crop = rect;
+      }
+    }
+    if (auto rotation = getOptInt(*video, "rotationDegrees")) {
+      if (*rotation != 0 && *rotation != 90 && *rotation != 180 &&
+          *rotation != 270) {
+        error = "rotationDegrees must be one of 0, 90, 180, 270";
+        return std::nullopt;
+      }
+      request.video.rotationDegrees = std::int32_t(*rotation);
+    }
+    request.video.flipHorizontal =
+        getBool(*video, "flipHorizontal", false, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
+    request.video.flipVertical =
+        getBool(*video, "flipVertical", false, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
   }
 
   // audio { enabled, codec?, bitRate?, sampleRate?, channels? }
@@ -648,6 +682,53 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
         return std::nullopt;
       }
       request.audio.channels = std::int32_t(*channels);
+    }
+    if (auto gain = getOptDouble(*audio, "gainDb")) {
+      if (*gain < -60.0 || *gain > 60.0) {
+        error = "gainDb must be within -60..60";
+        return std::nullopt;
+      }
+      request.audio.gainDb = *gain;
+    }
+    if (auto fadeIn = getOptInt(*audio, "fadeInMs")) {
+      if (*fadeIn < 0) {
+        error = "fadeInMs must be non-negative";
+        return std::nullopt;
+      }
+      request.audio.fadeInMs = std::int32_t(*fadeIn);
+    }
+    if (auto fadeOut = getOptInt(*audio, "fadeOutMs")) {
+      if (*fadeOut < 0) {
+        error = "fadeOutMs must be non-negative";
+        return std::nullopt;
+      }
+      request.audio.fadeOutMs = std::int32_t(*fadeOut);
+    }
+    request.audio.normalizeLoudness =
+        getBool(*audio, "normalizeLoudness", false, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
+    if (auto speed = getOptDouble(*audio, "playbackSpeed")) {
+      if (*speed < 0.5 || *speed > 2.0) {
+        error = "playbackSpeed must be within 0.5..2.0";
+        return std::nullopt;
+      }
+      if (std::abs(*speed - 1.0) > 0.001) {
+        request.audio.playbackSpeed = *speed;
+      }
+    }
+    request.audio.removeSilence =
+        getBool(*audio, "removeSilence", false, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
+    if (auto depth = getOptInt(*audio, "pcmBitDepth")) {
+      if (*depth != 16 && *depth != 24 && *depth != 32) {
+        error = "pcmBitDepth must be one of 16, 24, 32";
+        return std::nullopt;
+      }
+      request.audio.pcmBitDepth = std::int32_t(*depth);
     }
   }
 

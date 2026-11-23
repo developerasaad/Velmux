@@ -1039,8 +1039,28 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   } else if (record.request.video.enabled) {
     expect.videoCodec = record.pipeline.videoCodec;
     if (!record.sourceInfo.video.empty()) {
-      expect.expectedHeight = record.request.video.resolutionHeight.value_or(
-          record.sourceInfo.video.front().height);
+      // Transform-aware expected geometry (the executor applies
+      // crop -> rotation -> scale): a correct 90-degree rotation of a
+      // 1920x1080 source is 1080 high, and a cropped output is the crop
+      // height — comparing against the raw source height would fail every
+      // correct transformed output.
+      std::int32_t baseH = record.sourceInfo.video.front().height;
+      std::int32_t baseW = record.sourceInfo.video.front().width;
+      if (record.request.video.crop.has_value() &&
+          record.request.video.crop->active()) {
+        const std::int32_t availW =
+            std::max(0, baseW - record.request.video.crop->x);
+        const std::int32_t availH =
+            std::max(0, baseH - record.request.video.crop->y);
+        baseW = std::clamp(record.request.video.crop->width, 2, availW);
+        baseH = std::clamp(record.request.video.crop->height, 2, availH);
+      }
+      if (record.request.video.rotationDegrees == 90 ||
+          record.request.video.rotationDegrees == 270) {
+        std::swap(baseW, baseH);
+      }
+      expect.expectedHeight =
+          record.request.video.resolutionHeight.value_or(baseH);
     }
   } else {
     expect.expectVideo = false;
@@ -1074,6 +1094,24 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
       // the keyframe snap without opening a fake-success window.
       expect.durationToleranceSec += 1.0;
     }
+  }
+  // Audio DSP timeline effects (spec §10): pitch-preserving speed stretches
+  // the duration by exactly 1/speed; silence removal can only shorten.
+  if (record.request.audio.playbackSpeed.has_value() &&
+      *record.request.audio.playbackSpeed > 0.0) {
+    expect.expectedDurationSec /= *record.request.audio.playbackSpeed;
+  }
+  if (record.request.audio.removeSilence) {
+    // Removed silence is content-dependent: no exact expectation is
+    // honest. Upper bound = unstretched duration (+tolerance); a floor of
+    // 10% catches truncated output without demanding exact silence
+    // detection. Encoded via the same expectedDuration path with a wide
+    // tolerance: the validator's check is |actual - expected| <= tol,
+    // so set expected to the midpoint of [0.1, 1.0] x duration and a
+    // tolerance covering the whole band.
+    const double span = expect.expectedDurationSec;
+    expect.expectedDurationSec = span * 0.55;
+    expect.durationToleranceSec += span * 0.45;
   }
 
   const ValidationReport report =

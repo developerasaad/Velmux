@@ -23,6 +23,7 @@ extern "C" {
 #include <libavfilter/buffersrc.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/audio_fifo.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
@@ -87,7 +88,11 @@ struct CodecCleanup {
     av_packet_free(&packet);
     sws_freeContext(sws);
     swr_free(&swr);
+    if (audioFifo != nullptr) {
+      av_audio_fifo_free(audioFifo);
+    }
     avfilter_graph_free(&filterGraph);
+    avfilter_graph_free(&audioGraph);
     avcodec_free_context(&videoDec);
     avcodec_free_context(&audioDec);
     avcodec_free_context(&videoEnc);
@@ -114,9 +119,16 @@ struct CodecCleanup {
   AVCodecContext *audioEnc = nullptr;
   SwsContext *sws = nullptr;
   SwrContext *swr = nullptr;
+  // Encoder-side sample accumulator: frame-based encoders (AAC) require
+  // EXACTLY frame_size samples per non-final frame, but the DSP graph and
+  // the resampler emit arbitrary chunk sizes. The fifo absorbs the
+  // mismatch; the encoder is fed only complete frames (plus the final
+  // partial one at drain).
+  AVAudioFifo *audioFifo = nullptr;
   AVFrame *frame = nullptr;
   AVPacket *packet = nullptr;
   AVFilterGraph *filterGraph = nullptr;
+  AVFilterGraph *audioGraph = nullptr;
   // Scratch files materialized for burn-in (shifted subtitle copies).
   std::vector<std::string> tempFiles;
 };
@@ -1192,6 +1204,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   // the direct sws path. Owned by cleanup.filterGraph.
   AVFilterContext *burnSrc = nullptr;
   AVFilterContext *burnSink = nullptr;
+  // Audio DSP chain endpoints (spec §10); active when any DSP knob is set.
+  AVFilterContext *audioSrc = nullptr;
+  AVFilterContext *audioSink = nullptr;
   // Time base the buffersrc was declared with; pushed frames' pts are
   // normalized into it (decoders may adjust their own time base mid-stream).
   AVRational burnGraphTb{0, 1};
@@ -1254,18 +1269,45 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
     cleanup.videoEnc = avcodec_alloc_context3(encCodec);
 
-    // Target geometry: requested resolution or source size; never upscale.
-    std::int32_t outH =
-        request.video.resolutionHeight.value_or(cleanup.videoDec->height);
-    if (cleanup.videoDec->height > 0) {
-      outH = std::min(outH, cleanup.videoDec->height);
+    // Target geometry: requested resolution or the TRANSFORMED source size;
+    // never upscale. Crop applies first (source-frame pixels), then rotation
+    // (odd multiples of 90 swap width/height); scale fits inside the
+    // transformed rectangle preserving aspect.
+    const bool wantsCrop =
+        request.video.crop.has_value() && request.video.crop->active();
+    const bool wantsRotation = request.video.rotationDegrees == 90 ||
+                               request.video.rotationDegrees == 270;
+    std::int32_t baseH = cleanup.videoDec->height;
+    std::int32_t baseW = cleanup.videoDec->width;
+    if (wantsCrop) {
+      // The crop rectangle must fit entirely inside the source frame:
+      // silently clamping a user rect to the overlap would produce a
+      // different crop than requested (mangling, not tolerance).
+      const CropRect &crop = *request.video.crop;
+      const bool cropValid =
+          crop.x >= 0 && crop.y >= 0 &&
+          crop.x + crop.width <= cleanup.videoDec->width &&
+          crop.y + crop.height <= cleanup.videoDec->height &&
+          crop.width >= 2 && crop.height >= 2;
+      if (!cropValid) {
+        result.error = Error::make(
+            ErrorCode::InvalidArgument,
+            "crop rectangle does not fit inside the source frame", "ffmpeg");
+        return result;
+      }
+      baseW = crop.width;
+      baseH = crop.height;
+    }
+    if (wantsRotation) {
+      std::swap(baseW, baseH);
+    }
+    std::int32_t outH = request.video.resolutionHeight.value_or(baseH);
+    if (baseH > 0) {
+      outH = std::min(outH, baseH);
     }
     outH = std::max(outH & ~1, 16);
     const double aspect =
-        cleanup.videoDec->width > 0 && cleanup.videoDec->height > 0
-            ? double(cleanup.videoDec->width) /
-                  double(cleanup.videoDec->height)
-            : 16.0 / 9.0;
+        baseW > 0 && baseH > 0 ? double(baseW) / double(baseH) : 16.0 / 9.0;
     std::int32_t outW = std::int32_t(std::lround(outH * aspect)) & ~1;
     outW = std::max(outW, 16);
     cleanup.videoEnc->width = outW;
@@ -1330,12 +1372,20 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     avcodec_parameters_from_context(outVideo->codecpar, cleanup.videoEnc);
     outVideo->time_base = cleanup.videoEnc->time_base;
 
-    if (request.subtitles.policy == SubtitlePolicy::BurnIn) {
+    // Unified video filter graph: burn-in rendering AND/OR geometry
+    // transforms (crop -> rotation -> flips -> scale -> [subtitles]).
+    const bool wantsBurnIn =
+        request.subtitles.policy == SubtitlePolicy::BurnIn;
+    const bool wantsTransform =
+        wantsCrop || request.video.rotationDegrees != 0 ||
+        request.video.flipHorizontal || request.video.flipVertical;
+    if (wantsBurnIn || wantsTransform) {
       // Resolve the burn-in source: explicit external file, else the first
       // embedded subtitle stream.
       std::string subPath;
       int subGlobalIndex = -1; // stream index in the input container
       int subOrdinal = -1;     // subtitle-stream ordinal (the filter's `si`)
+      if (wantsBurnIn) {
       if (request.subtitles.externalUri.has_value()) {
         const std::optional<std::string> ext =
             localPathForUri(*request.subtitles.externalUri);
@@ -1384,10 +1434,11 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         }
         ++subOrdinal; // this stream is the (ordinal+1)-th subtitle stream
       }
+      } // wantsBurnIn (subtitle source resolution)
 
       // Timing offset: materialize a shifted copy before rendering
       // (spec §14: adjust subtitle timing — never silently ignored).
-      if (request.subtitles.timingOffsetMs != 0) {
+      if (wantsBurnIn && request.subtitles.timingOffsetMs != 0) {
         const std::filesystem::path outFs(params.outputPath);
         const std::string stem = outFs.stem().string();
         if (subGlobalIndex >= 0) {
@@ -1440,8 +1491,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         subPath = shifted;
       }
 
-      const FontSource fontSource = findFontSource();
-      if (fontSource.dir.empty()) {
+      const FontSource fontSource = wantsBurnIn ? findFontSource()
+                                                : FontSource{};
+      if (wantsBurnIn && fontSource.dir.empty()) {
         result.error = Error::make(
             ErrorCode::UnsupportedFeature,
             "no fonts directory found for subtitle rendering "
@@ -1508,29 +1560,63 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             "cannot constrain the subtitle filter output format", "ffmpeg");
         return result;
       }
-      std::string graphDesc =
-          "scale=w=" + std::to_string(outW) + ":h=" + std::to_string(outH) +
-          ",subtitles=filename='" + escapeFilterPath(subPath) +
-          "':fontsdir='" + escapeFilterPath(fontSource.dir) + "'";
-      if (subOrdinal >= 0) {
-        graphDesc += ":si=" + std::to_string(subOrdinal);
+      // Graph description: crop -> rotation -> flips -> scale, then the
+      // subtitles filter when burning in. Order matters: crop uses
+      // source-frame coordinates; rotation swaps dimensions; the scale
+      // lands on the encoder's (transform-aware) target geometry.
+      std::string graphDesc;
+      if (wantsCrop) {
+        const CropRect &crop = *request.video.crop;
+        graphDesc += "crop=w=" + std::to_string(baseW) +
+                     ":h=" + std::to_string(baseH) +
+                     ":x=" + std::to_string(crop.x) +
+                     ":y=" + std::to_string(crop.y) + ",";
+      }
+      switch (request.video.rotationDegrees) {
+        case 90:
+          graphDesc += "transpose=1,";
+          break;
+        case 180:
+          graphDesc += "transpose=1,transpose=1,";
+          break;
+        case 270:
+          graphDesc += "transpose=2,";
+          break;
+        default:
+          break;
+      }
+      if (request.video.flipHorizontal) {
+        graphDesc += "hflip,";
+      }
+      if (request.video.flipVertical) {
+        graphDesc += "vflip,";
+      }
+      graphDesc +=
+          "scale=w=" + std::to_string(outW) + ":h=" + std::to_string(outH);
+      if (wantsBurnIn) {
+        graphDesc += ",subtitles=filename='" + escapeFilterPath(subPath) +
+                     "':fontsdir='" + escapeFilterPath(fontSource.dir) + "'";
+        if (subOrdinal >= 0) {
+          graphDesc += ":si=" + std::to_string(subOrdinal);
+        }
       }
       // SRT-like sources render with libass's default style (family
       // "Arial"), which never matches the fontsdir contents on a provider-
       // less static build. Redirect the family to the discovered font so
       // text actually renders. ASS/SSA keep their authored styling.
       const bool subIsAss =
-          subGlobalIndex >= 0
-              ? (cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
-                     AV_CODEC_ID_ASS ||
-                 cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
-                     AV_CODEC_ID_SSA)
-              : (subPath.size() > 4 &&
-                 (subPath.compare(subPath.size() - 4, 4, ".ass") == 0 ||
-                  subPath.compare(subPath.size() - 4, 4, ".ssa") == 0 ||
-                  subPath.compare(subPath.size() - 4, 4, ".ASS") == 0 ||
-                  subPath.compare(subPath.size() - 4, 4, ".SSA") == 0));
-      if (!subIsAss && !fontSource.family.empty()) {
+          wantsBurnIn &&
+          (subGlobalIndex >= 0
+               ? (cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
+                      AV_CODEC_ID_ASS ||
+                  cleanup.in->streams[subGlobalIndex]->codecpar->codec_id ==
+                      AV_CODEC_ID_SSA)
+               : (subPath.size() > 4 &&
+                  (subPath.compare(subPath.size() - 4, 4, ".ass") == 0 ||
+                   subPath.compare(subPath.size() - 4, 4, ".ssa") == 0 ||
+                   subPath.compare(subPath.size() - 4, 4, ".ASS") == 0 ||
+                   subPath.compare(subPath.size() - 4, 4, ".SSA") == 0)));
+      if (subIsAss == false && wantsBurnIn && !fontSource.family.empty()) {
         graphDesc += ":force_style='FontName=" +
                      escapeFilterPath(fontSource.family) + "'";
       }
@@ -1611,6 +1697,25 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
 
     const char *encName = encoderNameFor(pipeline.audioCodec);
+    // PCM bit depth (spec §10): the user-selectable depth picks the exact
+    // PCM encoder variant; lossless codecs ignore it.
+    std::string pcmOverride;
+    if (pipeline.audioCodec == AudioCodec::Pcm &&
+        request.audio.pcmBitDepth.has_value()) {
+      switch (*request.audio.pcmBitDepth) {
+        case 24:
+          pcmOverride = "pcm_s24le";
+          break;
+        case 32:
+          pcmOverride = "pcm_s32le";
+          break;
+        default:
+          break; // 16-bit stays the default pcm_s16le mapping
+      }
+      if (!pcmOverride.empty()) {
+        encName = pcmOverride.c_str();
+      }
+    }
     const AVCodec *encCodec = encName != nullptr
                                   ? avcodec_find_encoder_by_name(encName)
                                   : nullptr;
@@ -1711,6 +1816,186 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                                  "cannot create audio resampler", "ffmpeg");
       av_frame_free(&videoFrame);
       return result;
+    }
+    cleanup.audioFifo = av_audio_fifo_alloc(
+        cleanup.audioEnc->sample_fmt,
+        cleanup.audioEnc->ch_layout.nb_channels, 1);
+    if (cleanup.audioFifo == nullptr) {
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "cannot create audio fifo", "ffmpeg");
+      av_frame_free(&videoFrame);
+      return result;
+    }
+
+    // Audio DSP chain (spec §10): gain -> fades -> loudness -> speed ->
+    // silence removal, applied between decode and the resampler. The sink
+    // is constrained to the DECODER's format/rate/layout so the existing
+    // swr configuration stays valid regardless of what the chain does
+    // internally (avfilter auto-inserts resampling where needed).
+    if (request.audio.gainDb.has_value() ||
+        request.audio.fadeInMs.has_value() ||
+        request.audio.fadeOutMs.has_value() ||
+        request.audio.normalizeLoudness ||
+        request.audio.playbackSpeed.has_value() ||
+        request.audio.removeSilence) {
+      const AVFilter *aSrc = avfilter_get_by_name("abuffer");
+      const AVFilter *aSink = avfilter_get_by_name("abuffersink");
+      cleanup.audioGraph = avfilter_graph_alloc();
+      if (aSrc == nullptr || aSink == nullptr ||
+          cleanup.audioGraph == nullptr) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "cannot allocate audio DSP graph",
+                                   "ffmpeg");
+        av_frame_free(&videoFrame);
+        return result;
+      }
+      const int decRate = cleanup.audioDec->sample_rate > 0
+                              ? cleanup.audioDec->sample_rate
+                              : 48000;
+      char layoutDesc[64];
+      if (av_channel_layout_describe(&cleanup.audioDec->ch_layout,
+                                     layoutDesc, sizeof(layoutDesc)) < 0) {
+        std::snprintf(layoutDesc, sizeof(layoutDesc), "stereo");
+      }
+      char aSrcArgs[256];
+      std::snprintf(aSrcArgs, sizeof(aSrcArgs),
+                    "time_base=1/%d:sample_rate=%d:sample_fmt=%s"
+                    ":channel_layout=%s",
+                    decRate, decRate,
+                    av_get_sample_fmt_name(static_cast<AVSampleFormat>(
+                        cleanup.audioDec->sample_fmt)),
+                    layoutDesc);
+      const int srcRc = avfilter_graph_create_filter(
+          &audioSrc, aSrc, "ain", aSrcArgs, nullptr, cleanup.audioGraph);
+      const int sinkRc =
+          srcRc >= 0
+              ? avfilter_graph_create_filter(&audioSink, aSink, "aout",
+                                             nullptr, nullptr,
+                                             cleanup.audioGraph)
+              : srcRc;
+      if (srcRc < 0 || sinkRc < 0) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot create audio DSP endpoints (" + std::string(aSrcArgs) +
+                ")",
+            "ffmpeg");
+        av_frame_free(&videoFrame);
+        return result;
+      }
+      // Pin the sink to the decoder's negotiated space.
+      const int sinkRates[] = {decRate, -1};
+      av_opt_set_bin(audioSink, "sample_rates",
+                     reinterpret_cast<const uint8_t *>(sinkRates),
+                     sizeof(sinkRates) - sizeof(sinkRates[0]),
+                     AV_OPT_SEARCH_CHILDREN);
+      const enum AVSampleFormat sinkFmts[] = {
+          static_cast<AVSampleFormat>(cleanup.audioDec->sample_fmt),
+          AV_SAMPLE_FMT_NONE};
+      av_opt_set_bin(audioSink, "sample_fmts",
+                     reinterpret_cast<const uint8_t *>(sinkFmts),
+                     sizeof(sinkFmts) - sizeof(sinkFmts[0]),
+                     AV_OPT_SEARCH_CHILDREN);
+      av_opt_set(audioSink, "ch_layouts", layoutDesc,
+                 AV_OPT_SEARCH_CHILDREN);
+
+      std::string desc;
+      if (request.audio.gainDb.has_value()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "volume=volume=%.2fdB:"
+                                        "precision=double,",
+                      *request.audio.gainDb);
+        desc += buf;
+      }
+      // Total audio span for fade positioning (trim window or source).
+      double spanSec = 0.0;
+      if (cleanup.in->duration != AV_NOPTS_VALUE &&
+          cleanup.in->duration > 0) {
+        spanSec = double(cleanup.in->duration) / double(AV_TIME_BASE);
+      }
+      // Window this range covers on the output timeline: segment-local for
+      // segmented runs, the whole output for single-pass. Fades position
+      // inside the window and fire only in the FIRST/LAST window (a
+      // fade-in repeating every 10 s segment would be wrong output, not a
+      // cosmetic issue).
+      const double windowSec =
+          rangeActive && rangeEndUs > rangeStartUs
+              ? double(rangeEndUs - rangeStartUs) / 1000000.0
+              : spanSec;
+      const bool firstWindow =
+          !rangeActive || rangeStartUs <= request.trim.startUs;
+      const bool lastWindow =
+          !rangeActive || request.trim.endUs < 0 ||
+          rangeEndUs >= request.trim.endUs;
+      if (request.audio.fadeInMs.has_value() && *request.audio.fadeInMs > 0 &&
+          firstWindow) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "afade=t=in:st=0:d=%.3f,",
+                      double(*request.audio.fadeInMs) / 1000.0);
+        desc += buf;
+      }
+      if (request.audio.fadeOutMs.has_value() && *request.audio.fadeOutMs > 0 &&
+          lastWindow && windowSec > 0.0) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+                      "afade=t=out:st=%.3f:d=%.3f,",
+                      std::max(0.0, windowSec -
+                                       double(*request.audio.fadeOutMs) /
+                                           1000.0),
+                      double(*request.audio.fadeOutMs) / 1000.0);
+        desc += buf;
+      }
+      if (request.audio.normalizeLoudness) {
+        desc += "loudnorm=I=-16:TP=-1.5:LRA=11,";
+      }
+      if (request.audio.playbackSpeed.has_value() &&
+          *request.audio.playbackSpeed > 0.0) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "atempo=%.4f,",
+                      *request.audio.playbackSpeed);
+        desc += buf;
+      }
+      if (request.audio.removeSilence) {
+        // Remove mid-stream silences longer than 100 ms below -45 dB,
+        // keeping 50 ms of each for natural transitions.
+        desc += "silenceremove=stop_periods=-1:stop_duration=0.1:"
+                "stop_threshold=-45dB:stop_silence=0.05,";
+      }
+      if (desc.empty()) {
+        desc = "anull";
+      } else {
+        desc.pop_back(); // trailing comma
+      }
+      AVFilterInOut *aOuts = avfilter_inout_alloc();
+      AVFilterInOut *aIns = avfilter_inout_alloc();
+      bool graphOk = aOuts != nullptr && aIns != nullptr;
+      if (graphOk) {
+        // Entry names MUST be "in"/"out": libavfilter matches unlabeled
+        // graph strings against these conventional labels (anything else
+        // leaves the abuffer unwired and graph_config fails).
+        aOuts->name = av_strdup("in");
+        aOuts->filter_ctx = audioSrc;
+        aOuts->pad_idx = 0;
+        aOuts->next = nullptr;
+        aIns->name = av_strdup("out");
+        aIns->filter_ctx = audioSink;
+        aIns->pad_idx = 0;
+        aIns->next = nullptr;
+        graphOk = avfilter_graph_parse_ptr(cleanup.audioGraph, desc.c_str(),
+                                           &aIns, &aOuts, nullptr) >= 0;
+      }
+      avfilter_inout_free(&aIns);
+      avfilter_inout_free(&aOuts);
+      if (graphOk) {
+        graphOk = avfilter_graph_config(cleanup.audioGraph, nullptr) >= 0;
+      }
+      if (!graphOk) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot initialize the audio DSP graph (" + desc + ")",
+            "ffmpeg");
+        av_frame_free(&videoFrame);
+        return result;
+      }
     }
   }
 
@@ -1884,6 +2169,130 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   };
 
   bool rangeDone = false; // crossed the range end; stop reading input
+  // Feeds the encoder from the fifo: only complete frame_size frames (the
+  // final drain allows a partial tail). PCM-style encoders (frame_size 0)
+  // consume whatever is available.
+  const auto feedEncoderFromFifo = [&](bool flush) {
+    if (cleanup.audioFifo == nullptr || cleanup.audioEnc == nullptr) {
+      return;
+    }
+    const int frameSize = cleanup.audioEnc->frame_size;
+    while (true) {
+      const int have = av_audio_fifo_size(cleanup.audioFifo);
+      int want = frameSize > 0 ? frameSize : have;
+      if (want <= 0) {
+        return;
+      }
+      if (have < want) {
+        if (!flush || have == 0) {
+          return; // wait for more input (or nothing left to flush)
+        }
+        want = have; // final partial frame
+      }
+      AVFrame *audioFrame = av_frame_alloc();
+      audioFrame->format = cleanup.audioEnc->sample_fmt;
+      audioFrame->sample_rate = cleanup.audioEnc->sample_rate;
+      av_channel_layout_copy(&audioFrame->ch_layout,
+                             &cleanup.audioEnc->ch_layout);
+      audioFrame->nb_samples = want;
+      if (av_frame_get_buffer(audioFrame, 0) < 0 ||
+          av_audio_fifo_read(cleanup.audioFifo,
+                             reinterpret_cast<void **>(audioFrame->data),
+                             want) < want) {
+        av_frame_free(&audioFrame);
+        return;
+      }
+      // Encoder time_base is 1/sample_rate: pts in output samples.
+      audioFrame->pts = audioSamplesOut;
+      audioSamplesOut += want;
+      if (avcodec_send_frame(cleanup.audioEnc, audioFrame) == 0) {
+        AVPacket *encPacket = av_packet_alloc();
+        while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+          encPacket->stream_index = audioOut;
+          av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                               cleanup.out->streams[audioOut]->time_base);
+          if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+            writeFailed = true;
+          }
+          av_packet_unref(encPacket);
+        }
+        av_packet_free(&encPacket);
+      }
+      av_frame_free(&audioFrame);
+      if (frameSize <= 0 || (flush && av_audio_fifo_size(cleanup.audioFifo) == 0)) {
+        return;
+      }
+    }
+  };
+  // Resamples one decoded (possibly DSP-filtered) frame into the fifo,
+  // then feeds the encoder whatever complete frames accumulated.
+  const auto encodeAudioFrame = [&](AVFrame *srcFrame) {
+    if (cleanup.swr == nullptr || cleanup.audioFifo == nullptr) {
+      return;
+    }
+    // Output capacity: the resampler's worst case for this input size.
+    const int maxOut =
+        swr_get_out_samples(cleanup.swr, srcFrame->nb_samples);
+    if (maxOut <= 0) {
+      return;
+    }
+    uint8_t **buffer = nullptr;
+    if (av_samples_alloc_array_and_samples(
+            &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels,
+            maxOut, cleanup.audioEnc->sample_fmt, 0) < 0 ||
+        buffer == nullptr) {
+      return;
+    }
+    const int converted = swr_convert(
+        cleanup.swr, buffer, maxOut,
+        const_cast<const uint8_t **>(srcFrame->data),
+        srcFrame->nb_samples);
+    if (converted > 0) {
+      if (av_audio_fifo_write(
+              cleanup.audioFifo, reinterpret_cast<void **>(buffer),
+              converted) < converted) {
+        writeFailed = true;
+      }
+    }
+    if (buffer != nullptr) {
+      av_freep(&buffer[0]);
+      av_freep(&buffer);
+    }
+    feedEncoderFromFifo(false);
+  };
+  // Pushes one decoded audio frame through the DSP graph when active and
+  // encodes every pulled output frame (the graph may emit multiple frames
+  // per input or none, e.g. after silence removal).
+  const auto processAudioFrame = [&](AVFrame *decoded) {
+    if (audioSrc != nullptr && audioSink != nullptr) {
+      if (av_buffersrc_add_frame_flags(audioSrc, decoded,
+                                       AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+        AVFrame *dsp = av_frame_alloc();
+        while (av_buffersink_get_frame(audioSink, dsp) >= 0) {
+          encodeAudioFrame(dsp);
+          av_frame_unref(dsp);
+        }
+        av_frame_free(&dsp);
+      }
+    } else {
+      encodeAudioFrame(decoded);
+    }
+  };
+  // Flushes the DSP graph's tail (atempo/loudnorm/silenceremove hold
+  // buffered samples) and encodes everything it emits.
+  const auto flushAudioGraph = [&]() {
+    if (audioSrc == nullptr || audioSink == nullptr) {
+      return;
+    }
+    if (av_buffersrc_add_frame(audioSrc, nullptr) >= 0) {
+      AVFrame *dsp = av_frame_alloc();
+      while (av_buffersink_get_frame(audioSink, dsp) >= 0) {
+        encodeAudioFrame(dsp);
+        av_frame_unref(dsp);
+      }
+      av_frame_free(&dsp);
+    }
+  };
   while (!writeFailed && !rangeDone &&
          av_read_frame(cleanup.in, cleanup.packet) >= 0) {
     if (params.cancel && params.cancel->isCancelled()) {
@@ -2076,46 +2485,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
               break;
             }
           }
-          const int maxOutSamples =
-              cleanup.audioEnc->frame_size > 0
-                  ? cleanup.audioEnc->frame_size
-                  : cleanup.frame->nb_samples;
-          AVFrame *audioFrame = av_frame_alloc();
-          audioFrame->format = cleanup.audioEnc->sample_fmt;
-          audioFrame->sample_rate = cleanup.audioEnc->sample_rate;
-          av_channel_layout_copy(&audioFrame->ch_layout,
-                                 &cleanup.audioEnc->ch_layout);
-          audioFrame->nb_samples = maxOutSamples;
-          if (av_frame_get_buffer(audioFrame, 0) < 0) {
-            av_frame_free(&audioFrame);
-            av_frame_unref(cleanup.frame);
-            continue;
-          }
-          const int converted = swr_convert(
-              cleanup.swr, audioFrame->data, maxOutSamples,
-              const_cast<const uint8_t **>(cleanup.frame->data),
-              cleanup.frame->nb_samples);
-          if (converted > 0) {
-            audioFrame->nb_samples = converted;
-            // Encoder time_base is 1/sample_rate: pts in output samples.
-            audioFrame->pts = audioSamplesOut;
-            audioSamplesOut += converted;
-            if (avcodec_send_frame(cleanup.audioEnc, audioFrame) == 0) {
-              AVPacket *encPacket = av_packet_alloc();
-              while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
-                encPacket->stream_index = audioOut;
-                av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
-                                     cleanup.out->streams[audioOut]->time_base);
-                if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
-                  writeFailed = true;
-                }
-                av_packet_unref(encPacket);
-              }
-              av_packet_free(&encPacket);
-            }
-          }
-          (void)0; /* input sample counting not needed: pts follows output samples */
-          av_frame_free(&audioFrame);
+          processAudioFrame(cleanup.frame);
           av_frame_unref(cleanup.frame);
         }
       }
@@ -2195,6 +2565,38 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   }
 
   drainVideoEncoder();
+  // Flush the DSP graph's tail BEFORE the encoder drain: atempo/loudnorm/
+  // silenceremove hold buffered samples that must still be encoded.
+  flushAudioGraph();
+  // Drain the resampler's own delay into the fifo, then encode the final
+  // (possibly partial) frame. Only after that may the encoder be flushed.
+  if (cleanup.swr != nullptr && cleanup.audioFifo != nullptr) {
+    while (true) {
+      const int estimate = swr_get_out_samples(cleanup.swr, 0);
+      if (estimate <= 0) {
+        break;
+      }
+      uint8_t **buffer = nullptr;
+      if (av_samples_alloc_array_and_samples(
+              &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels,
+              estimate, cleanup.audioEnc->sample_fmt, 0) < 0 ||
+          buffer == nullptr) {
+        break;
+      }
+      const int converted =
+          swr_convert(cleanup.swr, buffer, estimate, nullptr, 0);
+      if (converted > 0) {
+        av_audio_fifo_write(cleanup.audioFifo,
+                            reinterpret_cast<void **>(buffer), converted);
+      }
+      av_freep(&buffer[0]);
+      av_freep(&buffer);
+      if (converted <= 0) {
+        break;
+      }
+    }
+  }
+  feedEncoderFromFifo(true);
   drainAudioEncoder();
   if (!writeFailed) {
     av_write_trailer(cleanup.out);
@@ -2606,6 +3008,9 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   caps.videoScaling = true;
   caps.timeTrim = true;
   caps.audioResampling = true;
+  // The audio DSP chain (gain/fades/loudnorm/atempo/silenceremove) runs as
+  // a libavfilter graph between decode and the resampler.
+  caps.audioDsp = true;
   caps.subtitlePassthrough = true;
   caps.subtitleBurnIn = true;
   // Extraction: text formats copy to sidecars natively; container-internal

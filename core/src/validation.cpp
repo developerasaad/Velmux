@@ -40,9 +40,9 @@ bool containerFamilyMatches(Container expected, Container observed) {
       return true;
     }
     const bool aIso = a == Container::Mp4 || a == Container::M4v ||
-                      a == Container::Mov;
+                      a == Container::Mov || a == Container::M4a;
     const bool bIso = b == Container::Mp4 || b == Container::M4v ||
-                      b == Container::Mov;
+                      b == Container::Mov || b == Container::M4a;
     if (aIso && bIso) {
       return true;
     }
