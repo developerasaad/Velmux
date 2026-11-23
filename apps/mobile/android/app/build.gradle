@@ -88,10 +88,19 @@ android {
         // The pinned FFmpeg artifacts (tools/ffmpeg-builder/build-android.sh)
         // cover exactly these ABIs. Without the filter the NDK default set
         // would also build 32-bit x86, silently shipping an engine without
-        // the FFmpeg backend there.
+        // the FFmpeg backend there. -PvelmuxAbis=x86_64 narrows the set for
+        // the emulator CI (only the device's ABI is exercised there, which
+        // cuts the native build to a third); the default stays the full set.
+        def velmuxAbiList = (project.findProperty('velmuxAbis')
+            ?: 'armeabi-v7a,arm64-v8a,x86_64').split(',').collect { it.trim() }
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
+            abiFilters velmuxAbiList
         }
+        // The instrumented tests are JUnit4 (@RunWith(AndroidJUnit4)). AGP's
+        // default runner (android.test.InstrumentationTestRunner) cannot
+        // discover them and connectedDebugAndroidTest would report an empty
+        // test run, so point it at the androidx runner explicitly.
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnit4Runner"
         externalNativeBuild {
             cmake {
                 arguments "-DVELMUX_FFMPEG_ANDROID_PREFIX=${project.findProperty('velmuxFFmpegPrefix') ?: ''}"
