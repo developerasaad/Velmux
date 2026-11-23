@@ -1036,7 +1036,7 @@ TEST_CASE("REAL sample generation: representative window, requested settings") {
 
   const Result<SampleResult> sample = env.engine->generateSample(
       transcodeRequest(mixed, Container::WebM, VideoCodec::VP9,
-                       AudioCodec::Aac),
+                       AudioCodec::Opus),
       1);
   INFO("sample error: " << sample.error().message);
   REQUIRE(sample.ok());
