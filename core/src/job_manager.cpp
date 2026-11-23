@@ -886,10 +886,13 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   expect.container = record.pipeline.container;
   if (!record.pipeline.sidecarExtension.empty()) {
     // Extraction job: the artifact is a text sidecar; validate cues.
+    // The container-oriented 1 KiB floor would reject valid short
+    // sidecars (a two-cue SRT is ~100 bytes); one cue line is the floor.
     expect.subtitleSidecar = true;
     expect.expectVideo = false;
     expect.expectAudio = false;
     expect.expectedDurationSec = 0.0;
+    expect.minimumBytes = 32;
   } else if (record.request.video.enabled) {
     expect.videoCodec = record.pipeline.videoCodec;
     if (!record.sourceInfo.video.empty()) {
