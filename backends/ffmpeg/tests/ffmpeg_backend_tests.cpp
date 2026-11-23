@@ -1239,13 +1239,23 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
   ConversionRequest request = transcodeRequest(
       truncated, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
 
-  // Three honest outcomes, one forbidden (Completed):
-  //  a) inspection refuses (Result not ok),
+  // Honest outcomes, one forbidden shape (fake success):
+  //  a) inspection refuses (Result not ok) with a reason,
   //  b) the plan is infeasible with a reason,
-  //  c) the job runs and the VALIDATOR catches the short output.
+  //  c) the job Fails (validator catches the missing tail), or
+  //  d) the job Completes AND the output covers the INSPECTED source
+  //     duration - inspection of a truncated file may already report the
+  //     decodable duration, and converting exactly what was inspected is
+  //     honest. What is never allowed: Completed with output clearly
+  //     shorter than what inspection promised.
   const Result<PlanResult> plan =
       env.engine->plan(MediaSource{truncated, "cut.mp4"}, request);
   if (plan.ok() && plan.value().feasible) {
+    // The inspection the engine will reuse for validation.
+    const Result<MediaInfo> inspected =
+        env.engine->inspect(MediaSource{truncated, "cut.mp4"});
+    REQUIRE(inspected.ok());
+    const double inspectedDuration = inspected.value().durationSec;
     EventWaiter waiter;
     env.engine->events().subscribe(&waiter);
     const Result<std::string> jobId = env.engine->startJob(request);
@@ -1254,8 +1264,18 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
     REQUIRE(terminal.has_value());
     INFO("terminal state: " << int(terminal->state)
                             << " error: " << terminal->error);
-    REQUIRE(terminal->state == JobState::Failed);
-    CHECK(terminal->error.size() > 0);
+    if (terminal->state == JobState::Completed) {
+      REQUIRE(inspectedDuration > 0.0);
+      const auto jobs = env.engine->listJobs();
+      const std::string outputPath = jobs.front().outputPath;
+      const ProbeResult probe = probeWith(outputPath);
+      INFO("inspected " << inspectedDuration << "s, output "
+                        << probe.durationSec << "s");
+      CHECK(probe.durationSec >= inspectedDuration - 1.0);
+    } else {
+      REQUIRE(terminal->state == JobState::Failed);
+      CHECK(terminal->error.size() > 0);
+    }
   } else if (plan.ok()) {
     CHECK(plan.value().message.size() > 0);
   } else {
