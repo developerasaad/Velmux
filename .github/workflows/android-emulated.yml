@@ -1,16 +1,25 @@
-# Real-emulator validation of the Android instrumented tests: the engine's
-# C++ core runs behind the same JNI facade the React Native app uses, with
-# the Android MediaCodec backend only (no FFmpeg prefix), converting real
-# media on API 29 (the product floor, docs/DECISIONS.md D-003) and API 34
-# AOSP emulators.
+# Android instrumented tests on real emulators (Milestone 1/13 validation).
 #
-# The emulator is provisioned manually (cmdline-tools + sdkmanager +
-# avdmanager + emulator CLI) so the whole pipeline stays first-party and
-# cacheable; no third-party emulator actions.
+# The instrumented suite in apps/mobile runs REAL MediaCodec conversions
+# through the engine's JNI facade against fixtures generated on-device by
+# real encoders, and validates outputs with an independent MediaExtractor
+# probe. This workflow is the first time those tests actually execute:
+# API 29 (the product floor) and a modern API level, both x86_64 AOSP.
+#
+# The build runs WITHOUT the FFmpeg artifacts on purpose: these tests
+# validate the native Android backend (MediaCodec/MediaExtractor/
+# MediaMuxer). The FFmpeg path is validated on the host runner by core.yml.
 name: Android emulated
 
 on:
   push:
+    paths:
+      - apps/**
+      - core/**
+      - backends/**
+      - bridge/**
+      - .github/workflows/android-emulated.yml
+  pull_request:
     paths:
       - apps/**
       - core/**
@@ -36,15 +45,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # minSdk 29 is the product floor; 34 is the modern baseline.
-          # `default` = AOSP images; the tests need no Google APIs.
           - api-level: 29
-            system-image: system-images;android-29;default;x86_64
+            # Product floor: Android 10 / API 29 (docs/DECISIONS.md D-003).
+            image: system-images;android-29;default;x86_64
           - api-level: 34
-            system-image: system-images;android-34;default;x86_64
+            image: system-images;android-34;default;x86_64
+    env:
+      ANDROID_AVD_HOME: /home/runner/.android/avd
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+
+      - name: Show KVM availability
+        run: |
+          echo "KVM device:"; ls -l /dev/kvm || true
+          egrep -c '(vmx|svm)' /proc/cpuinfo || true
+
+      - name: Install emulator runtime libraries
+        run: |
+          sudo apt-get update
+          # ubuntu-24.04: libasound2 is a transitional name for
+          # libasound2t64; the headless emulator links both it and Pulse.
+          sudo apt-get install -y libpulse0 libasound2t64 || \
+            sudo apt-get install -y libpulse0 libasound2
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -63,140 +86,124 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      # Gradle dependency and wrapper caching is enabled by default here.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Install emulator host packages
+      - name: Locate Android SDK tools
+        id: sdk
         run: |
-          sudo apt-get update -qq
-          # libX11/libxcb: the emulator (QEMU frontend) links against them
-          # even with -no-window. libpulse0/libnss3 are pulled in by the
-          # emulator's audio/metrics components; on ubuntu-24.04 (noble)
-          # ALSA is packaged as libasound2t64 (libasound2 on older images)
-          # - install whichever name resolves.
-          sudo apt-get install -y libx11-6 libxcb1 libpulse0 libnss3
-          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
-          # KVM hardware acceleration is what makes a headless emulator
-          # viable on the runner; fail loudly if it is unavailable.
-          test -e /dev/kvm || {
-            echo "::error::/dev/kvm is missing on this runner"
-            exit 1
-          }
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "sdk=$SDK" >> "$GITHUB_OUTPUT"
+          ls "$SDK"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -1)
+          fi
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+          "$SDKMANAGER" --version
 
-      # The SDK lives in $HOME/android-sdk (never the runner's preinstalled
-      # tree) so every byte below is owned by this workflow and cacheable.
-      # Shared pieces (cmdline-tools, emulator, platform/build pieces, NDK)
-      # are keyed on the pinned tool versions; the system image is keyed on
-      # the API level because that is the only per-matrix difference.
-      - name: Cache shared Android SDK pieces
-        uses: actions/cache@v4
+      - name: Restore emulator and system image cache
+        id: emu-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
-            ~/android-sdk/cmdline-tools
-            ~/android-sdk/platform-tools
-            ~/android-sdk/emulator
-            ~/android-sdk/platforms
-            ~/android-sdk/build-tools
-            ~/android-sdk/ndk
-            ~/android-sdk/cmake
-            ~/android-sdk/licenses
-          # Mirrors the pins in apps/mobile/android (build.gradle ext +
-          # app/build.gradle): platform 37.0, build-tools 37.0.0,
-          # NDK 27.1.12297006, CMake 3.22.1. Bump when those pins change.
-          key: velmux-android-sdk-37.0_37.0.0_27.1.12297006_3.22.1
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/system-images/android-${{ matrix.api-level }}
+          key: android-emu-v1-${{ matrix.api-level }}-${{ runner.os }}
 
-      - name: Cache emulator system image (API ${{ matrix.api-level }})
-        uses: actions/cache@v4
+      - name: Install emulator and system image
+        env:
+          SDKMANAGER: ${{ steps.sdk.outputs.sdkmanager }}
+        run: |
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "emulator" "platform-tools" "${{ matrix.image }}" > /dev/null
+
+      - name: Save emulator and system image cache
+        if: steps.emu-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
         with:
-          path: ~/android-sdk/system-images
-          key: velmux-android-sysimg-${{ matrix.api-level }}
+          path: |
+            /usr/local/lib/android/sdk/emulator
+            /usr/local/lib/android/sdk/system-images/android-${{ matrix.api-level }}
+          key: android-emu-v1-${{ matrix.api-level }}-${{ runner.os }}
 
-      - name: Install Android cmdline-tools
-        run: |
-          SDK="$HOME/android-sdk"
-          if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            mkdir -p "$SDK/cmdline-tools"
-            curl -sS -o /tmp/cmdline-tools.zip \
-              https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
-            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
-            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-          fi
-          # Every later step (Gradle/AGP included) must see this SDK, not
-          # the runner's preinstalled one.
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/emulator" >> "$GITHUB_PATH"
+      - name: Restore NDK cache
+        id: ndk-cache
+        uses: actions/cache/restore@v4
+        with:
+          # Matched to apps/mobile/android/build.gradle ext.ndkVersion; the
+          # engine's CMake build needs it and AGP auto-installs on miss.
+          path: /usr/local/lib/android/sdk/ndk/27.1.12297006
+          key: android-ndk-27.1.12297006-${{ runner.os }}
 
-      - name: Install SDK packages
+      - name: Create AVD
         run: |
-          SDK="$HOME/android-sdk"
-          yes | sdkmanager --sdk_root="$SDK" --licenses > /dev/null
-          # platform/build-tools/NDK/CMake mirror the Gradle pins so the
-          # build never needs to auto-download anything; sdkmanager is a
-          # no-op for pieces already restored from cache.
-          sdkmanager --sdk_root="$SDK" \
-            "platform-tools" \
-            "emulator" \
-            "platforms;android-37.0" \
-            "build-tools;37.0.0" \
-            "ndk;27.1.12297006" \
-            "cmake;3.22.1" \
-            "${{ matrix.system-image }}"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/avdmanager \
+            create avd \
+            --name velmux-api${{ matrix.api-level }} \
+            --package "${{ matrix.image }}" \
+            --sdcard 2048M \
+            --force
+          # Keep the emulator from trying to load a heavy default profile.
+          cat >> "$ANDROID_AVD_HOME/velmux-api${{ matrix.api-level }}.avd/config.ini" <<EOF
+          hw.ramSize=3072
+          hw.lcd.density=240
+          hw.lcd.width=720
+          hw.lcd.height=1280
+          disk.dataPartition.size=6G
+          EOF
 
-      - name: Create Android Virtual Device
+      - name: Boot emulator
+        timeout-minutes: 15
         run: |
-          echo no | avdmanager create avd \
-            --name velmux-ci \
-            --package "${{ matrix.system-image }}" \
-            --device pixel_4
-
-      - name: Boot the emulator
-        run: |
-          # Output MUST be redirected away from the step's pipes so the
-          # background emulator survives into later steps.
-          emulator -avd velmux-ci \
+          export PATH="/usr/local/lib/android/sdk/emulator:/usr/local/lib/android/sdk/platform-tools:$PATH"
+          nohup emulator -avd velmux-api${{ matrix.api-level }} \
             -no-window -no-audio -no-boot-anim -no-snapshot \
-            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
-          # Generous cold-boot budget: AOSP images can boot slowly.
-          timeout 600 adb wait-for-device shell \
-            'while [ -z "$(getprop sys.boot_completed)" ]; do sleep 1; done'
-          adb devices -l
-          # Let package manager settle before the first APK install.
+            -gpu swiftshader_indirect -accel on \
+            > /tmp/emulator.log 2>&1 &
+          adb wait-for-device
+          timeout 540 adb shell 'while [ -z "$(getprop sys.boot_completed)" ]; do sleep 2; done'
+          # Some system services settle slightly after boot_completed.
           sleep 10
-
-      - name: Build and install the debug app (Android backend only)
-        working-directory: apps/mobile/android
-        run: |
-          # Deliberately NO -PvelmuxFFmpegPrefix: these tests validate the
-          # Android MediaCodec backend on its own. Only the emulator's ABI
-          # is built (-PvelmuxAbis=x86_64) to keep the native build fast.
-          ./gradlew installDebug --stacktrace \
-            -PvelmuxAbis=x86_64 -PreactNativeArchitectures=x86_64
+          adb shell getprop sys.boot_completed
+          adb devices -l
 
       - name: Run instrumented tests
         working-directory: apps/mobile/android
         run: |
-          ./gradlew connectedDebugAndroidTest --stacktrace \
-            -PvelmuxAbis=x86_64 -PreactNativeArchitectures=x86_64
+          export PATH="/usr/local/lib/android/sdk/platform-tools:$PATH"
+          # Disable animations for stable instrumentation timing.
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace
 
-      # Diagnostics for any failure: device logcat, emulator stdout and the
-      # instrumented-test XML reports.
-      - name: Collect failure diagnostics
+      - name: Save NDK cache
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /usr/local/lib/android/sdk/ndk/27.1.12297006
+          key: android-ndk-27.1.12297006-${{ runner.os }}
+
+      - name: Collect diagnostics on failure
         if: failure()
         run: |
-          mkdir -p /tmp/velmux-diagnostics
-          adb logcat -d > /tmp/velmux-diagnostics/logcat.txt 2>/dev/null || true
-          cp /tmp/emulator.log /tmp/velmux-diagnostics/ 2>/dev/null || true
-          cp -r apps/mobile/android/app/build/outputs/androidTest-results \
-            /tmp/velmux-diagnostics/ 2>/dev/null || true
+          export PATH="/usr/local/lib/android/sdk/platform-tools:$PATH"
+          mkdir -p /tmp/diag
+          adb bugreport /tmp/diag/bugreport.zip > /dev/null 2>&1 || true
+          cp /tmp/emulator.log /tmp/diag/ 2>/dev/null || true
 
-      - name: Upload failure diagnostics
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: velmux-emulated-diagnostics-api${{ matrix.api-level }}
-          path: /tmp/velmux-diagnostics
+          name: velmux-android-emulated-api${{ matrix.api-level }}-diag
+          path: |
+            /tmp/diag
+            apps/mobile/android/app/build/outputs/androidTest-results/
+            apps/mobile/android/app/build/reports/
           if-no-files-found: ignore
+          retention-days: 7
