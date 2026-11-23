@@ -85,6 +85,13 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        // The pinned FFmpeg artifacts (tools/ffmpeg-builder/build-android.sh)
+        // cover exactly these ABIs. Without the filter the NDK default set
+        // would also build 32-bit x86, silently shipping an engine without
+        // the FFmpeg backend there.
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
+        }
         externalNativeBuild {
             cmake {
                 arguments "-DVELMUX_FFMPEG_ANDROID_PREFIX=${project.findProperty('velmuxFFmpegPrefix') ?: ''}"

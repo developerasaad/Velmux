@@ -99,6 +99,12 @@ else()
 endif()
 
 if(VELMUX_FFMPEG_FOUND)
+  # The queries below need the pkg-config executable. It is NOT guaranteed
+  # to be discovered implicitly: find_package(SQLite3) happens to define
+  # PKG_CONFIG_EXECUTABLE as a side effect on host builds, but embedded-
+  # SQLite targets (Android NDK) never call it, which silently disabled the
+  # backend even with a valid prefix. Resolve it explicitly.
+  find_package(PkgConfig REQUIRED)
   # Resolve flags once at configure time. Static linking of the Velmux-built
   # FFmpeg needs --static so the pinned external codec libs come along.
   set(_pc_env "PKG_CONFIG_PATH=${VELMUX_FFMPEG_PC_PATH}:$ENV{PKG_CONFIG_PATH}")

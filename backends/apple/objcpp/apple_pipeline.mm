@@ -127,6 +127,41 @@ bool cancelled(const RunContext &ctx) {
   return ctx.shouldContinue && !ctx.shouldContinue();
 }
 
+// Hardware-encode probing must be portable across every Apple target: the
+// macOS-only VTIsHardwareEncodeSupported does not exist in iOS SDKs at all.
+// The public cross-platform probe is VTCopyVideoEncoderList combined with
+// the hardware-accelerated key (function: macOS 10.8 / iOS 8+; key:
+// macOS 10.14 / iOS 13+ — both older than every Velmux deployment target).
+bool hardwareEncodeSupported(FourCharCode codec) {
+  CFArrayRef encoders = nullptr;
+  if (VTCopyVideoEncoderList(nullptr, &encoders) != noErr ||
+      encoders == nullptr) {
+    return false;
+  }
+  bool hardware = false;
+  const CFIndex count = CFArrayGetCount(encoders);
+  for (CFIndex i = 0; i < count && !hardware; ++i) {
+    const CFDictionaryRef entry =
+        static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(encoders, i));
+    const void *type =
+        CFDictionaryGetValue(entry, kVTVideoEncoderList_CodecType);
+    if (type == nullptr) {
+      continue;
+    }
+    int64_t listed = 0;
+    if (CFNumberGetValue(static_cast<CFNumberRef>(type),
+                         kCFNumberSInt64Type, &listed) &&
+        static_cast<FourCharCode>(listed) == codec) {
+      const void *flag = CFDictionaryGetValue(
+          entry, kVTVideoEncoderList_IsHardwareAccelerated);
+      hardware = flag != nullptr &&
+                 CFEqual(static_cast<CFTypeRef>(flag), kCFBooleanTrue);
+    }
+  }
+  CFRelease(encoders);
+  return hardware;
+}
+
 void reportProgress(const RunContext &ctx, double fraction) {
   if (ctx.onProgress) {
     ctx.onProgress(fraction);
@@ -180,20 +215,21 @@ bool enumerateSupport(NativeSupport &out) {
     out.audio.push_back({codec, CodecEntry{decode, encode, false}});
   };
 
-  // VideoToolbox hardware queries. Software fallbacks exist for H.264 and
-  // HEVC on all supported OS versions, so encode support is always true
-  // for those; the hardware bit is what the probe answers.
-  const bool hw264 =
-      VTIsHardwareEncodeSupported(kCMVideoCodecType_H264);
-  const bool hw265 =
-      VTIsHardwareEncodeSupported(kCMVideoCodecType_HEVC);
+  // VideoToolbox encode support: software fallbacks exist for H.264 and
+  // HEVC on all supported OS versions, so encode support is always true for
+  // those; the hardware bit comes from the portable encoder-list probe.
+  const bool hw264 = hardwareEncodeSupported(kCMVideoCodecType_H264);
+  const bool hw265 = hardwareEncodeSupported(kCMVideoCodecType_HEVC);
   addVideo(VideoCodec::H264, true, true, hw264);
   addVideo(VideoCodec::HEVC, true, true, hw265);
   const bool hwProRes =
-      VTIsHardwareEncodeSupported(kCMVideoCodecType_ProRes422);
+      hardwareEncodeSupported(kCMVideoCodecType_ProRes422);
   addVideo(VideoCodec::ProRes, true, true, hwProRes);
-  // VP9 decode availability is hardware-dependent and not exposed through
-  // a portable public probe; not reported rather than guessed.
+  // VP9: hardware decode is publicly probeable on every Velmux Apple target
+  // (VTIsHardwareDecodeSupported: macOS 10.13 / iOS 11+). VideoToolbox has
+  // no VP9 encoder, so this stays decode-only either way.
+  addVideo(VideoCodec::VP9,
+           VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9), false, false);
   // Audio: AudioToolbox software encoders, available everywhere.
   addAudio(AudioCodec::Aac, true, true);
   addAudio(AudioCodec::HeAac, true, false);
@@ -614,7 +650,20 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     return result;
   }
   [writer startWriting];
-  [writer startSessionAtSourceTime:asset.startTime];
+  // AVAsset.startTime does not exist on iOS, so the session starts at the
+  // earliest track start actually being read; local files are zero-based,
+  // but sources with nonzero track offsets must not gain a leading gap.
+  CMTime sessionStart = kCMTimeZero;
+  if (videoTrack != nil) {
+    sessionStart = videoTrack.timeRange.start;
+  }
+  if (audioTrack != nil) {
+    sessionStart = (videoTrack != nil)
+                       ? CMTimeMinimum(sessionStart,
+                                       audioTrack.timeRange.start)
+                       : audioTrack.timeRange.start;
+  }
+  [writer startSessionAtSourceTime:sessionStart];
 
   // ---- Drive the pipeline ------------------------------------------------------
   __block BOOL videoDone = !wantVideo;
@@ -708,7 +757,28 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     }
     [NSThread sleepForTimeInterval:0.005];
   }
-  if (![writer finishWriting]) {
+  // The synchronous -finishWriting is deprecated; the completion-handler
+  // form is the API present in every current SDK. Finalization is not
+  // cancellable mid-flush — wait for it so the file is never left
+  // half-finalized by our own teardown.
+  __block BOOL writeSucceeded = NO;
+  dispatch_semaphore_t writeSema = dispatch_semaphore_create(0);
+  [writer finishWritingWithCompletionHandler:^{
+    writeSucceeded = (writer.status == AVAssetWriterStatusCompleted);
+    dispatch_semaphore_signal(writeSema);
+  }];
+  for (;;) {
+    if (dispatch_semaphore_wait(
+            writeSema, dispatch_time(DISPATCH_TIME_NOW,
+                                     100 * NSEC_PER_MSEC)) == 0) {
+      break;
+    }
+    if (cancelled(ctx)) {
+      dispatch_semaphore_wait(writeSema, DISPATCH_TIME_FOREVER);
+      break;
+    }
+  }
+  if (!writeSucceeded) {
     result.error = writer.error != nil
                        ? writer.error.localizedDescription.UTF8String
                        : "finishing the output failed";

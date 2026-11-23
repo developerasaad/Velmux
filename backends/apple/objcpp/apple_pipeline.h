@@ -37,7 +37,11 @@ struct NativeSupport {
   std::string summary; // human-readable implementation label
 };
 
-// Probes VideoToolbox for real decode/encode support (VTIsHardware*).
+// Probes VideoToolbox for real decode/encode support. Hardware-encode info
+// comes from VTCopyVideoEncoderList (portable: iOS 8+/macOS 10.8+), hardware
+// decode from VTIsHardwareDecodeSupported (iOS 11+/macOS 10.13+); the
+// macOS-only VTIsHardwareEncodeSupported is never referenced because iOS
+// SDKs do not declare it.
 // Returns false off Apple platforms (never fabricated).
 bool enumerateSupport(NativeSupport &out);
 
