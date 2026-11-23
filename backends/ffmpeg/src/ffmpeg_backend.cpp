@@ -231,9 +231,241 @@ bool isBurnableSubtitleCodec(AVCodecID id) {
     case AV_CODEC_ID_TEXT:
       return true;
     default:
-      return false; // PGS/DVB/VobSub are bitmap formats (libass cannot)
+      return false; // handled by the bitmap path below when applicable
   }
 }
+
+// Bitmap subtitle codec ids decodable into AVSubtitle pict rects and
+// composited through the overlay-based burn-in path.
+bool isBitmapSubtitleCodec(AVCodecID id) {
+  switch (id) {
+    case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+    case AV_CODEC_ID_DVB_SUBTITLE:
+    case AV_CODEC_ID_DVD_SUBTITLE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// One pre-decoded bitmap cue: an overlay frame (YUVA420P, full output
+// geometry, alpha 0 = transparent outside the rects) valid for
+// [startUs, endUs) on the source timeline.
+struct BitmapCue {
+  std::int64_t startUs = 0;
+  std::int64_t endUs = 0;
+  AVFrame *overlay = nullptr; // owned by the vector's owner
+};
+
+// Composites one decoded subtitle's rects into a full-geometry YUVA frame.
+// Rect positions/sizes map linearly from the source video size to the
+// output geometry (burn-in may downscale; transforms are refused earlier).
+bool compositeSubtitleRects(const AVSubtitle &sub, std::int32_t srcW,
+                            std::int32_t srcH, std::int32_t outW,
+                            std::int32_t outH, AVFrame *frame) {
+  const double sx = double(outW) / double(std::max(srcW, 1));
+  const double sy = double(outH) / double(std::max(srcH, 1));
+  for (unsigned r = 0; r < sub.num_rects; ++r) {
+    const AVSubtitleRect *rect = sub.rects[r];
+    if (rect->type != SUBTITLE_BITMAP || rect->w <= 0 || rect->h <= 0 ||
+        rect->data[0] == nullptr || rect->data[1] == nullptr) {
+      continue;
+    }
+    const std::int32_t rw = std::max(2, std::int32_t(rect->w * sx) & ~1);
+    const std::int32_t rh = std::max(2, std::int32_t(rect->h * sy) & ~1);
+    const std::int32_t rx =
+        std::clamp(std::int32_t(rect->x * sx), 0, std::max(0, outW - rw));
+    const std::int32_t ry =
+        std::clamp(std::int32_t(rect->y * sy), 0, std::max(0, outH - rh));
+    // PAL8 (indices + palette) -> YUVA420P directly into the sub-region.
+    SwsContext *sws = sws_getContext(
+        rect->w, rect->h, AV_PIX_FMT_PAL8, rw, rh, AV_PIX_FMT_YUVA420P,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (sws == nullptr) {
+      return false;
+    }
+    const uint8_t *srcSlice[4] = {rect->data[0], rect->data[1], nullptr,
+                                  nullptr};
+    const int srcStride[4] = {rect->linesize[0], 0, 0, 0};
+    // Per-plane destination offsets for the sub-region (Y, U, V, A).
+    uint8_t *dst[4] = {
+        frame->data[0] + std::size_t(ry) * frame->linesize[0] + rx,
+        frame->data[1] + std::size_t(ry / 2) * frame->linesize[1] + rx / 2,
+        frame->data[2] + std::size_t(ry / 2) * frame->linesize[2] + rx / 2,
+        frame->data[3] + std::size_t(ry) * frame->linesize[3] + rx,
+    };
+    const int dstStride[4] = {frame->linesize[0], frame->linesize[1],
+                              frame->linesize[2], frame->linesize[3]};
+    sws_scale(sws, srcSlice, srcStride, 0, rect->h, dst, dstStride);
+    sws_freeContext(sws);
+  }
+  return true;
+}
+
+// Pre-decodes every bitmap cue of a subtitle stream (embedded in the
+// source, or a standalone external file: .sup, .idx/.sub, ...) into
+// full-geometry overlay frames. Bitmap burn-in composites these through
+// the overlay filter: libass cannot render them.
+class BitmapCueLoader {
+public:
+  ~BitmapCueLoader() {
+    for (auto &cue : cues_) {
+      if (cue.overlay != nullptr) {
+        av_frame_free(&cue.overlay);
+      }
+    }
+  }
+
+  // Returns false with a reason on failure. `durationUs` bounds the last
+  // open cue (PGS cues end at the NEXT cue; a trailing one would else
+  // never end).
+  bool load(const std::string &path, std::int32_t srcW, std::int32_t srcH,
+            std::int32_t outW, std::int32_t outH, std::int64_t durationUs,
+            std::int64_t offsetMs, std::string &reason) {
+    AVFormatContext *in = nullptr;
+    if (avformat_open_input(&in, path.c_str(), nullptr, nullptr) < 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      if (in != nullptr) {
+        AVFormatContext *ctx = in;
+        avformat_close_input(&ctx);
+      }
+      reason = "cannot open the bitmap subtitle source";
+      return false;
+    }
+    int subStream = -1;
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+        subStream = int(i);
+        break;
+      }
+    }
+    if (subStream < 0) {
+      avformat_close_input(&in);
+      reason = "the source has no subtitle track";
+      return false;
+    }
+    const AVCodecID cid = in->streams[subStream]->codecpar->codec_id;
+    if (!isBitmapSubtitleCodec(cid)) {
+      avformat_close_input(&in);
+      reason = std::string("codec ") + avcodec_get_name(cid) +
+               " is not a bitmap subtitle format";
+      return false;
+    }
+    const AVCodec *dec = avcodec_find_decoder(cid);
+    AVCodecContext *decCtx = dec != nullptr ? avcodec_alloc_context3(dec)
+                                            : nullptr;
+    if (decCtx == nullptr ||
+        avcodec_parameters_to_context(decCtx,
+                                      in->streams[subStream]->codecpar) < 0 ||
+        avcodec_open2(decCtx, dec, nullptr) < 0) {
+      if (decCtx != nullptr) {
+        avcodec_free_context(&decCtx);
+      }
+      avformat_close_input(&in);
+      reason = "cannot open the bitmap subtitle decoder";
+      return false;
+    }
+    const AVRational subTb = in->streams[subStream]->time_base;
+    const std::int64_t offsetUs = offsetMs * 1000;
+    AVPacket *pkt = av_packet_alloc();
+    AVSubtitle sub = {0};
+    std::vector<BitmapCue> raw; // cues before end-time resolution
+    while (av_read_frame(in, pkt) >= 0) {
+      if (pkt->stream_index != subStream) {
+        av_packet_unref(pkt);
+        continue;
+      }
+      int gotSub = 0;
+      if (avcodec_decode_subtitle2(decCtx, &sub, &gotSub, pkt) >= 0 &&
+          gotSub != 0) {
+        const std::int64_t baseUs =
+            pkt->pts != AV_NOPTS_VALUE
+                ? av_rescale_q(pkt->pts, subTb, AVRational{1, 1000000})
+                : 0;
+        if (sub.num_rects == 0) {
+          // Clear marker (PGS empty display set): closes the previous cue.
+          if (!raw.empty() && raw.back().endUs < 0) {
+            raw.back().endUs = baseUs;
+          }
+        } else {
+          BitmapCue cue;
+          cue.startUs =
+              baseUs + std::int64_t(sub.start_display_time) * 1000;
+          cue.endUs = sub.end_display_time == UINT32_MAX
+                          ? std::int64_t(-1) // closed by the next cue
+                          : baseUs +
+                                std::int64_t(sub.end_display_time) * 1000;
+          cue.overlay = av_frame_alloc();
+          cue.overlay->format = AV_PIX_FMT_YUVA420P;
+          cue.overlay->width = outW;
+          cue.overlay->height = outH;
+          if (av_frame_get_buffer(cue.overlay, 0) < 0) {
+            av_frame_free(&cue.overlay);
+            reason = "cannot allocate the cue overlay frame";
+            avsubtitle_free(&sub);
+            av_packet_unref(pkt);
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&in);
+            av_packet_free(&pkt);
+            return false;
+          }
+          // Transparent background: alpha 0 everywhere; the rects overwrite
+          // their sub-regions. get_buffer does NOT zero the planes.
+          for (int p = 0; p < 4; ++p) {
+            const int planeH = p == 1 || p == 2 ? (outH + 1) / 2 : outH;
+            if (cue.overlay->data[p] != nullptr) {
+              std::memset(cue.overlay->data[p], 0,
+                          std::size_t(cue.overlay->linesize[p]) *
+                              std::size_t(planeH));
+            }
+          }
+          if (!compositeSubtitleRects(sub, srcW, srcH, outW, outH,
+                                      cue.overlay)) {
+            av_frame_free(&cue.overlay);
+            reason = "cannot composite the bitmap cue";
+            avsubtitle_free(&sub);
+            av_packet_unref(pkt);
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&in);
+            av_packet_free(&pkt);
+            return false;
+          }
+          raw.push_back(std::move(cue));
+        }
+        avsubtitle_free(&sub);
+      }
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avcodec_free_context(&decCtx);
+    avformat_close_input(&in);
+
+    if (raw.empty()) {
+      reason = "no bitmap cues found in the subtitle source";
+      return false;
+    }
+    const std::int64_t boundUs =
+        durationUs > 0 ? durationUs + 1000000 : INT64_MAX / 4;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+      BitmapCue cue = std::move(raw[i]);
+      if (cue.endUs < 0) {
+        cue.endUs = i + 1 < raw.size() ? raw[i + 1].startUs : boundUs;
+      }
+      // User timing offset + sanity clamps.
+      cue.startUs = std::max<std::int64_t>(cue.startUs + offsetUs, 0);
+      cue.endUs = std::min<std::int64_t>(cue.endUs + offsetUs, boundUs);
+      if (cue.endUs > cue.startUs) {
+        cues_.push_back(std::move(cue));
+      }
+    }
+    return !cues_.empty();
+  }
+
+  std::vector<BitmapCue> &cues() { return cues_; }
+
+private:
+  std::vector<BitmapCue> cues_;
+};
 
 // File extension for a stream-copyable extraction of a text subtitle codec.
 const char *subtitleFileExtensionFor(AVCodecID id) {
@@ -1199,11 +1431,31 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   // ---- Video setup ---------------------------------------------------------
   int videoOut = -1;
   AVFrame *videoFrame = nullptr; // owned locally, freed at exit
+  // Output geometry (assigned by the video setup below; the bitmap event
+  // timeline and the direct sws path consume it at function scope).
+  std::int32_t outW = 0;
+  std::int32_t outH = 0;
   // Burn-in routing: when subtitles are burned, decoded frames pass through
   // a libavfilter graph (scale -> subtitles[libass] -> buffersink) instead of
   // the direct sws path. Owned by cleanup.filterGraph.
   AVFilterContext *burnSrc = nullptr;
   AVFilterContext *burnSink = nullptr;
+  // Bitmap burn-in overlay input (spec §11: PGS/VobSub/DVB); active only
+  // for bitmap cues (text burn-in uses the libass subtitles filter).
+  AVFilterContext *overlaySrc = nullptr;
+  // Pre-decoded bitmap cues (spec §11); populated by the video setup when
+  // bitmap burn-in is requested, consumed by the frame loop below.
+  std::vector<BitmapCue> bitmapCues;
+  // Owns every overlay frame (transparent pre-roll + all cue frames) for
+  // the whole transcode; freed on any exit path.
+  struct OverlayFrameGuard {
+    std::vector<AVFrame *> frames;
+    ~OverlayFrameGuard() {
+      for (AVFrame *f : frames) {
+        av_frame_free(&f);
+      }
+    }
+  } overlayFrameGuard;
   // Audio DSP chain endpoints (spec §10); active when any DSP knob is set.
   AVFilterContext *audioSrc = nullptr;
   AVFilterContext *audioSink = nullptr;
@@ -1301,15 +1553,17 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     if (wantsRotation) {
       std::swap(baseW, baseH);
     }
-    std::int32_t outH = request.video.resolutionHeight.value_or(baseH);
+    std::int32_t outH2 = request.video.resolutionHeight.value_or(baseH);
     if (baseH > 0) {
-      outH = std::min(outH, baseH);
+      outH2 = std::min(outH2, baseH);
     }
-    outH = std::max(outH & ~1, 16);
+    outH2 = std::max(outH2 & ~1, 16);
     const double aspect =
         baseW > 0 && baseH > 0 ? double(baseW) / double(baseH) : 16.0 / 9.0;
-    std::int32_t outW = std::int32_t(std::lround(outH * aspect)) & ~1;
-    outW = std::max(outW, 16);
+    std::int32_t outW2 = std::int32_t(std::lround(outH2 * aspect)) & ~1;
+    outW2 = std::max(outW2, 16);
+    outW = outW2;
+    outH = outH2;
     cleanup.videoEnc->width = outW;
     cleanup.videoEnc->height = outH;
     // Frame-rate conversion (spec §9): a requested output rate re-times
@@ -1412,17 +1666,6 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
               "ffmpeg");
           return result;
         }
-        const AVCodecID subCodec =
-            cleanup.in->streams[subGlobalIndex]->codecpar->codec_id;
-        if (!isBurnableSubtitleCodec(subCodec)) {
-          result.error = Error::make(
-              ErrorCode::UnsupportedFeature,
-              std::string("burn-in of bitmap subtitle streams (") +
-                  avcodec_get_name(subCodec) +
-                  ") requires rendering support that is not available yet",
-              "ffmpeg");
-          return result;
-        }
         subPath = *inPath;
         // The subtitles filter's `si` option counts SUBTITLE streams only:
         // convert the global stream index into its subtitle ordinal.
@@ -1436,9 +1679,74 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       }
       } // wantsBurnIn (subtitle source resolution)
 
+      // Classify the burn-in material: bitmap (PGS/DVB/VobSub) composites
+      // through the overlay path; text renders through libass.
+      bool bitmapBurn = false;
+      if (wantsBurnIn) {
+        AVCodecID subCodecId = AV_CODEC_ID_NONE;
+        if (subGlobalIndex >= 0) {
+          subCodecId =
+              cleanup.in->streams[subGlobalIndex]->codecpar->codec_id;
+        } else {
+          AVFormatContext *probeCtx = nullptr;
+          if (avformat_open_input(&probeCtx, subPath.c_str(), nullptr,
+                                  nullptr) >= 0) {
+            avformat_find_stream_info(probeCtx, nullptr);
+            for (unsigned i = 0; i < probeCtx->nb_streams; ++i) {
+              if (probeCtx->streams[i]->codecpar->codec_type ==
+                  AVMEDIA_TYPE_SUBTITLE) {
+                subCodecId = probeCtx->streams[i]->codecpar->codec_id;
+                break;
+              }
+            }
+            avformat_close_input(&probeCtx);
+          }
+        }
+        if (isBitmapSubtitleCodec(subCodecId)) {
+          if (wantsTransform) {
+            result.error = Error::make(
+                ErrorCode::UnsupportedFeature,
+                "bitmap subtitle burn-in cannot be combined with crop/"
+                "rotation/flip in V1 (cue positions are authored for the "
+                "source frame)",
+                "ffmpeg");
+            return result;
+          }
+          bitmapBurn = true;
+          BitmapCueLoader loader;
+          std::string cueReason;
+          const std::int64_t durationUs =
+              cleanup.in->duration != AV_NOPTS_VALUE &&
+                      cleanup.in->duration > 0
+                  ? cleanup.in->duration
+                  : 0;
+          if (!loader.load(subPath, cleanup.videoDec->width,
+                           cleanup.videoDec->height, outW, outH, durationUs,
+                           request.subtitles.timingOffsetMs, cueReason)) {
+            result.error = Error::make(
+                ErrorCode::UnsupportedFeature,
+                "bitmap burn-in failed: " + cueReason, "ffmpeg");
+            return result;
+          }
+          bitmapCues = std::move(loader.cues());
+          for (const BitmapCue &cue : bitmapCues) {
+            overlayFrameGuard.frames.push_back(cue.overlay);
+          }
+        } else if (!isBurnableSubtitleCodec(subCodecId)) {
+          result.error = Error::make(
+              ErrorCode::UnsupportedFeature,
+              std::string("burn-in of subtitle format ") +
+                  avcodec_get_name(subCodecId) + " is not supported",
+              "ffmpeg");
+          return result;
+        }
+      }
+
       // Timing offset: materialize a shifted copy before rendering
       // (spec §14: adjust subtitle timing — never silently ignored).
-      if (wantsBurnIn && request.subtitles.timingOffsetMs != 0) {
+      // Bitmap cues took the offset inside the loader.
+      if (wantsBurnIn && !bitmapBurn &&
+          request.subtitles.timingOffsetMs != 0) {
         const std::filesystem::path outFs(params.outputPath);
         const std::string stem = outFs.stem().string();
         if (subGlobalIndex >= 0) {
@@ -1560,6 +1868,67 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             "cannot constrain the subtitle filter output format", "ffmpeg");
         return result;
       }
+      if (bitmapBurn) {
+        // Bitmap burn-in graph (manually linked; no parse labels):
+        //   main -> scale -> overlay(main)   over -> overlay(side)
+        //   overlay -> sink
+        // The overlay layer is YUVA420P at the OUTPUT geometry; the pre-
+        // decoded cue frames were composited at exactly that size. A
+        // transparent pre-roll frame at t=0 keeps framesync from holding
+        // main frames before the first cue arrives.
+        AVFilterContext *scaleF = nullptr;
+        AVFilterContext *overlayF = nullptr;
+        char overArgs[512];
+        std::snprintf(overArgs, sizeof(overArgs),
+                      "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                      ":pixel_aspect=%d/%d",
+                      outW, outH, AV_PIX_FMT_YUVA420P,
+                      cleanup.videoDec->time_base.num,
+                      cleanup.videoDec->time_base.den, sar.num, sar.den);
+        // Filter args are option lists WITHOUT the filter-name prefix.
+        const std::string scaleArgsStr =
+            "w=" + std::to_string(outW) + ":h=" + std::to_string(outH);
+        int rc = avfilter_graph_create_filter(
+            &overlaySrc, srcFilter, "over", overArgs, nullptr,
+            cleanup.filterGraph);
+        if (rc >= 0) {
+          rc = avfilter_graph_create_filter(
+              &scaleF, avfilter_get_by_name("scale"), "sc",
+              scaleArgsStr.c_str(), nullptr, cleanup.filterGraph);
+        }
+        if (rc >= 0) {
+          rc = avfilter_graph_create_filter(
+              &overlayF, avfilter_get_by_name("overlay"), "ov",
+              "eof_action=pass:format=yuv420", nullptr,
+              cleanup.filterGraph);
+        }
+        if (rc >= 0) {
+          rc = avfilter_link(burnSrc, 0, scaleF, 0);
+        }
+        if (rc >= 0) {
+          rc = avfilter_link(scaleF, 0, overlayF, 0);
+        }
+        if (rc >= 0) {
+          rc = avfilter_link(overlaySrc, 0, overlayF, 1);
+        }
+        if (rc >= 0) {
+          rc = avfilter_link(overlayF, 0, burnSink, 0);
+        }
+        if (rc < 0 || overlaySrc == nullptr) {
+          result.error = Error::make(
+              ErrorCode::ExecutionFailed,
+              "cannot build the bitmap overlay graph: " + avErrorString(rc),
+              "ffmpeg");
+          return result;
+        }
+        if (avfilter_graph_config(cleanup.filterGraph, nullptr) < 0) {
+          result.error = Error::make(ErrorCode::ExecutionFailed,
+                                     "cannot configure the bitmap overlay "
+                                     "graph",
+                                     "ffmpeg");
+          return result;
+        }
+      } else {
       // Graph description: crop -> rotation -> flips -> scale, then the
       // subtitles filter when burning in. Order matters: crop uses
       // source-frame coordinates; rotation swaps dimensions; the scale
@@ -1648,6 +2017,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                 ")",
             "ffmpeg");
         return result;
+      }
       }
     } else {
       cleanup.sws = sws_getContext(
@@ -2169,6 +2539,99 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   };
 
   bool rangeDone = false; // crossed the range end; stop reading input
+  // Bitmap burn-in event timeline: (timeUs, frame) pairs pushed into the
+  // overlay input as the video timeline advances. A transparent pre-roll
+  // at t=0 (and after every cue end) keeps framesync flowing.
+  struct OverlayEvent {
+    std::int64_t us = 0;
+    bool isEnd = false; // end events sort before starts at equal times
+    AVFrame *frame = nullptr;
+  };
+  std::vector<OverlayEvent> overlayEvents;
+  std::size_t overlayCursor = 0;
+  if (overlaySrc != nullptr) {
+    AVFrame *transparent = av_frame_alloc();
+    transparent->format = AV_PIX_FMT_YUVA420P;
+    transparent->width = outW;
+    transparent->height = outH;
+    if (av_frame_get_buffer(transparent, 0) >= 0) {
+      for (int p = 0; p < 4; ++p) {
+        const int planeH = p == 1 || p == 2 ? (outH + 1) / 2 : outH;
+        if (transparent->data[p] != nullptr) {
+          std::memset(transparent->data[p], 0,
+                      std::size_t(transparent->linesize[p]) *
+                          std::size_t(planeH));
+        }
+      }
+      overlayEvents.push_back(OverlayEvent{0, true, transparent});
+      overlayFrameGuard.frames.push_back(transparent);
+    } else {
+      av_frame_free(&transparent);
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "cannot allocate the transparent overlay",
+                                 "ffmpeg");
+      av_frame_free(&videoFrame);
+      return result;
+    }
+    for (const BitmapCue &cue : bitmapCues) {
+      overlayEvents.push_back(
+          OverlayEvent{cue.startUs, false, cue.overlay});
+      overlayEvents.push_back(OverlayEvent{cue.endUs, true, transparent});
+    }
+    std::stable_sort(overlayEvents.begin(), overlayEvents.end(),
+                     [](const OverlayEvent &a, const OverlayEvent &b) {
+                       if (a.us != b.us) {
+                         return a.us < b.us;
+                       }
+                       return a.isEnd && !b.isEnd;
+                     });
+    // Far-future transparent sentinels: framesync only emits a main frame
+    // once the overlay input carries frames BEYOND it (empirically TWO
+    // ahead). Real events end at the last cue; without sentinels the
+    // video tail (and any sparse-cue timeline) would stall until the
+    // overlay EOF and then flush UNBLENDED. Transparent sentinels never
+    // change the visible result; they only guarantee the scheduler can
+    // always look ahead. They sort last, preserving push order.
+    overlayEvents.push_back(
+        OverlayEvent{3600LL * 1000000LL, true, transparent});
+    overlayEvents.push_back(
+        OverlayEvent{7200LL * 1000000LL, true, transparent});
+  }
+  const auto pushOverlayEventsUpTo = [&](std::int64_t upToUs) {
+    if (overlaySrc == nullptr) {
+      return;
+    }
+    // framesync invariant (established empirically with standalone graph
+    // probes): a main frame at T is only emitted once the overlay input
+    // carries frames BEYOND T - effectively two ahead. Starved, it
+    // buffers every main frame and eof_action=pass then flushes them
+    // UNBLENDED. Keep two pushed overlay events ahead of the main
+    // timeline: push all events <= T, then two more (the far-future
+    // sentinels guarantee the supply never runs dry).
+    std::int64_t lastPushedUs = INT64_MIN;
+    std::int64_t secondLastPushedUs = INT64_MIN;
+    while (overlayCursor < overlayEvents.size() &&
+           (overlayEvents[overlayCursor].us <= upToUs ||
+            lastPushedUs <= upToUs || secondLastPushedUs <= upToUs)) {
+      const OverlayEvent &event = overlayEvents[overlayCursor];
+      // av_frame_clone, NOT a struct copy: pushing a shallow stack copy
+      // fails inside av_frame_ref with ENOMEM (-12) — found via a
+      // standalone baseline in the same process. The clone shares the
+      // cached frame's buffers; KEEP_REF makes buffersrc take its own
+      // reference, so the clone is freed immediately after the push.
+      AVFrame *push = av_frame_clone(event.frame);
+      if (push != nullptr) {
+        push->pts =
+            av_rescale_q(event.us, AVRational{1, 1000000}, burnGraphTb);
+        av_buffersrc_add_frame_flags(overlaySrc, push,
+                                     AV_BUFFERSRC_FLAG_KEEP_REF);
+        av_frame_free(&push);
+      }
+      secondLastPushedUs = lastPushedUs;
+      lastPushedUs = event.us;
+      ++overlayCursor;
+    }
+  };
   // Feeds the encoder from the fifo: only complete frame_size frames (the
   // final drain allows a partial tail). PCM-style encoders (frame_size 0)
   // consume whatever is available.
@@ -2341,9 +2804,19 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             }
           }
           if (burnSrc != nullptr && burnSink != nullptr) {
-            // Burn-in path: the graph scales, renders subtitles (libass) and
-            // converts to the encoder's pixel format. Frame pts are
-            // normalized into the time base the buffersrc was declared with.
+            // Burn-in path: the graph scales, renders subtitles (libass for
+            // text; the overlay filter for bitmap cues) and converts to the
+            // encoder's pixel format. Frame pts are normalized into the time
+            // base the buffersrc was declared with.
+            if (overlaySrc != nullptr) {
+              // Advance the bitmap overlay timeline to this frame first:
+              // events must precede the main frame they apply to.
+              std::int64_t localUs = srcUs;
+              if (rangeBounded && srcUs >= 0) {
+                localUs = std::max<std::int64_t>(0, srcUs - rangeStartUs);
+              }
+              pushOverlayEventsUpTo(localUs);
+            }
             if (cleanup.frame->pts != AV_NOPTS_VALUE) {
               cleanup.frame->pts = av_rescale_q_rnd(
                   cleanup.frame->pts, cleanup.videoDec->time_base, burnGraphTb,
@@ -2564,6 +3037,12 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     av_packet_unref(cleanup.packet);
   }
 
+  // Bitmap burn-in: flush the overlay input FIRST (eof_action=pass lets
+  // remaining main frames through the overlay once its stream ends), then
+  // the main graph input, then the audio DSP tail, then the resampler.
+  if (overlaySrc != nullptr) {
+    av_buffersrc_add_frame(overlaySrc, nullptr);
+  }
   drainVideoEncoder();
   // Flush the DSP graph's tail BEFORE the encoder drain: atempo/loudnorm/
   // silenceremove hold buffered samples that must still be encoded.

@@ -897,6 +897,299 @@ TEST_CASE("REAL transcode preserves subtitle tracks (MKV/H.264+SRT -> HEVC? no: 
   CHECK(subtitleCodecName(outPath) == "subrip");
 }
 
+// ---------------------------------------------------------------------------
+// Bitmap subtitle burn-in (spec §11: PGS; DVB/VobSub share the same path)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void putU16(std::vector<std::uint8_t> &v, unsigned value) {
+  v.push_back(std::uint8_t(value >> 8));
+  v.push_back(std::uint8_t(value & 0xFF));
+}
+void putU24(std::vector<std::uint8_t> &v, unsigned value) {
+  v.push_back(std::uint8_t(value >> 16));
+  v.push_back(std::uint8_t((value >> 8) & 0xFF));
+  v.push_back(std::uint8_t(value & 0xFF));
+}
+void putU32(std::vector<std::uint8_t> &v, unsigned value) {
+  putU16(v, value >> 16);
+  putU16(v, value & 0xFFFF);
+}
+
+// One .sup record: "PG" magic + PTS(90kHz) + DTS + segment.
+void supRecord(std::vector<std::uint8_t> &out, std::int64_t pts90k,
+               std::uint8_t type, const std::vector<std::uint8_t> &data) {
+  out.push_back('P');
+  out.push_back('G');
+  putU32(out, pts90k);
+  putU32(out, 0); // DTS unused
+  out.push_back(type);
+  putU16(out, data.size());
+  out.insert(out.end(), data.begin(), data.end());
+}
+
+// RLE-codes a solid color bitmap (per line: one run + EOL).
+std::vector<std::uint8_t> solidRle(std::int32_t w, std::int32_t h,
+                                   std::uint8_t color) {
+  std::vector<std::uint8_t> rle;
+  for (std::int32_t y = 0; y < h; ++y) {
+    rle.push_back(0x00);
+    rle.push_back(std::uint8_t(0xC0 | (w >> 8)));
+    rle.push_back(std::uint8_t(w & 0xFF));
+    rle.push_back(color);
+    rle.push_back(0x00); // EOL
+    rle.push_back(0x00);
+  }
+  return rle;
+}
+
+// Hand-crafts a REAL PGS (.sup) stream: one white block cue at
+// [startSec, endSec) positioned at (x, y). The bytes follow the exact
+// segment grammar the pgssub decoder parses (PDS/ODS/PCS/WDS/END plus an
+// empty display set to clear).
+std::vector<std::uint8_t> makePgsSup(std::int32_t videoW,
+                                     std::int32_t videoH, std::int32_t blockW,
+                                     std::int32_t blockH, std::int32_t x,
+                                     std::int32_t y, double startSec,
+                                     double endSec) {
+  const std::int64_t start90 = std::int64_t(startSec * 90000.0);
+  const std::int64_t end90 = std::int64_t(endSec * 90000.0);
+  std::vector<std::uint8_t> sup;
+
+  // Segment ORDER matters: the decoder learns the video dimensions from
+  // the PCS and rejects objects larger than them - the object must come
+  // AFTER the presentation segment (standard PGS display-set order:
+  // PCS, WDS, PDS, ODS, END).
+  std::vector<std::uint8_t> pcs;
+  putU16(pcs, videoW);
+  putU16(pcs, videoH);
+  pcs.push_back(0x10); // frame rate
+  putU16(pcs, 0);      // composition number
+  pcs.push_back(0x00); // state: normal
+  pcs.push_back(0x00); // palette update flag
+  pcs.push_back(0);    // palette id
+  pcs.push_back(1);    // object count
+  putU16(pcs, 0);      // object id
+  pcs.push_back(0);    // window id
+  pcs.push_back(0x00); // composition flags (not forced, no crop)
+  putU16(pcs, x);
+  putU16(pcs, y);
+  supRecord(sup, start90, 0x16, pcs);
+
+  // Window definition.
+  std::vector<std::uint8_t> wds;
+  wds.push_back(0); // window id
+  putU16(wds, x);
+  putU16(wds, y);
+  putU16(wds, blockW);
+  putU16(wds, blockH);
+  supRecord(sup, start90, 0x17, wds);
+
+  // Palette: entry 1 = opaque white (BT.709 Y=235,Cr=Cb=128).
+  std::vector<std::uint8_t> pds;
+  pds.push_back(0); // palette id
+  pds.push_back(0); // version
+  pds.push_back(1); // color id 1
+  pds.push_back(235);
+  pds.push_back(128);
+  pds.push_back(128);
+  pds.push_back(255); // alpha
+  supRecord(sup, start90, 0x14, pds);
+
+  // Object: solid block RLE.
+  const std::vector<std::uint8_t> rle = solidRle(blockW, blockH, 1);
+  std::vector<std::uint8_t> ods;
+  putU16(ods, 0); // object id
+  ods.push_back(0); // version
+  ods.push_back(0x80); // first fragment
+  putU24(ods, unsigned(4 + rle.size())); // total size incl. w/h
+  putU16(ods, blockW);
+  putU16(ods, blockH);
+  ods.insert(ods.end(), rle.begin(), rle.end());
+  supRecord(sup, start90, 0x15, ods);
+
+  // Display.
+  supRecord(sup, start90, 0x80, {});
+
+  // Clear set at the end time (empty presentation + display).
+  std::vector<std::uint8_t> pcsClear;
+  putU16(pcsClear, videoW);
+  putU16(pcsClear, videoH);
+  pcsClear.push_back(0x10);
+  putU16(pcsClear, 1); // next composition number
+  pcsClear.push_back(0x00);
+  pcsClear.push_back(0x00);
+  pcsClear.push_back(0); // palette id
+  pcsClear.push_back(0); // object count = 0 -> clear
+  supRecord(sup, end90, 0x16, pcsClear);
+  supRecord(sup, end90, 0x80, {});
+  return sup;
+}
+
+} // namespace
+
+TEST_CASE("REAL bitmap burn-in: embedded PGS composited into the video") {
+  TestEnv env;
+  // Fixture: 4 s 320x240 video + a PGS track with a white 96x64 block at
+  // (64, 48) visible in [1s, 3s).
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+  const std::vector<std::uint8_t> sup =
+      makePgsSup(320, 240, 96, 64, 64, 48, 1.0, 3.0);
+  const auto supPath = env.dir / "cue.sup";
+  writeFile(supPath, std::string(sup.begin(), sup.end()));
+  const std::string withSubs = (env.dir / "pgs.mkv").string();
+  // -copyts: the mkv muxer otherwise re-bases the subtitle track against
+  // the audio's edit-list shift (-977 ms on this fixture), moving the cue
+  // away from where it was authored.
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error "
+                       "-copyts -avoid_negative_ts disabled -i \"" +
+                       fixture + "\" -i \"" + supPath.string() +
+                       "\" -map 0:v -map 0:a -map 1:0 -c:v copy -c:a copy "
+                       "-c:s copy \"" + withSubs + "\"")
+                          .c_str()) == 0);
+
+  ConversionRequest request =
+      transcodeRequest(withSubs, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  request.goal.kind = GoalKind::Custom;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+  const ProbeResult probe = probeWith(jobs.front().outputPath);
+  CHECK(probe.videoCodec == "h264");
+
+  // INDEPENDENT pixel cross-check at three timestamps: inside the cue the
+  // block region must be substantially brighter than the same region of
+  // the source; outside the cue it must match the source closely.
+  const auto regionMean = [&](const std::string &path, double atSec) {
+    // Crop the block region, average the gray pixels via the CLI.
+    const std::string cmd =
+        ffmpegBin() + " -hide_banner -loglevel error -ss " +
+        std::to_string(atSec) + " -i \"" + path +
+        "\" -frames:v 1 -vf crop=96:64:64:48 -f rawvideo -pix_fmt gray - "
+        "2>/dev/null";
+    std::FILE *pipe = popen(cmd.c_str(), "r");
+    REQUIRE(pipe != nullptr);
+    long total = 0;
+    int count = 0;
+    int byte = 0;
+    while ((byte = std::fgetc(pipe)) != EOF) {
+      total += byte;
+      ++count;
+    }
+    pclose(pipe);
+    return count > 0 ? double(total) / double(count) : -1.0;
+  };
+  const double insideBurned = regionMean(jobs.front().outputPath, 2.0);
+  const double insideSource = regionMean(fixture, 2.0);
+  const double outsideBurned = regionMean(jobs.front().outputPath, 0.5);
+  const double outsideSource = regionMean(fixture, 0.5);
+  INFO("cue region burned=" << insideBurned << " source=" << insideSource
+                           << "; outside burned=" << outsideBurned
+                           << " source=" << outsideSource);
+  // The white block lifts the region mean massively.
+  CHECK(insideBurned > insideSource + 60.0);
+  // Outside the cue the frame must stay (close to) the source: the
+  // transparent overlay changed nothing.
+  CHECK(std::abs(outsideBurned - outsideSource) < 12.0);
+}
+
+TEST_CASE("bitmap burn-in with external PGS and timing offset") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+  const std::vector<std::uint8_t> sup =
+      makePgsSup(320, 240, 96, 64, 64, 48, 1.0, 3.0);
+  const auto supPath = env.dir / "ext.sup";
+  writeFile(supPath, std::string(sup.begin(), sup.end()));
+
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  request.subtitles.externalUri = supPath.string();
+  request.subtitles.timingOffsetMs = 1000; // cue becomes [2s, 4s)
+  request.goal.kind = GoalKind::Custom;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+
+  // Offset check: at 1.5s the cue must NOT be visible yet (still transparent
+  // pre-roll), at 2.5s it must be. Pixel means via the same crop probe.
+  const auto regionMean = [&](double atSec) {
+    const std::string cmd =
+        ffmpegBin() + " -hide_banner -loglevel error -ss " +
+        std::to_string(atSec) + " -i \"" + jobs.front().outputPath +
+        "\" -frames:v 1 -vf crop=96:64:64:48 -f rawvideo -pix_fmt gray - "
+        "2>/dev/null";
+    std::FILE *pipe = popen(cmd.c_str(), "r");
+    REQUIRE(pipe != nullptr);
+    long total = 0;
+    int count = 0;
+    int byte = 0;
+    while ((byte = std::fgetc(pipe)) != EOF) {
+      total += byte;
+      ++count;
+    }
+    pclose(pipe);
+    return count > 0 ? double(total) / double(count) : -1.0;
+  };
+  const double before = regionMean(1.5);
+  const double during = regionMean(2.5);
+  INFO("pre-cue mean=" << before << " during-cue mean=" << during);
+  CHECK(during > before + 60.0);
+}
+
+TEST_CASE("bitmap burn-in refuses geometry transforms honestly") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const std::vector<std::uint8_t> sup =
+      makePgsSup(320, 240, 96, 64, 64, 48, 0.5, 1.5);
+  const auto supPath = env.dir / "ext.sup";
+  writeFile(supPath, std::string(sup.begin(), sup.end()));
+
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  request.subtitles.externalUri = supPath.string();
+  request.video.rotationDegrees = 90; // incompatible with bitmap cues
+  request.goal.kind = GoalKind::Custom;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  REQUIRE(terminal->state == JobState::Failed);
+  CHECK(terminal->error.find("cannot be combined") != std::string::npos);
+}
+
 TEST_CASE("REAL burn-in: embedded SRT rendered into the video (libass)") {
   TestEnv env;
   const std::string av = generateFixture(env.dir / "av.mp4",
