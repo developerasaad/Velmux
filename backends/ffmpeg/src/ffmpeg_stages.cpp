@@ -673,18 +673,23 @@ Error FfmpegMuxStage::drainAudioUpTo(std::int64_t boundaryPtsUs) {
         return Error::make(ErrorCode::None, "");
       }
     }
-    // Write the packet (the proven move-ref pattern: the interleave write
-    // takes ownership of the packet content).
+    // Write the packet. av_packet_move_ref copies the WHOLE struct: every
+    // field set before it is clobbered. Save the source timing, move the
+    // content, then rescale into the output stream's time base (the muxer
+    // may have changed it during write_header) and retarget the stream.
+    const std::int64_t srcPts = pkt->pts;
+    const std::int64_t srcDts = pkt->dts;
+    const std::int64_t srcDuration = pkt->duration;
     AVPacket *outPacket = av_packet_alloc();
+    av_packet_move_ref(outPacket, pkt);
     const AVRounding rounding =
         static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-    outPacket->pts = av_rescale_q_rnd(pkt->pts, src->time_base,
+    outPacket->pts = av_rescale_q_rnd(srcPts, src->time_base,
                                       dst->time_base, rounding);
-    outPacket->dts = av_rescale_q_rnd(pkt->dts, src->time_base,
+    outPacket->dts = av_rescale_q_rnd(srcDts, src->time_base,
                                       dst->time_base, rounding);
     outPacket->duration =
-        av_rescale_q(pkt->duration, src->time_base, dst->time_base);
-    av_packet_move_ref(outPacket, pkt);
+        av_rescale_q(srcDuration, src->time_base, dst->time_base);
     outPacket->stream_index = impl_->outAudio;
     outPacket->pos = -1;
     const bool writeOk =
