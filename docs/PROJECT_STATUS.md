@@ -12,8 +12,8 @@ the ultimate truth.
 | 2 | Capability system and planner | In progress (core-level, host-validated) |
 | 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | Implemented: artifacts build in CI (manual dispatch); both app builds consume them (push events) so shipped APKs and the iOS app carry the real FFmpeg backend. First fully-PIC rebuild in flight after the linker-fix round (D-030) |
 | 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Implemented at the composition level: stage contracts, FFmpeg stage workers, core HybridExecutor, planner hybrid candidates, real F→F proof with ffprobe validation in CI. Native-side participation (Android/Apple stage workers) and device proof of N-involving categories pending |
-| 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending) |
-| 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
+| 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending; TRIM implemented and tested: transcode windows keep source timestamps, stream copy snaps to keyframes) |
+| 6 | Compression intelligence | Partial (budget math implemented + unit tested; SAMPLE GENERATION implemented end-to-end: representative-window picker, engine op, bridge facade, TurboModule surface, real-file tests) |
 | 7 | Persistence/recovery | Complete at the engine level (segmented transcode + crash-safe checkpoint commit + durable resume; REAL cancel/resume fault-injection test passes on CI and locally with ffprobe-verified full-length output) |
 | 8 | Background and notifications | Not started |
 | 9 | Batch scheduler | Partial (resource-aware scheduler implemented + unit tested) |
@@ -88,6 +88,20 @@ the ultimate truth.
   CPU-frame interchange; the planner generates hybrid candidates only
   when no single-backend route exists. A REAL F→F composition runs in CI
   with ffprobe cross-validation.
+- Trimming (spec §15/§16): TimeRange on the request, honored by the
+  transcode path (single-range and segmented recovery tiling rebased
+  onto the window) and the stream-copy path (keyframe-snapped start);
+  persisted through job-store schema v2 (a submit→reload round-trip
+  initially dropped it — caught by a local end-to-end run).
+- Sample generation (spec §20): the engine plans against the FULL source
+  (the preview uses exactly the settings the real job would), then
+  transcodes only the densest window (demux-level per-second byte scan,
+  single pass, no decode; mid-file fallback). Independent validation
+  before reporting success. Exposed through the bridge facade and both
+  mobile TurboModules on dedicated workers.
+- The Android APK builds with the real FFmpeg backend linked in (M3
+  complete): the workflow consumes the PIC-fixed artifacts from the
+  latest successful ffmpeg-mobile run on main.
 
 ## Known limitations (do not pretend otherwise)
 
