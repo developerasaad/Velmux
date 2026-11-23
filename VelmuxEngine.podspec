@@ -16,17 +16,19 @@ ffmpeg_root = ENV['VELMUX_FFMPEG_ROOT']
 
 # CocoaPods file patterns must be RELATIVE to the podspec; the workflow
 # packages the artifacts inside the repository checkout, so the absolute
-# VELMUX_FFMPEG_ROOT converts to a repo-relative path here.
-def velmux_ffmpeg_relative(ffmpeg_root)
+# VELMUX_FFMPEG_ROOT converts to a repo-relative path here. Local variable:
+# the spec block sees lexical scope, not methods defined at file scope.
+ffmpeg_relative = nil
+if ffmpeg_root && !ffmpeg_root.empty?
   require 'pathname'
-  root = Pathname.new(File.expand_path(ffmpeg_root))
-  spec_dir = Pathname.new(File.expand_path(__dir__))
-  rel = root.relative_path_from(spec_dir)
-  if rel.to_s.start_with?('..')
+  _ff_root = Pathname.new(File.expand_path(ffmpeg_root))
+  _spec_dir = Pathname.new(File.expand_path(__dir__))
+  _rel = _ff_root.relative_path_from(_spec_dir)
+  if _rel.to_s.start_with?('..')
     raise "VELMUX_FFMPEG_ROOT must live inside the repository for CocoaPods " \
           "file patterns (got #{ffmpeg_root})"
   end
-  rel.to_s
+  ffmpeg_relative = _rel.to_s
 end
 
 Pod::Spec.new do |spec|
@@ -88,9 +90,8 @@ Pod::Spec.new do |spec|
   }
   spec.public_header_files = 'bridge/cpp/velmux_bridge.h'
   spec.source_files = source_files
-  if ffmpeg_root && !ffmpeg_root.empty?
-    spec.vendored_frameworks = velmux_ffmpeg_relative(ffmpeg_root) +
-                               '/VelmuxFFmpeg.xcframework'
+  if ffmpeg_relative
+    spec.vendored_frameworks = ffmpeg_relative + '/VelmuxFFmpeg.xcframework'
   end
   spec.libraries = 'c++', 'z'
   spec.frameworks = 'AVFoundation', 'VideoToolbox', 'CoreMedia',
