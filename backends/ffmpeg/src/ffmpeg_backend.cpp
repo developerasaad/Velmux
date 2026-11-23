@@ -1109,6 +1109,18 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
     inIndexOfOut.push_back(int(i));
   }
 
+  // Metadata preservation (spec): container-level + per-stream tags copy
+  // through the remux unchanged.
+  av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
+               AV_DICT_DONT_OVERWRITE);
+  for (std::size_t k = 0; k < inIndexOfOut.size() &&
+                           k < cleanup.out->nb_streams;
+       ++k) {
+    av_dict_copy(&cleanup.out->streams[k]->metadata,
+                 cleanup.in->streams[std::size_t(inIndexOfOut[k])]->metadata,
+                 AV_DICT_DONT_OVERWRITE);
+  }
+
   if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
                    AVIO_FLAG_WRITE);
@@ -2411,6 +2423,31 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                      outTb);
   }
 
+  // Metadata preservation (spec video ops: "metadata preservation where
+  // possible"): container-level and per-stream tags copy through the
+  // transcode. Re-encoding changes the essence, never the descriptive
+  // metadata (title/artist/creation date...). Encoder-written entries
+  // (extradata-adjacent tags) do not exist yet at header time.
+  av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
+               AV_DICT_DONT_OVERWRITE);
+  {
+    const std::size_t outStreamCount = cleanup.out->nb_streams;
+    for (unsigned i = 0;
+         i < cleanup.in->nb_streams && i < outStreamCount; ++i) {
+      const AVStream *srcSt = cleanup.in->streams[i];
+      // Match by type: the output streams are created in the same
+      // video/audio/subtitle order as the enabled inputs.
+      if (i == std::size_t(videoIn) && videoOut >= 0) {
+        av_dict_copy(&cleanup.out->streams[std::size_t(videoOut)]->metadata,
+                     srcSt->metadata, AV_DICT_DONT_OVERWRITE);
+      } else if (i == std::size_t(audioIn) && audioOut >= 0) {
+        av_dict_copy(&cleanup.out->streams[std::size_t(audioOut)]->metadata,
+                     srcSt->metadata, AV_DICT_DONT_OVERWRITE);
+      }
+      // Preserved subtitle streams copy their metadata at creation
+      // (language, dispositions) further up.
+    }
+  }
   if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
                    AVIO_FLAG_WRITE);

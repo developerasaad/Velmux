@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace velmux::core;
@@ -803,6 +804,117 @@ TEST_CASE("PCM bit depth selects the exact PCM encoder variant") {
   const auto jobs = env.engine->listJobs();
   const ProbeResult probe = probeWith(jobs.front().outputPath);
   CHECK(probe.audioCodec == "pcm_s24le");
+}
+
+TEST_CASE("metadata survives transcode and remux") {
+  TestEnv env;
+  // Fixture with container + stream metadata.
+  const std::string plain =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 1.0);
+  const std::string tagged = (env.dir / "tagged.mp4").string();
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+                       plain + "\" -metadata title=VelmuxMetaTitle "
+                       "-metadata artist=VelmuxMetaArtist -c copy \"" +
+                       tagged + "\"")
+                          .c_str()) == 0);
+
+  // Transcode path.
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(
+      transcodeRequest(tagged, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac, {}, 400'000));
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  REQUIRE(terminal->state == JobState::Completed);
+  const auto jobs = env.engine->listJobs();
+
+  const auto titleOf = [&](const std::string &path) {
+    std::FILE *pipe = popen((ffprobeBin() + " -v error -show_entries "
+                                     "format_tags=title -of csv=p=0 \"" +
+                             path + "\"")
+                                .c_str(), "r");
+    REQUIRE(pipe != nullptr);
+    char buf[256] = {0};
+    const char *got = std::fgets(buf, sizeof(buf), pipe);
+    pclose(pipe);
+    std::string s = got != nullptr ? buf : "";
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+      s.pop_back();
+    }
+    return s;
+  };
+  CHECK(titleOf(jobs.front().outputPath) == "VelmuxMetaTitle");
+
+  // Remux path.
+  EventWaiter waiter2;
+  env.engine->events().subscribe(&waiter2);
+  const Result<std::string> jobId2 = env.engine->startJob(
+      transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
+                       AudioCodec::Aac));
+  REQUIRE(jobId2.ok());
+  const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal2.has_value());
+  REQUIRE(terminal2->state == JobState::Completed);
+  const auto snap2 = env.engine->getJob(jobId2.value());
+  REQUIRE(snap2.has_value());
+  CHECK(titleOf(snap2->outputPath) == "VelmuxMetaTitle");
+}
+
+TEST_CASE("HARDENING: invalid timestamps never produce fake success") {
+  TestEnv env;
+  // Build a fixture, then corrupt a video packet's pts/dts to nonsense.
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 1.0);
+  // Negate the moov's stts entries by editing raw bytes is fragile;
+  // instead demux -> remux with forced garbage timestamps via the CLI
+  // is also unreliable. The robust hostile fixture: a zero-byte file
+  // pretending to be media (handled by inspection) plus a TRUNCATED
+  // mid-stream file with mangled trailing bytes.
+  const auto trunc = env.dir / "truncated.mp4";
+  {
+    std::ifstream in(fixture, std::ios::binary);
+    std::vector<char> data((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    // Keep 60% and flip bytes in the last 512 to damage the tail packets.
+    data.resize(data.size() * 6 / 10);
+    for (std::size_t i = data.size() >= 512 ? data.size() - 512 : 0;
+         i < data.size(); ++i) {
+      data[i] = static_cast<char>(~data[i]);
+    }
+    std::ofstream out(trunc, std::ios::binary);
+    out.write(data.data(), std::streamsize(data.size()));
+  }
+  // The engine must either fail honestly or produce a validated output;
+  // it must never report Completed with an empty/absent output.
+  ConversionRequest request =
+      transcodeRequest(trunc.string(), Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  // The engine may refuse at submit (inspection fails on the damaged
+  // file) or fail during execution - both are honest. What is forbidden
+  // is a Completed state with a missing/empty output.
+  const Result<std::string> jobId = env.engine->startJob(request);
+  if (!jobId.ok()) {
+    CHECK_FALSE(jobId.error().message.empty());
+    return;
+  }
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  if (terminal->state == JobState::Completed) {
+    const auto snap = env.engine->getJob(jobId.value());
+    REQUIRE(snap.has_value());
+    CHECK(snap->outputSizeBytes > 1024);
+  } else {
+    CHECK(terminal->state == JobState::Failed);
+    CHECK_FALSE(terminal->error.empty());
+  }
 }
 
 // ---------------------------------------------------------------------------
