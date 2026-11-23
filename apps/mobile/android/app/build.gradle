@@ -113,7 +113,9 @@ android {
         def velmuxAbiList = (project.findProperty('velmuxAbis')
             ?: 'armeabi-v7a,arm64-v8a,x86_64').split(',').collect { it.trim() }
         ndk {
-            abiFilters velmuxAbiList
+            // Spread: abiFilters is a varargs method; a bare List argument
+            // fails project evaluation (caught by the per-push Android CI).
+            abiFilters(*velmuxAbiList)
         }
         // The instrumented tests are JUnit4 (@RunWith(AndroidJUnit4)). AGP's
         // default runner (android.test.InstrumentationTestRunner) cannot
