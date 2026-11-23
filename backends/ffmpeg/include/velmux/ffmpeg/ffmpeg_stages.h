@@ -17,6 +17,7 @@ namespace velmux::ffmpeg {
 class FfmpegStageDecoder final
     : public velmux::backend::IVideoStageDecoder {
 public:
+  FfmpegStageDecoder();
   ~FfmpegStageDecoder() override;
   velmux::core::Error open(const std::string &sourcePath,
                            velmux::backend::InterchangePixel pixel) override;
@@ -33,6 +34,7 @@ private:
 class FfmpegStageEncoder final
     : public velmux::backend::IVideoStageEncoder {
 public:
+  FfmpegStageEncoder();
   ~FfmpegStageEncoder() override;
   velmux::core::Error open(const velmux::backend::StageEncoderConfig &config,
                            velmux::backend::InterchangePixel pixel) override;
@@ -51,6 +53,7 @@ private:
 // arise).
 class FfmpegMuxStage final : public velmux::backend::IMuxStage {
 public:
+  FfmpegMuxStage();
   ~FfmpegMuxStage() override;
   velmux::core::Error
   open(const std::string &outputPath,
