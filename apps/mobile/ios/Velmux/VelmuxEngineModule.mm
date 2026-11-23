@@ -11,6 +11,7 @@
 
 #import <RNVelmuxSpecs/RNVelmuxSpecs.h>
 #import <React/RCTBridge.h>
+#import <React/RCTInvalidating.h>
 #import <VelmuxEngine/velmux_bridge.h>
 
 #import <atomic>
@@ -18,7 +19,8 @@
 
 NSString *const kVelmuxEventName = @"velmux.jobEvent";
 
-@interface VelmuxEngineModule : NativeVelmuxSpecBase <NativeVelmuxSpec>
+@interface VelmuxEngineModule : NativeVelmuxSpecBase <NativeVelmuxSpec,
+                                                     RCTInvalidating>
 @end
 
 @implementation VelmuxEngineModule {
@@ -150,9 +152,9 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   json += "}";
   json += ",\"video\":{\"enabled\":" +
           std::string(request.video().enabled() ? "true" : "false");
-  if (request.video().codec().has_value()) {
+  if (request.video().codec() != nil) {
     json += ",\"codec\":\"" +
-            std::string(request.video().codec()->UTF8String) + "\"";
+            std::string(request.video().codec().UTF8String) + "\"";
   }
   if (request.video().resolutionHeight().has_value()) {
     json += ",\"resolutionHeight\":" +
@@ -162,9 +164,9 @@ RCT_EXPORT_MODULE(VelmuxEngine)
     json += ",\"frameRate\":" +
             std::to_string(*request.video().frameRate());
   }
-  if (request.video().rateControl().has_value()) {
+  if (request.video().rateControl() != nil) {
     json += ",\"rateControl\":\"" +
-            std::string(request.video().rateControl()->UTF8String) + "\"";
+            std::string(request.video().rateControl().UTF8String) + "\"";
   }
   if (request.video().bitRate().has_value()) {
     json += ",\"bitRate\":" +
@@ -177,9 +179,9 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   json += "}";
   json += ",\"audio\":{\"enabled\":" +
           std::string(request.audio().enabled() ? "true" : "false");
-  if (request.audio().codec().has_value()) {
+  if (request.audio().codec() != nil) {
     json += ",\"codec\":\"" +
-            std::string(request.audio().codec()->UTF8String) + "\"";
+            std::string(request.audio().codec().UTF8String) + "\"";
   }
   if (request.audio().bitRate().has_value()) {
     json += ",\"bitRate\":" +
@@ -196,9 +198,9 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   json += "}";
   json += ",\"subtitles\":{\"policy\":\"" +
           std::string(request.subtitles().policy().UTF8String) + "\"";
-  if (request.subtitles().externalUri().has_value()) {
+  if (request.subtitles().externalUri() != nil) {
     json += ",\"externalUri\":\"" +
-            std::string(request.subtitles().externalUri()->UTF8String) +
+            std::string(request.subtitles().externalUri().UTF8String) +
             "\"";
   }
   json += ",\"timingOffsetMs\":" +
