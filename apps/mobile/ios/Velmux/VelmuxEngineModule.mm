@@ -55,11 +55,12 @@ RCT_EXPORT_MODULE(VelmuxEngine)
 }
 
 - (void)invalidate {
+  // The codegen base (plain NSObject) declares no invalidate; there is no
+  // super implementation to chain into.
   if (_engine != nullptr) {
     velmux_engine_destroy(_engine);
     _engine = nullptr;
   }
-  [super invalidate];
 }
 
 // Engine lifecycle: created lazily in a durable per-app directory.
@@ -225,9 +226,9 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   if (_listenerCount.load() <= 0 || _polling.exchange(true)) {
     return;
   }
-  __weak typeof(self) weakSelf = self;
+  __weak VelmuxEngineModule *weakSelf = self;
   dispatch_async(_pollQueue, ^{
-    typeof(self) strongSelf = weakSelf;
+    VelmuxEngineModule *strongSelf = weakSelf;
     if (strongSelf == nil) {
       return;
     }
@@ -236,7 +237,7 @@ RCT_EXPORT_MODULE(VelmuxEngine)
       if (engine == nullptr) {
         break;
       }
-      char *raw = nullptr;
+      __block char *raw = nullptr;
       dispatch_sync(strongSelf->_engineQueue, ^{
         raw = velmux_poll_events(engine);
       });
