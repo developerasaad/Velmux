@@ -2,6 +2,7 @@
 // React Native TurboModule host would (JSON in, JSON out), against the REAL
 // engine + FFmpeg backend. Output validity is cross-checked with ffprobe,
 // never only with the code that produced the output.
+#define VELMUX_BRIDGE_CXX_HELPERS 1
 #include "velmux_bridge.h"
 
 #include <doctest/doctest.h>

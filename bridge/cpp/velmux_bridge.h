@@ -9,12 +9,20 @@
 // The bridge owns no policy: it forwards user intent in and job state out.
 #pragma once
 
+// The C++ serialization helpers below need the engine's C++ headers.
+// Pure-C/ObjC hosts (the iOS app target) consume ONLY the stable C
+// facade at the bottom; they must be able to include this header
+// without the core header search paths. Define VELMUX_BRIDGE_CXX_HELPERS
+// (engine sources and tests do) to expose them.
+#if defined(VELMUX_BRIDGE_CXX_HELPERS)
 #include "velmux/core/engine.h"
 #include "velmux/core/events.h"
 #include "velmux/core/job.h"
 
 #include <string>
+#endif
 
+#if defined(VELMUX_BRIDGE_CXX_HELPERS)
 namespace velmux::bridge {
 
 // Serialize a JobSnapshot to the bridge JSON contract.
@@ -36,6 +44,7 @@ std::optional<core::ConversionRequest>
 requestFromJson(const std::string &json, std::string &error);
 
 } // namespace velmux::bridge
+#endif // VELMUX_BRIDGE_CXX_HELPERS
 
 // ---------------------------------------------------------------------------
 // Stable C facade for hosts that register the engine from C/JSI without a
@@ -44,7 +53,9 @@ requestFromJson(const std::string &json, std::string &error);
 // String-returning functions produce either the documented payload or an
 // {"error": "..."} object; the caller frees with velmux_free_string.
 // ---------------------------------------------------------------------------
+#ifdef __cplusplus
 extern "C" {
+#endif
 
 // Opaque engine handle.
 typedef struct VelmuxEngineHandle VelmuxEngineHandle;
@@ -103,4 +114,8 @@ int velmux_update_resources(VelmuxEngineHandle *engine, const char *json);
 char *velmux_poll_events(VelmuxEngineHandle *engine);
 
 void velmux_free_string(char *str);
-}
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+

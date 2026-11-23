@@ -1,3 +1,4 @@
+#define VELMUX_BRIDGE_CXX_HELPERS 1
 #include "velmux_bridge.h"
 
 #if defined(VELMUX_WITH_FFMPEG_BACKEND)
