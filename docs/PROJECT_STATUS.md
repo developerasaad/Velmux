@@ -19,7 +19,7 @@ the ultimate truth.
 | 9 | Batch scheduler | Partial (resource-aware scheduler implemented + unit tested) |
 | 10 | Premium UX polish | In progress (design system + screens scaffolded) |
 | 11 | Performance measurement | Partial (planning micro-benchmark + telemetry) |
-| 12 | Hardening | Not started |
+| 12 | Hardening | Started with real kills: truncated-source / disappearing-source / unwritable-destination tests run in CI and EXPOSED a fake-success window (the output validator's duration/resolution/sample-rate checks were silently dead after the store round-trip - D-040/D-041 fixed it plus the trim-aware expectations). Process-kill restart E2E and true ENOSPC remain pending |
 
 ## What actually works today
 
@@ -126,6 +126,11 @@ the ultimate truth.
   cancel, durable resume, ffprobe-verified assembly); a full process-kill
   + restart end-to-end test is still pending (the reconcile/requeue logic
   itself is unit tested).
+- M12 hardening has begun paying for itself: the truncated-source test
+  found the dead-validation fake-success window (D-040). Still pending:
+  process-kill restart E2E, true ENOSPC (needs a size-limited filesystem
+  the CI runner cannot provide; the unwritable-destination test covers
+  the same open-for-write failure path), invalid-timestamp fixtures.
 
 ## Environment notes
 
