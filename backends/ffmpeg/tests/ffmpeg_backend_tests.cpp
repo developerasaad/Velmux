@@ -17,6 +17,8 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <sys/stat.h>
+#include <vector>
 
 using namespace velmux::core;
 using velmux::ffmpeg::FfmpegBackend;
@@ -1203,4 +1205,114 @@ TEST_CASE("extraction refusals stay honest") {
     CHECK(plan.value().message.find("no subtitle track") !=
           std::string::npos);
   }
+}
+
+// ---------------------------------------------------------------------------
+// M12 hardening: hostile environments and damaged inputs (spec §36/§38)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
+  TestEnv env;
+  const std::string full =
+      generateFixture(env.dir / "full.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+  // Cut the file at ~60%: the header stays parseable, the tail is gone.
+  const std::string truncated = (env.dir / "cut.mp4").string();
+  const std::int64_t fullSize =
+      std::filesystem::file_size(full);
+  {
+    std::ifstream in(full, std::ios::binary);
+    std::ofstream out(truncated, std::ios::binary | std::ios::trunc);
+    const std::int64_t keep = fullSize * 6 / 10;
+    std::vector<char> buf(static_cast<std::size_t>(keep));
+    in.read(buf.data(), keep);
+    out.write(buf.data(), keep);
+    REQUIRE(out.good());
+  }
+  REQUIRE(std::filesystem::file_size(truncated) < fullSize);
+
+  ConversionRequest request = transcodeRequest(
+      truncated, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
+
+  // Either the inspector refuses outright, or the job runs and the
+  // VALIDATOR catches the short output. Both are honest; a Completed
+  // state would be fake success.
+  const Result<PlanResult> plan =
+      env.engine->plan(MediaSource{truncated, "cut.mp4"}, request);
+  if (plan.ok() && plan.value().feasible) {
+    EventWaiter waiter;
+    env.engine->events().subscribe(&waiter);
+    const Result<std::string> jobId = env.engine->startJob(request);
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal.has_value());
+    INFO("terminal state: " << int(terminal->state)
+                            << " error: " << terminal->error);
+    REQUIRE(terminal->state == JobState::Failed);
+    CHECK(terminal->error.size() > 0);
+  } else {
+    CHECK(plan.value().message.size() > 0);
+  }
+}
+
+TEST_CASE("HARDENING: source disappearing before a retry fails cleanly") {
+  TestEnv env;
+  const std::string source =
+      generateFixture(env.dir / "gone.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  ConversionRequest request =
+      transcodeRequest(source, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+
+  // Phase 1: a normal run completes (the file exists).
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto first = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(first.has_value());
+  REQUIRE(first->state == JobState::Completed);
+
+  // Phase 2: the source vanishes, then the user retries. Deterministic:
+  // retry re-queues and the executor must fail at open time - cleanly,
+  // never a crash and never fake success.
+  std::filesystem::remove(source);
+  waiter.reset();
+  const Result<bool> retried = env.engine->retryJob(jobId.value());
+  REQUIRE(retried.ok());
+  REQUIRE(retried.value());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("terminal state: " << int(terminal->state)
+                          << " error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Failed);
+  CHECK_FALSE(terminal->error.empty());
+}
+
+TEST_CASE("HARDENING: unwritable output destination fails cleanly") {
+  TestEnv env;
+  const std::string source =
+      generateFixture(env.dir / "av.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  ConversionRequest request =
+      transcodeRequest(source, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+
+  // Make the outputs directory unwritable after engine creation: every
+  // artifact write must fail (never a silent no-op or a crash).
+  const std::string outputs = env.dir.string() + "/outputs";
+  REQUIRE(::chmod(outputs.c_str(), 0555) == 0);
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  // Restore permissions so TestEnv cleanup can remove the directory.
+  ::chmod(outputs.c_str(), 0755);
+  INFO("terminal state: " << int(terminal->state)
+                          << " error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Failed);
+  CHECK_FALSE(terminal->error.empty());
 }
