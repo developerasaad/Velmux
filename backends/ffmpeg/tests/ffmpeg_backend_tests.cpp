@@ -1035,11 +1035,11 @@ TEST_CASE("REAL sample generation: representative window, requested settings") {
   REQUIRE(std::filesystem::file_size(mixed) > 1024);
 
   const Result<SampleResult> sample = env.engine->generateSample(
-      transcodeRequest(mixed, Container::Mp4, VideoCodec::VP9,
+      transcodeRequest(mixed, Container::WebM, VideoCodec::VP9,
                        AudioCodec::Aac),
       1);
-  REQUIRE(sample.ok());
   INFO("sample error: " << sample.error().message);
+  REQUIRE(sample.ok());
   const SampleResult &s = sample.value();
 
   // The window must sit inside the motion (second) half.
