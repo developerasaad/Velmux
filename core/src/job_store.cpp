@@ -356,6 +356,83 @@ void parsePairs(const std::string &data,
   }
 }
 
+// Source inspection summary persisted in source_info_json: the fields
+// output validation needs after a store round-trip (duration, geometry,
+// sample rate, codecs of the first streams). Everything is enum/numeric
+// pairs, matching the request serialization style.
+std::string serializeSourceInfo(const MediaInfo &info) {
+  std::string out;
+  out += "duration=" + std::to_string(info.durationSec) + ";";
+  out += "size=" + std::to_string(info.sizeBytes) + ";";
+  if (info.hasVideo()) {
+    const VideoStream &v = info.video.front();
+    out += "vw=" + std::to_string(v.width) + ";";
+    out += "vh=" + std::to_string(v.height) + ";";
+    out += std::string("vcodec=") + codecName(v.codec) + ";";
+    out += "vfps=" + std::to_string(v.frameRate) + ";";
+  }
+  if (info.hasAudio()) {
+    const AudioStream &a = info.audio.front();
+    out += "ach=" + std::to_string(a.channels) + ";";
+    out += "asr=" + std::to_string(a.sampleRate) + ";";
+    out += std::string("acodec=") + codecName(a.codec) + ";";
+  }
+  return out;
+}
+
+MediaInfo parseSourceInfo(const std::string &data) {
+  MediaInfo info;
+  parsePairs(data, [&](const std::string &key, const std::string &value) {
+    try {
+      if (key == "duration") {
+        info.durationSec = std::stod(value);
+      } else if (key == "size") {
+        info.sizeBytes = std::stoll(value);
+      } else if (key == "vw") {
+        if (info.video.empty()) {
+          info.video.push_back(VideoStream{});
+        }
+        info.video.front().width = std::stoi(value);
+      } else if (key == "vh") {
+        if (info.video.empty()) {
+          info.video.push_back(VideoStream{});
+        }
+        info.video.front().height = std::stoi(value);
+      } else if (key == "vcodec") {
+        if (info.video.empty()) {
+          info.video.push_back(VideoStream{});
+        }
+        info.video.front().codec = videoCodecFromName(value).value_or(
+            VideoCodec::H264);
+      } else if (key == "vfps") {
+        if (info.video.empty()) {
+          info.video.push_back(VideoStream{});
+        }
+        info.video.front().frameRate = std::stod(value);
+      } else if (key == "ach") {
+        if (info.audio.empty()) {
+          info.audio.push_back(AudioStream{});
+        }
+        info.audio.front().channels = std::stoi(value);
+      } else if (key == "asr") {
+        if (info.audio.empty()) {
+          info.audio.push_back(AudioStream{});
+        }
+        info.audio.front().sampleRate = std::stoi(value);
+      } else if (key == "acodec") {
+        if (info.audio.empty()) {
+          info.audio.push_back(AudioStream{});
+        }
+        info.audio.front().codec =
+            audioCodecFromName(value).value_or(AudioCodec::Aac);
+      }
+    } catch (const std::exception &) {
+      // A malformed pair must never break job loading.
+    }
+  });
+  return info;
+}
+
 VideoRequest parseVideoRequest(const std::string &data) {
   VideoRequest video;
   parsePairs(data, [&](const std::string &key, const std::string &value) {
@@ -460,7 +537,9 @@ Error JobStore::insertJob(const JobRecord &record) {
   sqlite3_bind_int64(stmt, 26, record.request.trim.endUs);
   sqlite3_bind_text(stmt, 14, record.pipeline.summary.c_str(), -1,
                     SQLITE_TRANSIENT);
-  sqlite3_bind_text(stmt, 15, "", -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 15,
+                    serializeSourceInfo(record.sourceInfo).c_str(), -1,
+                    SQLITE_TRANSIENT);
   sqlite3_bind_double(stmt, 16, record.progress);
   sqlite3_bind_int64(stmt, 17, record.inputSizeBytes);
   sqlite3_bind_int64(stmt, 18, record.outputSizeBytes);
@@ -596,6 +675,7 @@ JobRecord JobStore::rowToRecord(sqlite3_stmt &stmt) {
                                    ? "0"
                                    : columnText(stmt, 12)));
   record.pipeline.summary = columnText(stmt, 13);
+  record.sourceInfo = parseSourceInfo(columnText(stmt, 14));
   record.progress = sqlite3_column_double(&stmt, 15);
   record.inputSizeBytes = sqlite3_column_int64(&stmt, 16);
   record.outputSizeBytes = sqlite3_column_int64(&stmt, 17);

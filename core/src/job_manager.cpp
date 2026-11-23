@@ -664,6 +664,11 @@ void JobManager::executeJob(const std::string &jobId) {
       return;
     }
     info = inspected.value();
+    // Validation compares the output against the inspection the planner
+    // used; keep the record consistent so the duration/geometry checks
+    // are live after the store round-trip (they were silently dead when
+    // the reloaded sourceInfo stayed empty).
+    record->sourceInfo = info;
   }
 
   PlanResult plan = planner_.plan(info, record->request);

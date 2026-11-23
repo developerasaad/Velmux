@@ -163,3 +163,50 @@ TEST_CASE("loadAllOrdersNewestFirst") {
   REQUIRE(all.size() == 2);
   CHECK(all.front().id == "newer");
 }
+
+TEST_CASE("source inspection survives the store round-trip (validation gate)") {
+  TempDb db;
+  JobRecord record = sampleJob("inspected", JobState::Queued);
+  record.sourceInfo.durationSec = 4.0;
+  record.sourceInfo.sizeBytes = 1'234'567;
+  VideoStream video;
+  video.codec = VideoCodec::H264;
+  video.width = 320;
+  video.height = 240;
+  video.frameRate = 12.0;
+  record.sourceInfo.video.push_back(video);
+  AudioStream audio;
+  audio.codec = AudioCodec::Aac;
+  audio.channels = 2;
+  audio.sampleRate = 44100;
+  record.sourceInfo.audio.push_back(audio);
+
+  REQUIRE(db.jobs().insertJob(record).ok());
+  Error error;
+  const auto loaded = db.jobs().loadJob("inspected", error);
+  REQUIRE(loaded.has_value());
+
+  // The fields output validation needs must be live after the reload:
+  // an empty sourceInfo silently disabled the duration/geometry checks
+  // (found by the M12 truncated-source hardening test).
+  CHECK(loaded->sourceInfo.durationSec == doctest::Approx(4.0));
+  CHECK(loaded->sourceInfo.sizeBytes == 1'234'567);
+  REQUIRE(loaded->sourceInfo.hasVideo());
+  CHECK(loaded->sourceInfo.video.front().width == 320);
+  CHECK(loaded->sourceInfo.video.front().height == 240);
+  CHECK(loaded->sourceInfo.video.front().codec == VideoCodec::H264);
+  CHECK(loaded->sourceInfo.video.front().frameRate == doctest::Approx(12.0));
+  REQUIRE(loaded->sourceInfo.hasAudio());
+  CHECK(loaded->sourceInfo.audio.front().sampleRate == 44100);
+  CHECK(loaded->sourceInfo.audio.front().channels == 2);
+  CHECK(loaded->sourceInfo.audio.front().codec == AudioCodec::Aac);
+
+  // updateJob (delete+insert) preserves it too.
+  JobRecord updated = *loaded;
+  updated.state = JobState::Completed;
+  REQUIRE(db.jobs().updateJob(updated).ok());
+  const auto reloaded = db.jobs().loadJob("inspected", error);
+  REQUIRE(reloaded.has_value());
+  CHECK(reloaded->sourceInfo.durationSec == doctest::Approx(4.0));
+  CHECK(reloaded->sourceInfo.video.front().height == 240);
+}
