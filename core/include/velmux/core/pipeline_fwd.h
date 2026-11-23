@@ -26,6 +26,11 @@ struct Pipeline {
   bool videoStreamCopy = false;
   bool audioStreamCopy = false;
   bool subtitleStreamCopy = false;
+  // Non-empty for subtitle-extraction jobs: the output is a text subtitle
+  // sidecar file with this extension (e.g. "srt"), not a media container.
+  // outputNameFor uses it for the artifact name; validation switches to
+  // cue-level checks.
+  std::string sidecarExtension;
   bool usesHardware = false;
   std::string summary; // human-readable, shown in UI/history
 

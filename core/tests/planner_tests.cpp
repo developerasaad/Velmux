@@ -59,6 +59,7 @@ struct Fixture {
                                  Container::WebM, Container::Mov};
     ffmpeg.writableContainers = {Container::Mp4, Container::Mkv,
                                  Container::WebM, Container::Mov};
+    ffmpeg.subtitleExtract = true;
 
     BackendCapabilities android;
     android.backend = BackendId::Android;
@@ -353,4 +354,70 @@ TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single ba
   REQUIRE(classic.best.has_value());
   CHECK(classic.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
   CHECK(classic.best->pipeline.assigns(StageId::Encode, BackendId::Ffmpeg));
+}
+
+TEST_CASE_FIXTURE(Fixture, "subtitle extraction plans a sidecar pipeline") {
+  MediaInfo source = h264AacSource();
+  SubtitleStream sub;
+  sub.format = SubtitleFormat::Srt;
+  source.subtitles.push_back(sub);
+
+  ConversionRequest request;
+  request.outputContainer = Container::Mkv;
+  request.goal.kind = GoalKind::Custom;
+  request.video.enabled = false;
+  request.audio.enabled = false;
+  request.subtitles.policy = SubtitlePolicy::Extract;
+
+  const PlanResult plan = planner.plan(source, request);
+  REQUIRE(plan.feasible);
+  REQUIRE(plan.best.has_value());
+  const Pipeline &pipeline = plan.best->pipeline;
+  CHECK(pipeline.assigns(StageId::Demux, BackendId::Ffmpeg));
+  CHECK(pipeline.assigns(StageId::SubtitleProcessing, BackendId::Ffmpeg));
+  CHECK(pipeline.stages.size() == 2);
+  CHECK(pipeline.sidecarExtension == "srt");
+  CHECK(pipeline.summary.find("sidecar") != std::string::npos);
+
+  // Container-internal text decodes to SRT; ASS-family keeps its format.
+  source.subtitles.front().format = SubtitleFormat::MovText;
+  const PlanResult movText = planner.plan(source, request);
+  REQUIRE(movText.feasible);
+  CHECK(movText.best->pipeline.sidecarExtension == "srt");
+
+  source.subtitles.front().format = SubtitleFormat::Ass;
+  const PlanResult ass = planner.plan(source, request);
+  REQUIRE(ass.feasible);
+  CHECK(ass.best->pipeline.sidecarExtension == "ass");
+}
+
+TEST_CASE_FIXTURE(Fixture, "subtitle extraction refuses impossible shapes") {
+  MediaInfo source = h264AacSource();
+
+  SUBCASE("bitmap formats need OCR (outside V1)") {
+    SubtitleStream sub;
+    sub.format = SubtitleFormat::Pgs;
+    source.subtitles.push_back(sub);
+    ConversionRequest request;
+    request.goal.kind = GoalKind::Custom;
+    request.video.enabled = false;
+    request.audio.enabled = false;
+    request.subtitles.policy = SubtitlePolicy::Extract;
+    const PlanResult plan = planner.plan(source, request);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.message.find("OCR") != std::string::npos);
+  }
+
+  SUBCASE("mixed convert+extract is refused") {
+    SubtitleStream sub;
+    sub.format = SubtitleFormat::Srt;
+    source.subtitles.push_back(sub);
+    ConversionRequest request;
+    request.goal.kind = GoalKind::Custom;
+    request.video.enabled = true;
+    request.subtitles.policy = SubtitlePolicy::Extract;
+    const PlanResult plan = planner.plan(source, request);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.message.find("standalone") != std::string::npos);
+  }
 }

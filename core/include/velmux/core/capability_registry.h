@@ -51,6 +51,11 @@ struct BackendCapabilities {
   bool subtitlePassthrough = false;
   // Can the backend render (burn in) subtitles onto the video?
   bool subtitleBurnIn = false;
+  // Can the backend extract subtitle tracks into text sidecar files
+  // (stream copy for native text formats, decode+re-encode to SRT for
+  // container-internal text like MP4 mov_text)? Bitmap formats (PGS,
+  // VobSub, DVB) need OCR and stay out of scope (spec §14).
+  bool subtitleExtract = false;
   // Milestone 4 stage-composition participation: can this backend decode
   // video into CPU frames (Yuv420P interchange) for a hybrid pipeline?
   bool stageDecodeToCpuFrames = false;

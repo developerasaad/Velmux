@@ -44,6 +44,9 @@ struct ValidationExpectation {
   // Minimum output size: a "successful" transcode of real media producing
   // a near-empty file is a failure.
   std::int64_t minimumBytes = 1024;
+  // Subtitle-extraction jobs: the output is a text sidecar (SRT/VTT/ASS),
+  // not a media container. Validation checks cue structure instead.
+  bool subtitleSidecar = false;
 };
 
 class OutputValidator {

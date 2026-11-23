@@ -239,6 +239,142 @@ const char *subtitleFileExtensionFor(AVCodecID id) {
   }
 }
 
+// Formats a timestamp as SRT time (HH:MM:SS,mmm).
+std::string srtTimestamp(std::int64_t us) {
+  if (us < 0) {
+    us = 0;
+  }
+  const std::int64_t msTotal = us / 1000;
+  const std::int64_t ms = msTotal % 1000;
+  const std::int64_t sTotal = msTotal / 1000;
+  const std::int64_t s = sTotal % 60;
+  const std::int64_t m = (sTotal / 60) % 60;
+  const std::int64_t h = sTotal / 3600;
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld,%03lld",
+                static_cast<long long>(h), static_cast<long long>(m),
+                static_cast<long long>(s), static_cast<long long>(ms));
+  return buf;
+}
+
+// Decodes a container-internal text subtitle stream (mov_text, ttml, ...)
+// and writes a valid SRT sidecar. Bitmap decodes (PGS/DVB/VobSub) produce
+// no text rects and fail honestly. Progress and cancellation are honored
+// at packet granularity (demux-level work; there is nothing to
+// checkpoint).
+bool decodeSubtitleStreamToSrt(AVFormatContext *in, int streamIndex,
+                               const std::string &outPath,
+                               const velmux::backend::ExecuteParams &params) {
+  const AVCodec *codec =
+      avcodec_find_decoder(in->streams[streamIndex]->codecpar->codec_id);
+  if (codec == nullptr) {
+    return false;
+  }
+  AVCodecContext *dec = avcodec_alloc_context3(codec);
+  if (dec == nullptr) {
+    return false;
+  }
+  if (avcodec_parameters_to_context(dec, in->streams[streamIndex]->codecpar) <
+          0 ||
+      avcodec_open2(dec, codec, nullptr) < 0) {
+    avcodec_free_context(&dec);
+    return false;
+  }
+  std::ofstream out(outPath, std::ios::binary | std::ios::trunc);
+  if (!out.good()) {
+    avcodec_free_context(&dec);
+    return false;
+  }
+  AVPacket *pkt = av_packet_alloc();
+  AVSubtitle sub = {0};
+  std::int64_t cueIndex = 0;
+  bool ok = true;
+  bool cancelled = false;
+  while (ok && av_read_frame(in, pkt) >= 0) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      cancelled = true;
+      av_packet_unref(pkt);
+      break;
+    }
+    if (pkt->stream_index != streamIndex) {
+      av_packet_unref(pkt);
+      continue;
+    }
+    int gotSub = 0;
+    const int consumed =
+        avcodec_decode_subtitle2(dec, &sub, &gotSub, pkt);
+    if (consumed < 0) {
+      // Damaged packet: skip it, keep the rest (isolate malformed input).
+      av_packet_unref(pkt);
+      continue;
+    }
+    if (gotSub != 0) {
+      const AVRational tb = in->streams[streamIndex]->time_base;
+      const std::int64_t startUs =
+          sub.pts != AV_NOPTS_VALUE
+              ? av_rescale_q(sub.pts, dec->pkt_timebase.num > 0
+                                         ? dec->pkt_timebase
+                                         : tb,
+                             AVRational{1, 1000000})
+              : 0;
+      std::int64_t endUs = startUs;
+      if (sub.end_display_time > 0) {
+        endUs = startUs + std::int64_t(sub.end_display_time) * 1000;
+      } else {
+        endUs = startUs + 2'000'000; // sane default cue length
+      }
+      std::string text;
+      for (unsigned r = 0; r < sub.num_rects; ++r) {
+        const AVSubtitleRect *rect = sub.rects[r];
+        if (rect->type == SUBTITLE_TEXT && rect->text != nullptr) {
+          if (!text.empty()) {
+            text += "\n";
+          }
+          text += rect->text;
+        } else if (rect->type == SUBTITLE_ASS && rect->ass != nullptr) {
+          // "Dialogue: 0,start,end,style,,0,0,0,,text" - take the last
+          // field; strip the trivial override tags.
+          const char *ass = rect->ass;
+          const char *lastComma = strrchr(ass, ',');
+          if (lastComma != nullptr) {
+            std::string chunk(lastComma + 1);
+            std::size_t pos = 0;
+            while ((pos = chunk.find('{', pos)) != std::string::npos) {
+              const std::size_t close = chunk.find('}', pos);
+              if (close == std::string::npos) {
+                chunk.erase(pos);
+                break;
+              }
+              chunk.erase(pos, close - pos + 1);
+            }
+            if (!text.empty()) {
+              text += "\n";
+            }
+            text += chunk;
+          }
+        }
+      }
+      if (!text.empty()) {
+        ++cueIndex;
+        out << cueIndex << "\n"
+            << srtTimestamp(startUs) << " --> " << srtTimestamp(endUs)
+            << "\n"
+            << text << "\n\n";
+      }
+      avsubtitle_free(&sub);
+    }
+    av_packet_unref(pkt);
+  }
+  av_packet_free(&pkt);
+  avcodec_free_context(&dec);
+  out.flush();
+  ok = out.good() && cueIndex > 0;
+  if (cancelled) {
+    return false;
+  }
+  return ok;
+}
+
 // Extracts one subtitle stream into a standalone text subtitle file via
 // demux + packet-copy remux (valid for text formats whose packets are the
 // file's native cue representation). Used to materialize a burn-in source
@@ -554,6 +690,11 @@ bool FfmpegExecutor::canExecute(const Pipeline &pipeline,
 }
 
 ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
+  // Subtitle-extraction jobs: demux + subtitle processing only, artifact
+  // is a text sidecar.
+  if (params.request.subtitles.policy == SubtitlePolicy::Extract) {
+    return executeSubtitleExtract(params);
+  }
   if (params.pipeline.videoStreamCopy && params.pipeline.audioStreamCopy) {
     // Burn-in rewrites video pixels; a copy pipeline can never serve it
     // (the planner enforces this; the executor refuses defensively).
@@ -567,6 +708,79 @@ ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
     return executeRemux(params);
   }
   return executeTranscode(params);
+}
+
+ExecuteResult FfmpegExecutor::executeSubtitleExtract(
+    const ExecuteParams &params) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  const ConversionRequest &request = params.request;
+  if (params.pipeline.sidecarExtension.empty() || request.video.enabled ||
+      request.audio.enabled) {
+    result.error = Error::make(
+        ErrorCode::InvalidArgument,
+        "extraction requests must be subtitle-only with a sidecar pipeline",
+        "ffmpeg");
+    return result;
+  }
+  const std::optional<std::string> inPath = localPathFor(request.source);
+  if (!inPath.has_value()) {
+    result.error = Error::make(ErrorCode::SourceUnavailable,
+                               "unsupported source URI", "ffmpeg");
+    return result;
+  }
+
+  AVFormatContext *in = nullptr;
+  if (avformat_open_input(&in, inPath->c_str(), nullptr, nullptr) < 0 ||
+      avformat_find_stream_info(in, nullptr) < 0) {
+    if (in != nullptr) {
+      AVFormatContext *ctx = in;
+      avformat_close_input(&ctx);
+    }
+    result.error = Error::make(ErrorCode::SourceUnavailable,
+                               "cannot open the source", "ffmpeg");
+    return result;
+  }
+  int subStream = -1;
+  for (unsigned i = 0; i < in->nb_streams; ++i) {
+    if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+      subStream = int(i);
+      break;
+    }
+  }
+  if (subStream < 0) {
+    avformat_close_input(&in);
+    result.error = Error::make(ErrorCode::InvalidArgument,
+                               "the source has no subtitle track", "ffmpeg");
+    return result;
+  }
+  const AVCodecID cid = in->streams[subStream]->codecpar->codec_id;
+
+  // Copy path: native text formats whose packets ARE the file format.
+  bool ok = false;
+  if (subtitleFileExtensionFor(cid) != nullptr) {
+    ok = extractSubtitleStreamToFile(*inPath, subStream, params.outputPath);
+  } else {
+    // Decode path: container-internal text (mov_text, ttml, ...) decodes
+    // to AVSubtitle text rects, written as SRT cues.
+    ok = decodeSubtitleStreamToSrt(in, subStream, params.outputPath,
+                                    params);
+  }
+  avformat_close_input(&in);
+  if (!ok) {
+    result.error = Error::make(
+        ErrorCode::UnsupportedFeature,
+        std::string("cannot extract subtitle codec ") +
+            avcodec_get_name(cid) +
+            " (bitmap formats need OCR, which is outside V1)",
+        "ffmpeg");
+    std::error_code ec;
+    std::filesystem::remove(params.outputPath, ec);
+    return result;
+  }
+  result.success = true;
+  result.framesProcessed = 1;
+  return result;
 }
 
 ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
@@ -2298,6 +2512,10 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   caps.audioResampling = true;
   caps.subtitlePassthrough = true;
   caps.subtitleBurnIn = true;
+  // Extraction: text formats copy to sidecars natively; container-internal
+  // text (mov_text/ttml) decodes to SRT. Bitmap formats (PGS/DVB/VobSub)
+  // need OCR and refuse honestly.
+  caps.subtitleExtract = true;
   // Milestone 4: the FFmpeg stage workers decode to Yuv420P through
   // swscale and encode/mux from CPU frames.
   caps.stageDecodeToCpuFrames = true;

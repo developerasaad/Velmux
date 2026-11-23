@@ -884,7 +884,13 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   }
   ValidationExpectation expect;
   expect.container = record.pipeline.container;
-  if (record.request.video.enabled) {
+  if (!record.pipeline.sidecarExtension.empty()) {
+    // Extraction job: the artifact is a text sidecar; validate cues.
+    expect.subtitleSidecar = true;
+    expect.expectVideo = false;
+    expect.expectAudio = false;
+    expect.expectedDurationSec = 0.0;
+  } else if (record.request.video.enabled) {
     expect.videoCodec = record.pipeline.videoCodec;
     if (!record.sourceInfo.video.empty()) {
       expect.expectedHeight = record.request.video.resolutionHeight.value_or(
@@ -949,8 +955,12 @@ std::string JobManager::outputNameFor(const JobRecord &record) const {
   if (dot != std::string::npos && dot > 0) {
     stem = stem.substr(0, dot);
   }
+  // Extraction jobs produce a text sidecar whose extension comes from
+  // the track's format (planner-decided), not a media container.
   const std::string ext =
-      containerName(record.pipeline.container);
+      !record.pipeline.sidecarExtension.empty()
+          ? record.pipeline.sidecarExtension
+          : containerName(record.pipeline.container);
   std::string name = stem.empty() ? "velmux-output" : stem;
   name += "-velmux." + ext;
   std::string path = config_.dataDir + "/outputs/" + name;

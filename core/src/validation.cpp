@@ -6,6 +6,9 @@
 
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 namespace velmux::core {
 
@@ -60,6 +63,42 @@ ValidationReport OutputValidator::validate(const std::string &outputPath,
     return report;
   }
   report.outputBytes = bytes;
+
+  // Subtitle-extraction jobs: the output is a text sidecar. Validate the
+  // cue structure directly (independent of the code that wrote it) — the
+  // inspector cannot parse SRT/VTT/ASS files as media containers.
+  if (expect.subtitleSidecar) {
+    if (bytes < expect.minimumBytes) {
+      report.problems.push_back("Subtitle sidecar is suspiciously small (" +
+                                std::to_string(bytes) + " bytes).");
+    }
+    std::ifstream in(outputPath, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    std::size_t cues = 0;
+    for (std::size_t pos = 0; pos < text.size();) {
+      const std::size_t eol = text.find('\n', pos);
+      const std::string line =
+          text.substr(pos, eol == std::string::npos ? std::string::npos
+                                                    : eol - pos);
+      // SRT/WebVTT cues carry "-->"; ASS/SSA carry "Dialogue:" lines.
+      if (line.find("-->") != std::string::npos ||
+          line.rfind("Dialogue:", 0) == 0) {
+        ++cues;
+      }
+      if (eol == std::string::npos) {
+        break;
+      }
+      pos = eol + 1;
+    }
+    if (cues == 0) {
+      report.problems.push_back(
+          "Subtitle sidecar contains no recognizable cues.");
+    }
+    report.ok = report.problems.empty();
+    return report;
+  }
+
   if (bytes < expect.minimumBytes) {
     report.problems.push_back("Output file is suspiciously small (" +
                               std::to_string(bytes) + " bytes).");

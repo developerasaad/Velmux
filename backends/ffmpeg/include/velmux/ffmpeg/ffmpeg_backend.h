@@ -44,6 +44,11 @@ public:
 
 private:
   velmux::backend::ExecuteResult executeRemux(const velmux::backend::ExecuteParams &params);
+  // Subtitle-extraction job: first text subtitle track to a sidecar file
+  // (stream copy for native text formats, decode+re-encode to SRT for
+  // container-internal text like MP4 mov_text).
+  velmux::backend::ExecuteResult
+  executeSubtitleExtract(const velmux::backend::ExecuteParams &params);
   velmux::backend::ExecuteResult
   executeTranscode(const velmux::backend::ExecuteParams &params);
   // Single pass over [rangeStartUs, rangeEndUs) of the source; used directly

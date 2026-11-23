@@ -122,14 +122,41 @@ PlanResult Planner::plan(const MediaInfo &source,
 
   // Subtitle policy constraints (never silently discard: removal must be
   // explicit).
+  bool extractJob = false;
   if (request.subtitles.policy == SubtitlePolicy::Extract) {
-    // Extraction to sidecar files is not implemented yet. Reject honestly
-    // instead of silently dropping the tracks (D-013).
-    result.feasible = false;
-    result.message =
-        "Subtitle extraction is not implemented in this build yet; tracks "
-        "can be preserved, removed, or burned in.";
-    return result;
+    // Extraction produces a text sidecar, not a media container: it is a
+    // subtitle-only job. Mixed "convert + extract" would need two outputs;
+    // v1 asks for two jobs (honest refusal, no silent half-work).
+    extractJob = true;
+    if (request.video.enabled || request.audio.enabled) {
+      result.feasible = false;
+      result.message =
+          "Subtitle extraction is a standalone operation in this build: "
+          "disable video and audio for the extract job.";
+      return result;
+    }
+    if (!source.hasSubtitles()) {
+      result.feasible = false;
+      result.message = "This source has no subtitle track to extract.";
+      return result;
+    }
+    // v1 extracts the first subtitle track. Bitmap formats need OCR
+    // (outside V1, spec §14); CEA captions ride the video elementary
+    // stream and have no demuxed track here.
+    const SubtitleFormat first = source.subtitles.front().format;
+    const bool textExtractable =
+        first == SubtitleFormat::Srt || first == SubtitleFormat::WebVtt ||
+        first == SubtitleFormat::Ass || first == SubtitleFormat::Ssa ||
+        first == SubtitleFormat::MovText || first == SubtitleFormat::Ttml;
+    if (!textExtractable) {
+      result.feasible = false;
+      result.message =
+          std::string("The first subtitle track (") +
+          subtitleFormatName(first) +
+          ") cannot be extracted: bitmap and CEA formats need OCR, which "
+          "is outside V1.";
+      return result;
+    }
   }
   // Trim window sanity (spec §15/§16). Executors clamp against the real
   // duration; an inverted or empty window is a request error.
@@ -180,6 +207,65 @@ PlanResult Planner::plan(const MediaInfo &source,
     double preferenceScore = 0.0;
   };
   std::vector<Candidate> candidates;
+
+  // Extraction candidates: demux + subtitle processing on a backend that
+  // extracts. The artifact is a text sidecar; the extension comes from the
+  // track's format (native text copies as-is, container-internal text
+  // decodes to SRT).
+  if (extractJob) {
+    const SubtitleFormat first = source.subtitles.front().format;
+    for (BackendId backend : caps_.registeredBackends()) {
+      const auto *caps = caps_.capabilitiesOf(backend);
+      if (caps == nullptr || !caps->subtitleExtract) {
+        continue;
+      }
+      if (std::find(caps->readableContainers.begin(),
+                    caps->readableContainers.end(),
+                    source.container) ==
+          caps->readableContainers.end()) {
+        continue;
+      }
+      const char *ext = "srt";
+      switch (first) {
+        case SubtitleFormat::WebVtt:
+          ext = "vtt";
+          break;
+        case SubtitleFormat::Ass:
+        case SubtitleFormat::Ssa:
+          ext = "ass";
+          break;
+        default:
+          break; // Srt/MovText/Ttml -> SRT (copy or decode)
+      }
+      Candidate candidate;
+      Pipeline &pipeline = candidate.pipeline;
+      pipeline.stages.push_back({StageId::Demux, backend});
+      pipeline.stages.push_back({StageId::SubtitleProcessing, backend});
+      pipeline.container = source.container; // artifact is the sidecar
+      pipeline.sidecarExtension = ext;
+      pipeline.subtitleStreamCopy = false;
+      const BackendPrior &prior = priorFor(backend);
+      candidate.throughput = prior.softwareFps * 20.0; // demux-level work
+      candidate.setupMs = prior.setupMs;
+      candidate.transferMs = 0.0;
+      candidate.usesHardware = false;
+      candidate.preferenceScore = 0.0;
+      pipeline.summary = std::string("Extract subtitles (") +
+                         (pipeline.sidecarExtension == "ass" ? "ASS" : "SRT") +
+                         ") to a sidecar file";
+      if (source.subtitles.size() > 1) {
+        pipeline.summary += " (track 1 of " +
+                            std::to_string(source.subtitles.size()) + ")";
+      }
+      candidates.push_back(std::move(candidate));
+    }
+    if (candidates.empty()) {
+      result.feasible = false;
+      result.message =
+          "No registered backend can extract subtitles on this device.";
+      return result;
+    }
+  }
 
   const bool canStreamCopyVideo =
       wantsVideo && source.video.front().codec == outVideoCodec &&
@@ -403,14 +489,19 @@ PlanResult Planner::plan(const MediaInfo &source,
   };
 
   // Stream-copy first (never re-encode unnecessarily), then transcodes.
-  if (streamCopyIsValid &&
-      (sameContainer || features_.containerAccepts(outContainer, outVideoCodec))) {
-    for (BackendId backend : caps_.registeredBackends()) {
-      addCandidate(backend, true);
+  // Extraction jobs already have their candidates; generating transcode
+  // candidates for a subtitle-only request would be meaningless.
+  if (!extractJob) {
+    if (streamCopyIsValid &&
+        (sameContainer ||
+         features_.containerAccepts(outContainer, outVideoCodec))) {
+      for (BackendId backend : caps_.registeredBackends()) {
+        addCandidate(backend, true);
+      }
     }
-  }
-  for (BackendId backend : caps_.registeredBackends()) {
-    addCandidate(backend, false);
+    for (BackendId backend : caps_.registeredBackends()) {
+      addCandidate(backend, false);
+    }
   }
 
   // ----- Hybrid candidates (Milestone 4) -----------------------------------

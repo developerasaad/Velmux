@@ -685,7 +685,8 @@ TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
                                          "testsrc2=size=320x240:rate=12",
                                          "sine=frequency=440:sample_rate=44100", 2.0);
 
-  // Extraction is not implemented: the plan must refuse rather than drop.
+  // Extraction is a standalone subtitle-only job: a mixed convert+extract
+  // request must be refused rather than half-executed.
   ConversionRequest extract =
       transcodeRequest(av, Container::Mkv, VideoCodec::H264, AudioCodec::Aac);
   extract.subtitles.policy = SubtitlePolicy::Extract;
@@ -693,7 +694,7 @@ TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
       MediaSource{av, "av.mp4"}, extract);
   REQUIRE(plan.ok());
   CHECK_FALSE(plan.value().feasible);
-  CHECK(plan.value().message.find("extraction") != std::string::npos);
+  CHECK(plan.value().message.find("standalone") != std::string::npos);
 
   // Burn-in without any subtitle source is invalid.
   ConversionRequest burnNothing =
@@ -1065,4 +1066,141 @@ TEST_CASE("sample generation fails honestly on a broken source") {
                        VideoCodec::H264, AudioCodec::Aac),
       2);
   REQUIRE_FALSE(sample.ok());
+}
+
+// ---------------------------------------------------------------------------
+// Subtitle extraction (spec §14): text tracks to sidecar files
+// ---------------------------------------------------------------------------
+
+TEST_CASE("REAL extraction: MKV/SRT track to a sidecar .srt through the engine") {
+  TestEnv env;
+  // Base A/V fixture + SRT sidecar muxed into MKV (copy).
+  const std::string av =
+      generateFixture(env.dir / "av.mkv", "testsrc2=size=160x120:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const std::string srtPath = (env.dir / "subs.srt").string();
+  writeFile(env.dir / "subs.srt", kSampleSrt);
+  const std::string mkv = muxWithSubtitles(av, env.dir / "subs.srt",
+                                           env.dir / "withsubs.mkv");
+
+  ConversionRequest request;
+  request.source.uri = mkv;
+  request.source.displayName = "withsubs.mkv";
+  request.goal.kind = GoalKind::Custom;
+  request.video.enabled = false;
+  request.audio.enabled = false;
+  request.subtitles.policy = SubtitlePolicy::Extract;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  REQUIRE(jobs.size() == 1);
+  const std::string outputPath = jobs.front().outputPath;
+  // The artifact is a text sidecar with the SRT extension.
+  REQUIRE(outputPath.size() > 4);
+  CHECK(outputPath.substr(outputPath.size() - 4) == ".srt");
+  REQUIRE(std::filesystem::exists(outputPath));
+
+  // INDEPENDENT content check (not the code that wrote it): the cue text
+  // from the source SRT survives, with real cue timing lines.
+  const std::string extracted = readFile(outputPath);
+  CHECK(extracted.find("BURNMARKERTEXT") != std::string::npos);
+  CHECK(extracted.find("Second cue") != std::string::npos);
+  CHECK(extracted.find("-->") != std::string::npos);
+  CHECK(extracted.size() > 40);
+}
+
+TEST_CASE("REAL extraction: MP4 mov_text decodes to SRT") {
+  TestEnv env;
+  // MP4 with a mov_text subtitle track (the container-internal text
+  // format that cannot stream-copy into a sidecar).
+  const std::string av =
+      generateFixture(env.dir / "av.mp4", "testsrc2=size=160x120:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  writeFile(env.dir / "subs.srt", kSampleSrt);
+  const std::string mp4 = (env.dir / "movtext.mp4").string();
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error -i \"" + av +
+      "\" -i \"" + (env.dir / "subs.srt").string() +
+      "\" -map 0:v -map 0:a -map 1:0 -c:v copy -c:a copy -c:s mov_text " +
+      mp4;
+  REQUIRE(std::system(cmd.c_str()) == 0);
+
+  ConversionRequest request;
+  request.source.uri = mp4;
+  request.source.displayName = "movtext.mp4";
+  request.goal.kind = GoalKind::Custom;
+  request.video.enabled = false;
+  request.audio.enabled = false;
+  request.subtitles.policy = SubtitlePolicy::Extract;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  const std::string outputPath = jobs.front().outputPath;
+  CHECK(outputPath.substr(outputPath.size() - 4) == ".srt");
+  const std::string extracted = readFile(outputPath);
+  CHECK(extracted.find("BURNMARKERTEXT") != std::string::npos);
+  CHECK(extracted.find("-->") != std::string::npos);
+}
+
+TEST_CASE("extraction refusals stay honest") {
+  TestEnv env;
+  const std::string mkv = [&] {
+    const std::string av =
+        generateFixture(env.dir / "av.mkv", "testsrc2=size=160x120:rate=10",
+                        "sine=frequency=440:sample_rate=44100", 1.0);
+    writeFile(env.dir / "subs.srt", kSampleSrt);
+    return muxWithSubtitles(av, env.dir / "subs.srt", env.dir / "s.mkv");
+  }();
+
+  SUBCASE("mixed convert+extract is refused, not half-executed") {
+    ConversionRequest request;
+    request.source.uri = mkv;
+    request.source.displayName = "s.mkv";
+    request.goal.kind = GoalKind::Custom;
+    request.video.enabled = true;
+    request.audio.enabled = true;
+    request.subtitles.policy = SubtitlePolicy::Extract;
+    const Result<PlanResult> plan =
+        env.engine->plan(MediaSource{mkv, "s.mkv"}, request);
+    REQUIRE(plan.ok());
+    CHECK_FALSE(plan.value().feasible);
+    CHECK(plan.value().message.find("standalone") != std::string::npos);
+  }
+
+  SUBCASE("no subtitle track is an honest refusal") {
+    const std::string plain =
+        generateFixture(env.dir / "plain.mp4",
+                        "testsrc2=size=160x120:rate=10",
+                        "sine=frequency=440:sample_rate=44100", 1.0);
+    ConversionRequest request;
+    request.source.uri = plain;
+    request.source.displayName = "plain.mp4";
+    request.goal.kind = GoalKind::Custom;
+    request.video.enabled = false;
+    request.audio.enabled = false;
+    request.subtitles.policy = SubtitlePolicy::Extract;
+    const Result<PlanResult> plan =
+        env.engine->plan(MediaSource{plain, "plain.mp4"}, request);
+    REQUIRE(plan.ok());
+    CHECK_FALSE(plan.value().feasible);
+    CHECK(plan.value().message.find("no subtitle track") !=
+          std::string::npos);
+  }
 }
