@@ -270,3 +270,87 @@ TEST_CASE_FIXTURE(Fixture, "alternates are ranked best-first") {
     CHECK(plan.alternates[i - 1].cost <= plan.alternates[i].cost);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 4: hybrid candidate generation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Scenario registry: FFmpeg decodes VP9 (and stage-decodes to CPU frames)
+// but cannot encode HEVC; Android encodes HEVC (stage-encodes from CPU
+// frames) but cannot decode VP9. Only a hybrid pipeline can serve
+// VP9 -> HEVC.
+CapabilityRegistry hybridScenarioCaps() {
+  CapabilityRegistry caps;
+  BackendCapabilities ffmpeg;
+  ffmpeg.backend = BackendId::Ffmpeg;
+  ffmpeg.implementation = "scenario";
+  ffmpeg.canInspect = true;
+  ffmpeg.video.push_back(VideoCapability{VideoCodec::VP9,
+                                         {true, false, true}, false, 0, 0});
+  ffmpeg.video.push_back(VideoCapability{VideoCodec::H264,
+                                         {true, true, true}, false, 0, 0});
+  ffmpeg.audio.push_back(AudioCapability{AudioCodec::Aac, {true, true, true}});
+  ffmpeg.readableContainers = {Container::Mp4};
+  ffmpeg.writableContainers = {Container::Mp4};
+  ffmpeg.stageDecodeToCpuFrames = true;
+
+  BackendCapabilities android;
+  android.backend = BackendId::Android;
+  android.implementation = "scenario-hw";
+  android.canInspect = true;
+  android.video.push_back(VideoCapability{VideoCodec::HEVC,
+                                          {false, true, true}, true, 3840,
+                                          2160});
+  android.audio.push_back(AudioCapability{AudioCodec::Aac, {true, true, true}});
+  android.readableContainers = {Container::Mp4};
+  android.writableContainers = {Container::Mp4};
+  android.stageEncodeFromCpuFrames = true;
+
+  caps.registerBackend(ffmpeg);
+  caps.registerBackend(android);
+  return caps;
+}
+
+} // namespace
+
+TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single backend suffices") {
+  CapabilityRegistry scenario = hybridScenarioCaps();
+  Planner scenarioPlanner{FeatureRegistry::instance(), scenario, nullptr};
+
+  MediaInfo source = h264AacSource();
+  source.video.front().codec = VideoCodec::VP9;
+
+  ConversionRequest request;
+  request.outputContainer = Container::Mp4;
+  request.goal.kind = GoalKind::Custom;
+  request.video.codec = VideoCodec::HEVC;
+  request.audio.codec = AudioCodec::Aac;
+
+  const PlanResult plan = scenarioPlanner.plan(source, request);
+  REQUIRE(plan.feasible);
+  REQUIRE(plan.best.has_value());
+  const Pipeline &pipeline = plan.best->pipeline;
+  CHECK_FALSE(pipeline.videoStreamCopy);
+  // The decode side is FFmpeg (the only VP9 decoder); the encode/mux side
+  // is Android (the only HEVC encoder).
+  CHECK(pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
+  CHECK(pipeline.assigns(StageId::Demux, BackendId::Ffmpeg));
+  CHECK(pipeline.assigns(StageId::Encode, BackendId::Android));
+  CHECK(pipeline.assigns(StageId::Mux, BackendId::Android));
+  CHECK(pipeline.summary.find("Hybrid") != std::string::npos);
+  // Inspected source rate reaches the pipeline for encoder/muxer timing.
+  CHECK(pipeline.sourceFrameRate == doctest::Approx(30.0));
+
+  // Sanity: single-backend scenarios never degrade to hybrid (the normal
+  // Fixture registry serves H.264 -> HEVC through FFmpeg alone).
+  ConversionRequest single = request;
+  single.video.codec = VideoCodec::HEVC;
+  source.video.front().codec = VideoCodec::H264;
+  const PlanResult classic = planner.plan(source, single);
+  REQUIRE(classic.feasible);
+  REQUIRE(classic.best.has_value());
+  CHECK(classic.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
+  CHECK(classic.best->pipeline.assigns(StageId::Encode, BackendId::Ffmpeg));
+}

@@ -1,6 +1,7 @@
 #include "velmux/ffmpeg/ffmpeg_backend.h"
 #include "velmux/ffmpeg/codec_mapping.h"
 #include "subtitle_tools.h"
+#include "ffmpeg_util.h"
 
 #include "velmux/core/compression.h"
 #include "velmux/core/feature_registry.h"
@@ -77,82 +78,8 @@ void initFfmpegLabel() {
   });
 }
 
-std::string avErrorString(int errnum) {
-  char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
-  av_strerror(errnum, buf, sizeof(buf));
-  return buf;
-}
-
-Error makeAvError(ErrorCode code, const std::string &context, int errnum) {
-  return Error::make(code, context + ": " + avErrorString(errnum), "ffmpeg");
-}
-
-// Map a Velmux quality request (0..100) to the encoder's CRF-style quality
-// parameter (higher quality -> lower CRF).
-int qualityToCrf(VideoCodec codec, std::int32_t quality) {
-  const int q = std::clamp(quality, 0, 100);
-  switch (codec) {
-    case VideoCodec::H264: // libx264 crf 0..51
-      return 51 - (q * 51) / 100;
-    case VideoCodec::AV1: // libsvtav1 crf 0..63
-    case VideoCodec::VP9: // libvpx-vp9 crf 0..63
-    case VideoCodec::VP8:
-      return 63 - (q * 63) / 100;
-    default:
-      return 23;
-  }
-}
-
-// Concrete libavcodec encoder names for the feature-selected build: prefer
-// the external libraries Velmux pins (tools/ffmpeg-builder/versions.json).
-const char *encoderNameFor(VideoCodec codec) {
-  switch (codec) {
-    case VideoCodec::H264:
-      return "libx264";
-    case VideoCodec::AV1:
-      return "libsvtav1";
-    case VideoCodec::VP8:
-      return "libvpx-vp8";
-    case VideoCodec::VP9:
-      return "libvpx-vp9";
-    case VideoCodec::Mpeg4Part2:
-      return "mpeg4";
-    case VideoCodec::Ffv1:
-      return "ffv1";
-    case VideoCodec::Mjpeg:
-      return "mjpeg";
-    default:
-      return nullptr; // HEVC software encoder not pinned in V1 host build
-  }
-}
-
-const char *encoderNameFor(AudioCodec codec) {
-  switch (codec) {
-    case AudioCodec::Aac:
-    case AudioCodec::HeAac:
-      return "aac"; // FFmpeg-native AAC encoder
-    case AudioCodec::Mp3:
-      return "libmp3lame";
-    case AudioCodec::Opus:
-      return "libopus";
-    case AudioCodec::Vorbis:
-      return "libvorbis";
-    case AudioCodec::Flac:
-      return "flac";
-    case AudioCodec::Alac:
-      return "alac";
-    case AudioCodec::Pcm:
-      return "pcm_s16le";
-    case AudioCodec::Ac3:
-      return "ac3";
-    case AudioCodec::Eac3:
-      return "eac3";
-    case AudioCodec::WavPack:
-      return "wavpack";
-    default:
-      return nullptr;
-  }
-}
+// Shared helpers (avErrorString, makeAvError, qualityToCrf,
+// encoderNameFor) live in ffmpeg_util.h.
 
 struct CodecCleanup {
   ~CodecCleanup() {
@@ -2209,6 +2136,10 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   caps.audioResampling = true;
   caps.subtitlePassthrough = true;
   caps.subtitleBurnIn = true;
+  // Milestone 4: the FFmpeg stage workers decode to Yuv420P through
+  // swscale and encode/mux from CPU frames.
+  caps.stageDecodeToCpuFrames = true;
+  caps.stageEncodeFromCpuFrames = true;
 
   const auto &features = FeatureRegistry::instance();
 

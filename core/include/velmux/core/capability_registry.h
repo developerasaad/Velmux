@@ -51,6 +51,12 @@ struct BackendCapabilities {
   bool subtitlePassthrough = false;
   // Can the backend render (burn in) subtitles onto the video?
   bool subtitleBurnIn = false;
+  // Milestone 4 stage-composition participation: can this backend decode
+  // video into CPU frames (Yuv420P interchange) for a hybrid pipeline?
+  bool stageDecodeToCpuFrames = false;
+  // Can this backend encode video from CPU frames and mux the result
+  // (with stream-copied audio) for a hybrid pipeline?
+  bool stageEncodeFromCpuFrames = false;
   // Free-form implementation label, e.g. "ffmpeg 7.1.1 (static, feature
   // selected)" or "MediaCodec (OMX.qcom.video.encoder.avc)".
   std::string implementation;

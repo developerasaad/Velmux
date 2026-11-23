@@ -8,7 +8,7 @@
 #include "subtitle_tools.h"
 
 #include "velmux/core/engine.h"
-
+#include "velmux/core/hybrid_executor.h"
 #include <doctest/doctest.h>
 
 #include <condition_variable>
@@ -836,5 +836,121 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
     const ProbeResult probe = probeWith(outPath);
     CHECK(probe.videoCodec == "vp9");
     CHECK(probe.durationSec == doctest::Approx(60.0).epsilon(0.05));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 4: hybrid (stage-composed) execution through the core executor
+// ---------------------------------------------------------------------------
+
+TEST_CASE("REAL hybrid composition: FFmpeg stages through the core HybridExecutor") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+
+  // Stage-split pipeline: decode side and mux side both FFmpeg here — the
+  // composition machinery, buffer interchange and muxer coordination are
+  // exactly what a native<->FFmpeg split will use on device; the CPU-frame
+  // boundary is real regardless of who owns each side.
+  velmux::core::HybridExecutor hybrid({env.backend});
+  Pipeline pipeline;
+  const auto assign = [&pipeline](StageId stage) {
+    pipeline.stages.push_back({stage, BackendId::Ffmpeg});
+  };
+  assign(StageId::Demux);
+  assign(StageId::Decode);
+  assign(StageId::VideoProcessing);
+  assign(StageId::AudioProcessing);
+  assign(StageId::Encode);
+  assign(StageId::Mux);
+  assign(StageId::Bitstream);
+  pipeline.videoCodec = VideoCodec::VP9;
+  pipeline.audioCodec = AudioCodec::Aac;
+  pipeline.container = Container::Mkv;
+  pipeline.sourceFrameRate = 12.0;
+  pipeline.audioStreamCopy = true;
+
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mkv, VideoCodec::VP9,
+                       AudioCodec::Aac);
+  request.subtitles.policy = SubtitlePolicy::Remove;
+
+  velmux::backend::ExecuteParams params;
+  params.pipeline = pipeline;
+  params.request = request;
+  params.outputPath = (env.dir / "hybrid-out.mkv").string();
+  params.jobId = "hybrid-test";
+  params.cancel = std::make_shared<velmux::backend::CancelToken>();
+  std::vector<double> progressFractions;
+  params.onProgress = [&progressFractions](
+                          const velmux::backend::ProgressReport &report) {
+    if (report.fraction >= 0.0) {
+      progressFractions.push_back(report.fraction);
+    }
+  };
+
+  REQUIRE(hybrid.canExecute(pipeline, request));
+  const auto result = hybrid.execute(params);
+  INFO("hybrid error: " << result.error.message);
+  REQUIRE(result.success);
+  // 2s * 12fps; allow the encoder to close the GOP with the exact count.
+  CHECK(result.framesProcessed >= 23);
+  CHECK(result.framesProcessed <= 25);
+  CHECK_FALSE(progressFractions.empty());
+  CHECK(progressFractions.back() > 0.9);
+  CHECK(result.wallClockSec > 0.0);
+
+  // INDEPENDENT ffprobe cross-check: video re-encoded, audio copied.
+  const ProbeResult probe = probeWith(params.outputPath);
+  CHECK(probe.videoCodec == "vp9");
+  CHECK(probe.audioCodec == "aac");
+  CHECK(probe.width == 320);
+  CHECK(probe.height == 240);
+  CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+  CHECK(std::filesystem::file_size(params.outputPath) > 8192);
+}
+
+TEST_CASE("hybrid executor refuses shapes outside its v1 contract") {
+  TestEnv env;
+  velmux::core::HybridExecutor hybrid({env.backend});
+
+  ConversionRequest request; // defaults: video+audio enabled
+  request.subtitles.policy = SubtitlePolicy::Remove;
+
+  Pipeline pipeline;
+  const auto assign = [&pipeline](StageId stage) {
+    pipeline.stages.push_back({stage, BackendId::Ffmpeg});
+  };
+  assign(StageId::Demux);
+  assign(StageId::Decode);
+  assign(StageId::VideoProcessing);
+  assign(StageId::AudioProcessing);
+  assign(StageId::Encode);
+  assign(StageId::Mux);
+  assign(StageId::Bitstream);
+
+  SUBCASE("video stream copy is whole-pipeline work") {
+    pipeline.videoStreamCopy = true;
+    CHECK_FALSE(hybrid.canExecute(pipeline, request));
+  }
+  SUBCASE("audio transcode is whole-pipeline work") {
+    pipeline.audioStreamCopy = false;
+    CHECK_FALSE(hybrid.canExecute(pipeline, request));
+  }
+  SUBCASE("subtitle preservation needs whole-pipeline backends") {
+    request.subtitles.policy = SubtitlePolicy::Preserve;
+    CHECK_FALSE(hybrid.canExecute(pipeline, request));
+  }
+  SUBCASE("geometry changes need whole-pipeline backends") {
+    request.video.resolutionHeight = 144;
+    CHECK_FALSE(hybrid.canExecute(pipeline, request));
+  }
+  SUBCASE("single-backend stage assignment shape is required") {
+    Pipeline bad = pipeline;
+    bad.stages.clear();
+    bad.stages.push_back({StageId::Decode, BackendId::Apple}); // unregistered
+    bad.stages.push_back({StageId::Mux, BackendId::Ffmpeg});
+    CHECK_FALSE(hybrid.canExecute(bad, request));
   }
 }

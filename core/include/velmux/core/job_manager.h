@@ -43,6 +43,7 @@ namespace velmux::core {
 class Planner;
 class OutputValidator;
 class TelemetryStore;
+class HybridExecutor;
 
 struct EngineConfig {
   // Directory for the SQLite database and recovery artifacts. Must be
@@ -148,6 +149,9 @@ private:
   TelemetryStore &telemetry_;
   OutputValidator *validator_ = nullptr;
   std::vector<backend::IBackend *> backends_;
+  // Stage-composed executor over backends_ (Milestone 4); created in
+  // setBackends().
+  std::unique_ptr<HybridExecutor> hybrid_;
   std::map<std::string, RunningJob> running_;
   std::uint64_t nextGeneration_ = 0; // guarded by mutex_
   mutable std::mutex mutex_;

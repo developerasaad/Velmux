@@ -2,6 +2,7 @@
 
 #include "velmux/backend/contracts.h"
 #include "velmux/core/compression.h"
+#include "velmux/core/hybrid_executor.h"
 #include "velmux/core/planner.h"
 #include "velmux/core/recovery.h"
 #include "velmux/core/telemetry.h"
@@ -133,6 +134,9 @@ JobManager::~JobManager() = default;
 
 void JobManager::setBackends(std::vector<backend::IBackend *> backends) {
   backends_ = std::move(backends);
+  // The hybrid executor composes stages across the registered backends
+  // (Milestone 4); it re-seeds whenever the backend set changes.
+  hybrid_ = std::make_unique<HybridExecutor>(backends_);
 }
 
 void JobManager::setValidator(OutputValidator *validator) {
@@ -557,7 +561,10 @@ void JobManager::executeJob(const std::string &jobId) {
   }
 
   backend::IBackend *backend = backendFor(pipeline);
-  if (backend == nullptr || backend->executor() == nullptr) {
+  const bool hybridPath =
+      backend == nullptr && hybrid_ != nullptr &&
+      hybrid_->canExecute(pipeline, record->request);
+  if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
       return; // superseded by a newer run of this job
@@ -619,12 +626,20 @@ void JobManager::executeJob(const std::string &jobId) {
     }
   }
 
-  const backend::ExecuteResult execResult = backend->executor()->execute(params);
+  const backend::ExecuteResult execResult =
+      hybridPath ? hybrid_->execute(params)
+                 : backend->executor()->execute(params);
 
   // Feed real observations into telemetry (performance learning).
   if (execResult.wallClockSec > 0.0) {
     PerfRecord perf;
-    perf.backend = backend->id();
+    perf.backend = hybridPath
+                        ? pipeline.assigns(StageId::Mux, BackendId::Android)
+                              ? BackendId::Android
+                          : pipeline.assigns(StageId::Mux, BackendId::Apple)
+                              ? BackendId::Apple
+                              : BackendId::Ffmpeg
+                        : backend->id();
     if (pipeline.videoStreamCopy == false && !info.video.empty()) {
       perf.videoCodec = pipeline.videoCodec;
     }

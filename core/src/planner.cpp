@@ -308,6 +308,10 @@ PlanResult Planner::plan(const MediaInfo &source,
     pipeline.videoCodec = outVideoCodec;
     pipeline.audioCodec = outAudioCodec;
     pipeline.container = outContainer;
+    pipeline.sourceFrameRate =
+        source.hasVideo() && source.video.front().frameRate > 0.0
+            ? source.video.front().frameRate
+            : 0.0;
     pipeline.videoStreamCopy = streamCopy && canStreamCopyVideo;
     pipeline.audioStreamCopy = streamCopy && canStreamCopyAudio;
     pipeline.subtitleStreamCopy =
@@ -395,6 +399,116 @@ PlanResult Planner::plan(const MediaInfo &source,
   }
   for (BackendId backend : caps_.registeredBackends()) {
     addCandidate(backend, false);
+  }
+
+  // ----- Hybrid candidates (Milestone 4) -----------------------------------
+  // Only when no single-backend transcode candidate exists: hybrid
+  // execution exists for pipelines that would otherwise have NO valid
+  // route (e.g. a source codec only backend A can decode, an output codec
+  // only backend B can encode). Single-backend pipelines keep winning
+  // whenever they exist — cross-backend CPU-frame copies cost real time.
+  const bool hasTranscodeCandidate = std::any_of(
+      candidates.begin(), candidates.end(), [](const Candidate &c) {
+        return !c.pipeline.videoStreamCopy;
+      });
+  if (wantsVideo && !hasTranscodeCandidate) {
+    const bool audioCopyable =
+        !wantsAudio ||
+        (source.hasAudio() &&
+         source.audio.front().codec == outAudioCodec &&
+         features_.audioSupport(source.audio.front().codec).streamCopy &&
+         features_.containerAccepts(outContainer, source.audio.front().codec));
+    for (BackendId decodeBackend : caps_.registeredBackends()) {
+      const auto *decodeCaps = caps_.capabilitiesOf(decodeBackend);
+      if (decodeCaps == nullptr || !decodeCaps->stageDecodeToCpuFrames) {
+        continue;
+      }
+      if (std::find(decodeCaps->readableContainers.begin(),
+                    decodeCaps->readableContainers.end(),
+                    source.container) ==
+          decodeCaps->readableContainers.end()) {
+        continue;
+      }
+      const auto decoders = caps_.backendsFor(source.video.front().codec,
+                                              CodecOp::Decode);
+      if (std::find(decoders.begin(), decoders.end(), decodeBackend) ==
+          decoders.end()) {
+        continue;
+      }
+      for (BackendId muxBackend : caps_.registeredBackends()) {
+        const auto *muxCaps = caps_.capabilitiesOf(muxBackend);
+        if (muxCaps == nullptr || !muxCaps->stageEncodeFromCpuFrames) {
+          continue;
+        }
+        if (std::find(muxCaps->writableContainers.begin(),
+                      muxCaps->writableContainers.end(),
+                      outContainer) == muxCaps->writableContainers.end()) {
+          continue;
+        }
+        // The mux side opens the same file for the audio copy.
+        if (std::find(muxCaps->readableContainers.begin(),
+                      muxCaps->readableContainers.end(),
+                      source.container) ==
+            muxCaps->readableContainers.end()) {
+          continue;
+        }
+        const auto encoders =
+            caps_.backendsFor(outVideoCodec, CodecOp::Encode);
+        if (std::find(encoders.begin(), encoders.end(), muxBackend) ==
+            encoders.end()) {
+          continue;
+        }
+        if (!audioCopyable) {
+          continue; // v1 hybrid carries only stream-copyable audio
+        }
+        if (!features_.containerAccepts(outContainer, outVideoCodec)) {
+          continue;
+        }
+
+        Candidate candidate;
+        Pipeline &pipeline = candidate.pipeline;
+        pipeline.stages.push_back({StageId::Demux, decodeBackend});
+        pipeline.stages.push_back({StageId::Decode, decodeBackend});
+        pipeline.stages.push_back({StageId::VideoProcessing, decodeBackend});
+        if (wantsAudio) {
+          pipeline.stages.push_back({StageId::AudioProcessing, muxBackend});
+        }
+        pipeline.stages.push_back({StageId::Encode, muxBackend});
+        pipeline.stages.push_back({StageId::Mux, muxBackend});
+        pipeline.stages.push_back({StageId::Bitstream, muxBackend});
+        pipeline.videoCodec = outVideoCodec;
+        pipeline.audioCodec = outAudioCodec;
+        pipeline.container = outContainer;
+        pipeline.sourceFrameRate =
+            source.hasVideo() && source.video.front().frameRate > 0.0
+                ? source.video.front().frameRate
+                : 0.0;
+        pipeline.videoStreamCopy = false;
+        pipeline.audioStreamCopy = wantsAudio;
+        pipeline.subtitleStreamCopy = false;
+
+        // Cost: the slower side bounds throughput; CPU-frame copies add
+        // transfer on every frame.
+        const BackendPrior &decPrior = priorFor(decodeBackend);
+        const BackendPrior &muxPrior = priorFor(muxBackend);
+        candidate.throughput = std::min(decPrior.softwareFps,
+                                        muxPrior.softwareFps) *
+                               0.7;
+        candidate.setupMs = decPrior.setupMs + muxPrior.setupMs;
+        candidate.transferMs = decPrior.transferMsPerFrame +
+                               muxPrior.transferMsPerFrame;
+        candidate.usesHardware =
+            caps_.videoCapability(muxBackend, outVideoCodec)
+                .value_or(VideoCapability{})
+                .hardware;
+        candidate.preferenceScore = 0.0;
+        pipeline.summary =
+            std::string("Hybrid: ") + backendName(decodeBackend) +
+            " decode -> " + backendName(muxBackend) + " encode -> " +
+            containerName(outContainer);
+        candidates.push_back(std::move(candidate));
+      }
+    }
   }
 
   if (candidates.empty()) {

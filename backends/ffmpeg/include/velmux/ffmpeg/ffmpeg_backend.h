@@ -15,6 +15,8 @@
 #include "velmux/backend/contracts.h"
 #include "velmux/core/types.h"
 
+#include "velmux/ffmpeg/ffmpeg_stages.h"
+
 #include <string>
 
 namespace velmux::ffmpeg {
@@ -65,10 +67,13 @@ public:
 
   velmux::backend::IInspector *inspector() override { return &inspector_; }
   velmux::backend::IPipelineExecutor *executor() override { return &executor_; }
+  // Milestone 4: every FFmpeg stage participates in hybrid pipelines.
+  velmux::backend::IStageBackend *stages() override { return &stageBackend_; }
 
 private:
   FfmpegInspector inspector_;
   FfmpegExecutor executor_;
+  velmux::ffmpeg::FfmpegStageBackend stageBackend_;
   std::string implementationLabel_;
 };
 

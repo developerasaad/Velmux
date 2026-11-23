@@ -36,6 +36,7 @@ add_library(velmux_core
   core/src/validation.cpp
   core/src/scheduler.cpp
   core/src/job_manager.cpp
+  core/src/hybrid_executor.cpp
   core/src/engine.cpp
 )
 add_library(velmux::core ALIAS velmux_core)
@@ -129,6 +130,7 @@ if(VELMUX_FFMPEG_FOUND)
     add_library(velmux_backend_ffmpeg
       backends/ffmpeg/src/codec_mapping.cpp
       backends/ffmpeg/src/ffmpeg_backend.cpp
+      backends/ffmpeg/src/ffmpeg_stages.cpp
       backends/ffmpeg/src/subtitle_tools.cpp
     )
     add_library(velmux::backend-ffmpeg ALIAS velmux_backend_ffmpeg)

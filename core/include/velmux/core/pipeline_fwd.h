@@ -18,6 +18,10 @@ struct Pipeline {
   VideoCodec videoCodec = VideoCodec::H264;
   AudioCodec audioCodec = AudioCodec::Aac;
   Container container = Container::Mp4;
+  // Source frame rate as inspected (0 when unknown). Hybrid executors
+  // need it for encoder/muxer timing when the user did not request a
+  // rate change.
+  double sourceFrameRate = 0.0;
   // Stream-copy flags (never re-encode unnecessarily).
   bool videoStreamCopy = false;
   bool audioStreamCopy = false;
