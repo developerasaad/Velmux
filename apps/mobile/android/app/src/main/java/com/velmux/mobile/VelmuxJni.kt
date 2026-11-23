@@ -19,6 +19,11 @@ object VelmuxJni {
   external fun nativeDestroyEngine(handle: Long)
   external fun nativeInspect(handle: Long, uri: String, displayName: String): ByteArray
   external fun nativePlan(handle: Long, requestJson: String): ByteArray
+  external fun nativeGenerateSample(
+    handle: Long,
+    requestJson: String,
+    sampleSeconds: Int
+  ): ByteArray
   external fun nativeStartJob(handle: Long, requestJson: String): ByteArray
   external fun nativeGetJob(handle: Long, jobId: String): ByteArray
   external fun nativeIsJobActive(handle: Long, jobId: String): Boolean

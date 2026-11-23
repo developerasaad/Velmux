@@ -115,6 +115,14 @@ jbyteArray nativePlan(JNIEnv *env, jclass, jlong handle, jstring requestJson) {
                      velmux_plan(asEngine(handle), request.c_str()));
 }
 
+jbyteArray nativeGenerateSample(JNIEnv *env, jclass, jlong handle,
+                                  jstring requestJson, jint sampleSeconds) {
+  const std::string request = utf16ToUtf8(env, requestJson);
+  return toJsonBytes(env, velmux_generate_sample(asEngine(handle),
+                                                 request.c_str(),
+                                                 int(sampleSeconds)));
+}
+
 jbyteArray nativeStartJob(JNIEnv *env, jclass, jlong handle,
                           jstring requestJson) {
   const std::string request = utf16ToUtf8(env, requestJson);
@@ -192,6 +200,8 @@ const JNINativeMethod kVelmuxJniMethods[] = {
      reinterpret_cast<void *>(nativeInspect)},
     {"nativePlan", "(JLjava/lang/String;)[B",
      reinterpret_cast<void *>(nativePlan)},
+    {"nativeGenerateSample", "(JLjava/lang/String;I)[B",
+     reinterpret_cast<void *>(nativeGenerateSample)},
     {"nativeStartJob", "(JLjava/lang/String;)[B",
      reinterpret_cast<void *>(nativeStartJob)},
     {"nativeGetJob", "(JLjava/lang/String;)[B",

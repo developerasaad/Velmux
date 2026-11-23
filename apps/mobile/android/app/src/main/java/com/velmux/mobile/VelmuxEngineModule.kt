@@ -36,6 +36,13 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
     Executors.newSingleThreadExecutor { runnable ->
       Thread(runnable, "velmux-events").apply { isDaemon = true }
     }
+
+  // Sample generation is a synchronous engine call: it runs on its own
+  // worker so neither the JS thread nor the event poller ever blocks.
+  private val sampleExecutor =
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "velmux-samples").apply { isDaemon = true }
+    }
   private val listenerCount = AtomicInteger(0)
   @Volatile private var polling = false
 
@@ -105,6 +112,28 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
     complete(promise, callJson { handle ->
       VelmuxJni.nativePlan(handle, requestJson(request))
     })
+  }
+
+  override fun generateSample(
+    request: ReadableMap,
+    sampleSeconds: Double,
+    promise: Promise
+  ) {
+    // Sample generation is a synchronous engine call: run it on the
+    // module's background executor so the JS thread never blocks.
+    sampleExecutor.execute {
+      try {
+        complete(promise, callJson { handle ->
+          VelmuxJni.nativeGenerateSample(
+            handle,
+            requestJson(request),
+            sampleSeconds.toInt().coerceAtLeast(1)
+          )
+        })
+      } catch (error: RuntimeException) {
+        promise.reject("E_ENGINE", "sample generation failed", error)
+      }
+    }
   }
 
   override fun startJob(request: ReadableMap, promise: Promise) {

@@ -66,6 +66,9 @@ export interface ConversionRequest {
     timingOffsetMs: number;
   };
   processingMode: 'auto' | 'preferNative' | 'preferSoftware' | 'balanced';
+  // Window on the source timeline, microseconds (spec §15/§16 trimming).
+  // endUs null = open-ended.
+  trim: {startUs: number; endUs: number | null} | null;
 }
 export interface JobSnapshot {
   id: string;
@@ -96,6 +99,12 @@ export interface ResourceUpdate {
   onBattery?: boolean;
   hardwareCodecAvailable?: boolean;
 }
+export interface SampleResult {
+  path: string;
+  startUs: number;
+  endUs: number;
+  sizeBytes: number;
+}
 export interface Spec extends TurboModule {
   inspect(source: MediaSource): Promise<MediaInfo>;
   plan(request: ConversionRequest): Promise<{
@@ -104,6 +113,13 @@ export interface Spec extends TurboModule {
     feasible: boolean;
     message: string | null;
   }>;
+  // Sample generation (spec §20): synchronously produce a short preview
+  // of the requested settings over the densest section of the source.
+  // Runs on the module's background worker; resolve carries the sample.
+  generateSample(
+    request: ConversionRequest,
+    sampleSeconds: number
+  ): Promise<SampleResult>;
   startJob(request: ConversionRequest): Promise<string>;
   cancelJob(jobId: string): Promise<boolean>;
   pauseJob(jobId: string): Promise<boolean>;

@@ -27,6 +27,7 @@ NSString *const kVelmuxEventName = @"velmux.jobEvent";
   std::atomic<int> _listenerCount;
   std::atomic<bool> _polling;
   dispatch_queue_t _pollQueue;
+  dispatch_queue_t _sampleQueue;
 }
 
 RCT_EXPORT_MODULE(VelmuxEngine)
@@ -37,6 +38,7 @@ RCT_EXPORT_MODULE(VelmuxEngine)
     _engine = nullptr;
     _engineQueue = dispatch_queue_create("velmux.engine", DISPATCH_QUEUE_SERIAL);
     _pollQueue = dispatch_queue_create("velmux.events", DISPATCH_QUEUE_SERIAL);
+    _sampleQueue = dispatch_queue_create("velmux.samples", DISPATCH_QUEUE_SERIAL);
     _listenerCount = 0;
     _polling = false;
   }
@@ -204,6 +206,15 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   json += "}";
   json += ",\"processingMode\":\"" +
           std::string(request.processingMode().UTF8String) + "\"";
+  if (request.trim().has_value()) {
+    const auto trim = *request.trim();
+    json += ",\"trim\":{\"startUs\":" +
+            std::to_string(int64_t(trim.startUs()));
+    if (trim.endUs().has_value()) {
+      json += ",\"endUs\":" + std::to_string(int64_t(*trim.endUs()));
+    }
+    json += "}";
+  }
   json += "}";
   return json;
 }
@@ -291,6 +302,32 @@ RCT_EXPORT_MODULE(VelmuxEngine)
     raw = velmux_plan(engine, json.c_str());
   });
   [self complete:[self ownedString:raw] resolve:resolve reject:reject];
+}
+
+- (void)generateSample:(JS::NativeVelmux::ConversionRequest &)request
+         sampleSeconds:(double)sampleSeconds
+               resolve:(RCTPromiseResolveBlock)resolve
+                reject:(RCTPromiseRejectBlock)reject {
+  VelmuxEngineHandle *engine = [self engineOrError:reject];
+  if (engine == nullptr) {
+    return;
+  }
+  const std::string json = [self requestJson:request];
+  // Sample generation is a long synchronous engine call: run it on the
+  // dedicated samples queue so neither the method queue nor the engine
+  // queue (plan/start/cancel control paths) blocks behind it.
+  dispatch_async(_sampleQueue, ^{
+    char *raw = velmux_generate_sample(engine, json.c_str(),
+                                       (int)MAX(1.0, sampleSeconds));
+    NSString *text = [self ownedString:raw];
+    NSDictionary *parsed = [self parseObject:text.UTF8String];
+    if (parsed[@"error"] != nil &&
+        [parsed[@"error"] isKindOfClass:[NSString class]]) {
+      reject(@"E_ENGINE", parsed[@"error"], nil);
+      return;
+    }
+    resolve(parsed);
+  });
 }
 
 - (void)startJob:(JS::NativeVelmux::ConversionRequest &)request

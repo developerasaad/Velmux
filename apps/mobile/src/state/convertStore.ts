@@ -575,5 +575,6 @@ export function computeRequest(draft: ConvertDraft): ConversionRequest | null {
       timingOffsetMs: draft.subtitles.timingOffsetMs,
     },
     processingMode: draft.processingMode,
+    trim: null,
   };
 }
