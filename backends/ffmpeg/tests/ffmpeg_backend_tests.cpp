@@ -1213,15 +1213,20 @@ TEST_CASE("extraction refusals stay honest") {
 
 TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
   TestEnv env;
+  // faststart puts moov at the FRONT: the truncated file still parses and
+  // plans, so the run+validate path (the interesting one) is exercised.
   const std::string full =
       generateFixture(env.dir / "full.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 4.0);
-  // Cut the file at ~60%: the header stays parseable, the tail is gone.
+  const std::string fast = (env.dir / "fast.mp4").string();
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+                       full + "\" -c copy -movflags faststart \"" + fast + "\"")
+                          .c_str()) == 0);
+  // Cut at ~60%: header parseable, media tail gone.
   const std::string truncated = (env.dir / "cut.mp4").string();
-  const std::int64_t fullSize =
-      std::filesystem::file_size(full);
+  const std::int64_t fullSize = std::filesystem::file_size(fast);
   {
-    std::ifstream in(full, std::ios::binary);
+    std::ifstream in(fast, std::ios::binary);
     std::ofstream out(truncated, std::ios::binary | std::ios::trunc);
     const std::int64_t keep = fullSize * 6 / 10;
     std::vector<char> buf(static_cast<std::size_t>(keep));
@@ -1234,9 +1239,10 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
   ConversionRequest request = transcodeRequest(
       truncated, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
 
-  // Either the inspector refuses outright, or the job runs and the
-  // VALIDATOR catches the short output. Both are honest; a Completed
-  // state would be fake success.
+  // Three honest outcomes, one forbidden (Completed):
+  //  a) inspection refuses (Result not ok),
+  //  b) the plan is infeasible with a reason,
+  //  c) the job runs and the VALIDATOR catches the short output.
   const Result<PlanResult> plan =
       env.engine->plan(MediaSource{truncated, "cut.mp4"}, request);
   if (plan.ok() && plan.value().feasible) {
@@ -1250,38 +1256,41 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
                             << " error: " << terminal->error);
     REQUIRE(terminal->state == JobState::Failed);
     CHECK(terminal->error.size() > 0);
-  } else {
+  } else if (plan.ok()) {
     CHECK(plan.value().message.size() > 0);
+  } else {
+    CHECK(plan.error().message.size() > 0);
   }
 }
 
-TEST_CASE("HARDENING: source disappearing before a retry fails cleanly") {
+TEST_CASE("HARDENING: source disappearing before a resume fails cleanly") {
   TestEnv env;
+  // Long enough to still be running when the pause lands.
   const std::string source =
       generateFixture(env.dir / "gone.mp4", "testsrc2=size=320x240:rate=12",
-                      "sine=frequency=440:sample_rate=44100", 2.0);
+                      "sine=frequency=440:sample_rate=44100", 20.0);
   ConversionRequest request =
-      transcodeRequest(source, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
+      transcodeRequest(source, Container::WebM, VideoCodec::VP9,
+                       AudioCodec::Opus);
 
-  // Phase 1: a normal run completes (the file exists).
+  // Phase 1: start, then pause while running.
   EventWaiter waiter;
   env.engine->events().subscribe(&waiter);
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
-  const auto first = waiter.waitForTerminal(std::chrono::seconds(120));
-  REQUIRE(first.has_value());
-  REQUIRE(first->state == JobState::Completed);
-
-  // Phase 2: the source vanishes, then the user retries. Deterministic:
-  // retry re-queues and the executor must fail at open time - cleanly,
-  // never a crash and never fake success.
+  // Wait until it is actually running, then pause.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  const Result<bool> paused = env.engine->pauseJob(jobId.value());
+  REQUIRE(paused.ok());
+  REQUIRE(paused.value());
+  // Phase 2: the source vanishes while the job sits paused; resume must
+  // fail cleanly at open time - never a crash, never fake success.
   std::filesystem::remove(source);
   waiter.reset();
-  const Result<bool> retried = env.engine->retryJob(jobId.value());
-  REQUIRE(retried.ok());
-  REQUIRE(retried.value());
-  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  const Result<bool> resumed = env.engine->resumeJob(jobId.value());
+  REQUIRE(resumed.ok());
+  REQUIRE(resumed.value());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(240));
   REQUIRE(terminal.has_value());
   INFO("terminal state: " << int(terminal->state)
                           << " error: " << terminal->error);
