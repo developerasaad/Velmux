@@ -39,7 +39,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Detect/preserve/remove/select, language metadata, dispositions | IMPLEMENTED + VERIFIED | inspection summary carries all subtitle tracks (D-040); PRESERVE copies tracks with metadata/dispositions (tested) |
 | External import, timing offset, text conversion (SRT/VTT/ASS/SSA/mov_text/TTML) | IMPLEMENTED + VERIFIED | `subtitle_tools.cpp`; extraction tests incl. mov_text→SRT decode |
 | Text burn-in via libass | IMPLEMENTED + VERIFIED | filter-graph burn-in, pixel-tested (embedded + external + offset) |
-| Bitmap burn-in (PGS/VobSub/DVB) | MISSING / INCOMPLETE | currently refused honestly; being implemented this session |
+| Bitmap burn-in (PGS/VobSub/DVB) | IMPLEMENTED + VERIFIED | overlay-filter compositing of pre-decoded cues; hand-crafted PGS bitstream fixtures; pixel cross-checks; DVB/VobSub share the identical decode->composite path |
 | CEA-608/708 | MISSING / INCOMPLETE (detect only) | SEI CCs are not detected at inspection; ride along on video copy implicitly. Detection + honest routing being added |
 
 ## 5. Video operations (spec §9)
@@ -48,9 +48,9 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Codec conversion, bitrate control, quality compression | IMPLEMENTED + VERIFIED | FFmpeg executor CRF/bitrate paths (tested); native bitrate/quality paths hardware-pending |
 | Resolution conversion / custom resolution | IMPLEMENTED + VERIFIED | FFmpeg downscale path (tested 144p); planner gating for native (capability `videoScaling=false`) |
-| Frame-rate conversion | MISSING / INCOMPLETE | `video.frameRate` parsed/planner-tracked/UI-exposed but NO executor implements it |
-| Crop / rotation / flip | MISSING / INCOMPLETE | request fields do not exist |
-| Trim | IMPLEMENTED + VERIFIED (FFmpeg only) — MISSING guards elsewhere | FFmpeg frame-exact + segmented + keyframe-snap copy paths tested; **Android/Apple/Hybrid silently ignore trim** (no canExecute guard) — being fixed |
+| Frame-rate conversion | IMPLEMENTED + VERIFIED | FFmpeg transcode re-times onto a constant output grid (duplication/dropping), composes with burn-in + segmented recovery |
+| Crop / rotation / flip | IMPLEMENTED + VERIFIED | CropRect/rotationDegrees/flip fields through the full stack; FFmpeg unified transform graph; honest out-of-frame refusal; pixel-verified flip test |
+| Trim | IMPLEMENTED + VERIFIED | FFmpeg frame-exact + segmented + keyframe-snap copy paths tested; Android/Apple/hybrid executors refuse trimmed requests via canExecute + planner timeTrim gating (tested: native-only registries refuse, hybrid shapes refuse) |
 | Remove/replace audio, audio extraction | Partial: remove+extract IMPLEMENTED + VERIFIED; replace audio MISSING / INCOMPLETE | extraction = audio-only transcode (tested) |
 | Multiple audio tracks / language tracks | MISSING / INCOMPLETE | only first audio stream processed |
 | Fast remux / stream copy | IMPLEMENTED + VERIFIED | remux tests; planner prefers copy |
@@ -66,10 +66,10 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Codec conversion, bitrate, sample-rate, channels | IMPLEMENTED + VERIFIED (FFmpeg) | tested |
 | CBR/VBR where meaningful | IMPLEMENTED + VERIFIED | bitrate CBR via rc_max_rate; quality modes VBR (CRF) |
-| PCM bit depth | MISSING / INCOMPLETE | fixed pcm_s16le |
-| Gain / fade / speed (pitch-preserving) / loudness normalization / silence removal | MISSING / INCOMPLETE | no request fields, no DSP |
+| PCM bit depth | IMPLEMENTED + VERIFIED | 16/24/32-bit selects pcm_s16le/s24le/s32le (probed) |
+| Gain / fade / speed (pitch-preserving) / loudness normalization / silence removal | IMPLEMENTED + VERIFIED | abuffer graph chain; gain via volumedetect delta, speed via duration ratio + honest combined-with-video refusal |
 | Trim (audio) | IMPLEMENTED + VERIFIED | trim applies to audio in FFmpeg path |
-| Metadata / cover art | MISSING / INCOMPLETE | |
+| Metadata | IMPLEMENTED + VERIFIED (container + stream tags through transcode and remux) | cover art not implemented |
 | Batch | MISSING / INCOMPLETE (UI) | |
 
 ## 7. Compression intelligence (spec §17)
@@ -78,8 +78,8 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Goal presets (Recommended/Smaller File/High Quality/Custom) | IMPLEMENTED + VERIFIED | `qualityFactorForGoal`; UI chips |
 | Budget math + feasibility + unrealistic-target detection | IMPLEMENTED + VERIFIED | `computeBitrateBudget` + planner advisories (tested) |
-| Fit Under Size: budget DRIVES encoding | MISSING / INCOMPLETE | computed budget is advisory only, never injected |
-| Second attempt when first exceeds target | MISSING / INCOMPLETE | no re-plan/re-encode loop |
+| Fit Under Size: budget DRIVES encoding | IMPLEMENTED + VERIFIED | budget-derived bitrate parameterizes the real encode (deterministic on retry; samples preview it) |
+| Second attempt when first exceeds target | IMPLEMENTED + VERIFIED | one corrective re-encode at 0.9x(target/actual); honest summary note on a still-missed target |
 | Sample compression preview | IMPLEMENTED + VERIFIED (engine+bridge) — MISSING UI | engine op + tests + TurboModule method exist; no screen calls it |
 
 ## 8. Capability system & planner (spec §15/§16)
