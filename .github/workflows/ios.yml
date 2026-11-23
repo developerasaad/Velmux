@@ -125,3 +125,12 @@ jobs:
         working-directory: apps/mobile/ios
         run: |
           xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO
+
+      # Release configuration must stay green on every push too: catches
+      # optimizer/dead-code issues the Debug build never sees. The full
+      # release artifact pipeline (packaging, checksums, GitHub Release)
+      # lives in .github/workflows/release.yml.
+      - name: Build Release for the iOS simulator
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Release -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO

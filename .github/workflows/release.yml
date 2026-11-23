@@ -1,0 +1,487 @@
+# Velmux release pipeline.
+#
+# Tag-driven (push a v* tag) or manual dispatch. Produces the real release
+# artifacts and — only after every gate succeeds — a GitHub Release with:
+#   - Android release APK + AAB (R8-minified; CI-signed via secrets when
+#     configured, otherwise test-signed with the debug keystore and marked
+#     as such)
+#   - iOS Release-configuration simulator .app and an unsigned device .app
+#     (archive-capable; store signing requires credentials this repo does
+#     not commit)
+#   - R8 mapping + native symbols for crash symbolication
+#   - SHA-256 checksums and a machine-readable build manifest
+#
+# Gates (a Release is never published from a failing or incomplete build):
+#   1. host-tests: the full host suite (pinned FFmpeg build + all C++
+#      engine/backend/bridge tests through ctest) runs INSIDE this workflow.
+#   2. android-release and ios-release each consume the pinned FFmpeg
+#      artifacts from the latest successful ffmpeg-mobile run; a release
+#      build without the real FFmpeg backend is a hard failure (unlike the
+#      per-push CI builds, which degrade with a warning).
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.0-rc.1)'
+        required: true
+        default: 'v0.1.0-rc.1'
+      create_github_release:
+        description: 'Publish a GitHub Release when all gates pass'
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Gate - host engine tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsqlite3-dev meson pkg-config
+
+      - name: Verify CMake toolchain
+        run: |
+          if ! command -v cmake >/dev/null 2>&1; then
+            python3 -m pip install cmake ninja
+          fi
+          cmake --version
+
+      - name: Restore host FFmpeg cache
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            tools/ffmpeg-builder/out/host
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          restore-keys: |
+            ffmpeg-host-${{ runner.os }}-
+
+      - name: Build pinned host FFmpeg
+        id: build-ffmpeg
+        env:
+          VELMUX_FFMPEG_JOBS: 4
+        run: tools/ffmpeg-builder/build-host.sh
+
+      - name: Save host FFmpeg cache
+        if: steps.build-ffmpeg.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            tools/ffmpeg-builder/out/host
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+
+      - name: Configure, build, test
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVELMUX_BUILD_TESTS=ON -DVELMUX_FFMPEG_PREFIX="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/host"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+
+  android-release:
+    name: Android release artifacts
+    needs: host-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      version-name: ${{ steps.version.outputs.version-name }}
+      version-code: ${{ steps.version.outputs.version-code }}
+      ffmpeg-run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Derive version metadata
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.version }}"
+          fi
+          VERSION_NAME="${TAG#v}"
+          echo "version-name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version-code=1" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - name: Install JS dependencies
+        working-directory: apps/mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Release builds REQUIRE the real FFmpeg backend: a release artifact
+      # without it is an incomplete build (per-push CI may degrade with a
+      # warning; a release may not).
+      - name: Locate FFmpeg Android artifacts
+        id: ffmpeg-artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'ffmpeg-mobile.yml',
+                status: 'success',
+                per_page: 10,
+              },
+            );
+            const run = runs.find(
+              (r) => r.head_branch === 'main' && r.path === '.github/workflows/ffmpeg-mobile.yml',
+            );
+            if (!run) {
+              core.setFailed(
+                'No successful ffmpeg-mobile run on main: a release build requires the pinned FFmpeg artifacts. Dispatch the ffmpeg-mobile workflow first.',
+              );
+              return;
+            }
+            core.info(`Using FFmpeg artifacts from run ${run.id}`);
+            core.setOutput('run-id', String(run.id));
+
+      - name: Download FFmpeg Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: velmux-ffmpeg-android
+          run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: tools/ffmpeg-builder/out/android
+
+      - name: Prepare release signing
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        working-directory: apps/mobile/android/app
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.keystore
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "keystore=release.keystore" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No release signing secrets configured; the release build will be test-signed with the debug keystore. Store distribution requires a private release keystore (see docs/RELEASE.md)."
+          fi
+
+      - name: Assemble release APK and AAB
+        working-directory: apps/mobile/android
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          KEYSTORE: ${{ steps.signing.outputs.keystore }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          SIGN_ARGS=()
+          if [ "$SIGNED" = "true" ]; then
+            SIGN_ARGS=(-PvelmuxSigningKeystore="$KEYSTORE"
+                       -PvelmuxSigningStorePassword="$KEYSTORE_PASSWORD"
+                       -PvelmuxSigningKeyAlias="$KEY_ALIAS"
+                       -PvelmuxSigningKeyPassword="$KEY_PASSWORD")
+          fi
+          ./gradlew assembleRelease bundleRelease --no-daemon --stacktrace \
+            -PvelmuxFFmpegPrefix="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/android" \
+            -PvelmuxVersionName="${{ steps.version.outputs.version-name }}" \
+            -PvelmuxVersionCode="${{ steps.version.outputs.version-code }}" \
+            "${SIGN_ARGS[@]}"
+
+      - name: Collect artifacts
+        working-directory: apps/mobile/android/app/build/outputs
+        run: |
+          mkdir -p /tmp/velmux-release
+          cp apk/release/*.apk /tmp/velmux-release/
+          cp bundle/release/*.aab /tmp/velmux-release/
+          cp mapping/release/mapping.txt /tmp/velmux-release/r8-mapping.txt || true
+          # Unstripped native libs for crash symbolication.
+          cd /tmp/velmux-release
+          zip -r velmux-android-native-symbols.zip \
+            "$OLDPWD/intermediates/merged_native_libs/release" \
+            "$OLDPWD/intermediates/stripped_native_libs/release" > /dev/null 2>&1 || true
+          ls -la /tmp/velmux-release
+
+      - name: Upload Android release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-android-release
+          path: /tmp/velmux-release
+          if-no-files-found: error
+          retention-days: 14
+
+  ios-release:
+    name: iOS release build
+    needs: host-tests
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Derive version metadata
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.version }}"
+          fi
+          # CFBundleShortVersionString stays numeric; the rc suffix lives
+          # in the release tag and manifest.
+          MARKETING="${TAG#v}"
+          MARKETING="${MARKETING%%-*}"
+          echo "marketing=${MARKETING}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install JS dependencies
+        working-directory: apps/mobile
+        run: npm ci --no-audit --no-fund
+
+      # Release builds REQUIRE the real FFmpeg backend (see android-release).
+      - name: Locate FFmpeg iOS artifacts
+        id: ffmpeg-artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'ffmpeg-mobile.yml',
+                status: 'success',
+                per_page: 10,
+              },
+            );
+            const run = runs.find(
+              (r) => r.head_branch === 'main' && r.path === '.github/workflows/ffmpeg-mobile.yml',
+            );
+            if (!run) {
+              core.setFailed(
+                'No successful ffmpeg-mobile run on main: a release build requires the pinned FFmpeg artifacts. Dispatch the ffmpeg-mobile workflow first.',
+              );
+              return;
+            }
+            core.info(`Using FFmpeg artifacts from run ${run.id}`);
+            core.setOutput('run-id', String(run.id));
+
+      - name: Download FFmpeg iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: velmux-ffmpeg-ios
+          run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: tools/ffmpeg-builder/out/ios
+
+      - name: Package FFmpeg xcframework
+        run: |
+          if [ ! -d "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios/iphoneos" ]; then
+            echo "::error::FFmpeg iOS artifacts incomplete; a release build requires them."
+            exit 1
+          fi
+          bash tools/ffmpeg-builder/package-ios-xcframework.sh \
+            "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios" \
+            "${GITHUB_WORKSPACE}/ffmpeg-ios-packaged"
+          echo "VELMUX_FFMPEG_ROOT=${GITHUB_WORKSPACE}/ffmpeg-ios-packaged" >> "$GITHUB_ENV"
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        run: |
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods
+          fi
+          pod install
+
+      # Release configuration, signing-independent (CODE_SIGNING_ALLOWED=NO).
+      # Two artifacts:
+      #   1. simulator .app — directly runnable for validation;
+      #   2. unsigned device .app — archive-capable: re-signable/re-archivable
+      #      with real certificates. Not an IPA and never presented as one.
+      - name: Build Release for the iOS simulator
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild -workspace Velmux.xcworkspace -scheme Velmux \
+            -configuration Release -sdk iphonesimulator \
+            -derivedDataPath build-release \
+            MARKETING_VERSION=${{ steps.version.outputs.marketing }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build CODE_SIGNING_ALLOWED=NO
+
+      - name: Build Release for iOS devices (unsigned, archive-capable)
+        working-directory: apps/mobile/ios
+        run: |
+          xcodebuild -workspace Velmux.xcworkspace -scheme Velmux \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build-release-device \
+            MARKETING_VERSION=${{ steps.version.outputs.marketing }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''
+
+      - name: Package artifacts
+        working-directory: apps/mobile/ios
+        run: |
+          mkdir -p /tmp/velmux-release
+          cd build-release/Build/Products/Release-iphonesimulator
+          zip -qry /tmp/velmux-release/Velmux-Release-ios-simulator.app.zip Velmux.app
+          cd "${GITHUB_WORKSPACE}/apps/mobile/ios/build-release-device/Build/Products/Release-iphoneos"
+          zip -qry /tmp/velmux-release/Velmux-Release-ios-device-unsigned.app.zip Velmux.app
+          ls -la /tmp/velmux-release
+
+      - name: Upload iOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-ios-release
+          path: /tmp/velmux-release
+          if-no-files-found: error
+          retention-days: 14
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [host-tests, android-release, ios-release]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_github_release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Required to create the tag (when dispatching) and the Release.
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Derive release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/velmux-release-staging
+          pattern: velmux-*-release
+          merge-multiple: true
+
+      - name: Generate checksums and manifest
+        working-directory: /tmp/velmux-release-staging
+        env:
+          FF_ANDROID_RUN: ${{ needs.android-release.outputs.ffmpeg-run-id }}
+          SIGNED: ${{ needs.android-release.outputs.signed }}
+        run: |
+          sha256sum ./* > SHA256SUMS.txt 2>/dev/null || \
+            find . -maxdepth 1 -type f -exec sha256sum {} + > SHA256SUMS.txt
+          python3 - <<'PYEOF' > manifest.json
+          import hashlib, json, os, subprocess, sys, datetime
+          tag = "${{ steps.tag.outputs.tag }}"
+          files = {}
+          for name in sorted(os.listdir('.')):
+              if os.path.isfile(name):
+                  h = hashlib.sha256(open(name, 'rb').read()).hexdigest()
+                  files[name] = {"sha256": h, "bytes": os.path.getsize(name)}
+          manifest = {
+              "version": tag,
+              "commit": os.environ.get("GITHUB_SHA", ""),
+              "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "android": {
+                  "versionName": "${{ needs.android-release.outputs.version-name }}",
+                  "versionCode": int("${{ needs.android-release.outputs.version-code }}"),
+                  "signing": "release-keystore" if "${{ needs.android-release.outputs.signed }}" == "true" else "debug-keystore (test-signed; store distribution requires a private release keystore)",
+              },
+              "ios": {
+                  "artifact": "unsigned device .app (archive-capable); store distribution requires an Apple Developer certificate and re-signing",
+              },
+              "ffmpeg": {
+                  "source": "pinned sources in tools/ffmpeg-builder/versions.json",
+                  "versionsLock": subprocess.run(
+                      ["sha256sum", "tools/ffmpeg-builder/versions.json"],
+                      capture_output=True, text=True,
+                      cwd=os.environ.get("GITHUB_WORKSPACE", ".")).stdout.split()[0],
+              },
+              "artifacts": files,
+          }
+          json.dump(manifest, sys.stdout, indent=2)
+          PYEOF
+          cat manifest.json
+
+      - name: Select release notes
+        id: notes
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION_NAME="${TAG#v}"
+          if [ -f "docs/release-notes/${VERSION_NAME}.md" ]; then
+            echo "path=docs/release-notes/${VERSION_NAME}.md" >> "$GITHUB_OUTPUT"
+          else
+            cat > /tmp/velmux-release-notes.md <<EOF
+          # Velmux ${TAG}
+
+          Release candidate built from commit ${GITHUB_SHA}.
+
+          See docs/PROJECT_STATUS.md for the current implementation and
+          validation state, and docs/AUDIT.md for the feature audit.
+          EOF
+            echo "path=/tmp/velmux-release-notes.md" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: /tmp/velmux-release-staging
+        run: |
+          # RC versions publish as GitHub pre-releases; stable tags do not.
+          PRERELEASE_FLAG="--prerelease"
+          case "$TAG" in
+            *-rc*|*-alpha*|*-beta*|*-pre*) ;;
+            *) PRERELEASE_FLAG="" ;;
+          esac
+          # --target creates the tag at this SHA when dispatching manually.
+          gh release create "$TAG" ./* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Velmux $TAG" \
+            --notes-file "${{ steps.notes.outputs.path }}" \
+            $PRERELEASE_FLAG

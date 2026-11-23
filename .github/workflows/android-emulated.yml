@@ -64,10 +64,10 @@ jobs:
       - name: Install emulator runtime libraries
         run: |
           sudo apt-get update
-          # ubuntu-24.04: libasound2 is a transitional name for
-          # libasound2t64; the headless emulator links both it and Pulse.
-          sudo apt-get install -y libpulse0 libasound2t64 || \
-            sudo apt-get install -y libpulse0 libasound2
+          # Headless emulator runtime deps on ubuntu-24.04; libasound2 is
+          # the transitional name for libasound2t64 there.
+          sudo apt-get install -y libx11-6 libxcb1 libpulse0 libnss3
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -178,7 +178,10 @@ jobs:
           adb shell settings put global window_animation_scale 0 || true
           adb shell settings put global transition_animation_scale 0 || true
           adb shell settings put global animator_duration_scale 0 || true
-          ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace
+          # Only the emulator's ABI is built (-PvelmuxAbis=x86_64): the
+          # native engine build drops to a third of the full ABI set.
+          ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
+            -PvelmuxAbis=x86_64 -PreactNativeArchitectures=x86_64
 
       - name: Save NDK cache
         if: steps.ndk-cache.outputs.cache-hit != 'true'

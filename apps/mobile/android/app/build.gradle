@@ -55,9 +55,28 @@ react {
 }
 
 /**
- * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
+ * Release engineering:
+ * - Version metadata is deterministic and injectable from CI
+ *   (-PvelmuxVersionName / -PvelmuxVersionCode); defaults mark the current
+ *   release candidate.
+ * - R8 runs on release builds; app-specific keeps live in
+ *   proguard-rules.pro (JNI facade + TurboModule codegen contracts).
+ * - Release signing consumes a CI-provided keystore via
+ *   -PvelmuxSigning* properties. When absent, the build falls back to the
+ *   debug keystore: the artifact is a REAL release build (R8-minified,
+ *   non-debuggable) that is test-signable — documented, never hidden.
  */
-def enableProguardInReleaseBuilds = false
+def enableProguardInReleaseBuilds = true
+
+def releaseVersionName = (project.findProperty('velmuxVersionName') ?: '0.1.0-rc.1').toString()
+def releaseVersionCode = (project.findProperty('velmuxVersionCode') ?: '1').toString().toInteger()
+
+def releaseKeystoreFile = project.findProperty('velmuxSigningKeystore')
+def releaseKeystorePassword = project.findProperty('velmuxSigningStorePassword')
+def releaseKeyAlias = project.findProperty('velmuxSigningKeyAlias')
+def releaseKeyPassword = project.findProperty('velmuxSigningKeyPassword')
+def hasReleaseSigning = releaseKeystoreFile != null && releaseKeystorePassword != null &&
+        releaseKeyAlias != null && releaseKeyPassword != null
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
@@ -83,8 +102,8 @@ android {
         // Velmux product floor: Android 10 / API 29 (docs/DECISIONS.md D-003).
         minSdkVersion 29
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode releaseVersionCode
+        versionName releaseVersionName
         // The pinned FFmpeg artifacts (tools/ffmpeg-builder/build-android.sh)
         // cover exactly these ABIs. Without the filter the NDK default set
         // would also build 32-bit x86, silently shipping an engine without
@@ -120,16 +139,26 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseKeystoreFile)
+                storePassword releaseKeystorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            // CI-provided release keystore when configured; otherwise the
+            // debug keystore signs a genuinely release-built artifact
+            // (test-signable, never presented as store-signed).
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources true
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
     }
