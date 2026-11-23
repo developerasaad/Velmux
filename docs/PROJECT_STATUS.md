@@ -81,7 +81,10 @@ the ultimate truth.
 - CI on GitHub Actions: core+tests (Linux, with the pinned FFmpeg built
   in-run), mobile TS checks, Android APK (with the FFmpeg artifacts), iOS
   simulator build (with the packaged FFmpeg xcframework), FFmpeg mobile
-  artifacts (manual dispatch).
+  artifacts (manual dispatch). ALL FIVE workflow families green
+  simultaneously as of 2ee6ce8: the Android APK and the iOS app both
+  build with the real FFmpeg backend linked, the hybrid composition and
+  subtitle-extraction integration tests pass on the host runner.
 - Hybrid stage-composed execution (M4, composition level): the FFmpeg
   backend exposes demux/decode/encode/mux stage workers; the core-owned
   HybridExecutor composes them across backends through the Yuv420P
