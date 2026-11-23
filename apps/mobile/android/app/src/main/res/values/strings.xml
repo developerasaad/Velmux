@@ -1,3 +1,21 @@
 <resources>
     <string name="app_name">Velmux</string>
+
+    <!-- Conversion notifications (M8): the foreground service renders
+         engine events; the strings stay plain and honest. -->
+    <string name="conversion_channel_active">Conversions in progress</string>
+    <string name="conversion_channel_results">Finished conversions</string>
+    <string name="conversion_preparing">Preparing conversion…</string>
+    <string name="conversion_running">Converting…</string>
+    <string name="conversion_running_many">Converting %1$d files…</string>
+    <string name="conversion_checkpointing">Saving progress…</string>
+    <string name="conversion_recovering">Resuming from checkpoint…</string>
+    <string name="conversion_action_cancel">Cancel</string>
+    <string name="conversion_completed_title">Conversion completed</string>
+    <string name="conversion_completed">Your file is ready</string>
+    <string name="conversion_completed_size">Output size: %1$s</string>
+    <string name="conversion_failed_title">Conversion failed</string>
+    <string name="conversion_failed">The job could not be completed</string>
+    <string name="conversion_canceled_title">Conversion canceled</string>
+    <string name="conversion_canceled">The job was canceled; completed work is kept</string>
 </resources>

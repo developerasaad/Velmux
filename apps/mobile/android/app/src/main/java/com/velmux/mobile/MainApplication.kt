@@ -22,6 +22,10 @@ class MainApplication : Application(), ReactApplication {
 
   override fun onCreate() {
     super.onCreate()
+    // Process-level engine host (M8): registered before any React surface
+    // so the foreground service can reach the engine from any lifecycle
+    // state.
+    EngineHolder.initialize(this)
     loadReactNative(this)
   }
 }

@@ -2,17 +2,20 @@
 // apps/mobile/src/native/NativeVelmux.ts) on top of the bridge C facade
 // from the VelmuxEngine pod.
 //
-// Mirrors the Android module (VelmuxEngineModule.kt): the engine is created
-// lazily in a durable Application Support directory, all job/event traffic
-// crosses the JSON facade, and events are polled at UI cadence and emitted
-// as "velmux.jobEvent". The C++ core owns everything durable; this module
-// owns nothing that survives process death.
+// Mirrors the Android module (VelmuxEngineModule.kt): all job/event
+// traffic crosses the JSON facade. The engine itself is process-owned by
+// VelmuxEngineHost (spec §22): it survives React bridge teardown, and the
+// host's event pump feeds both this module (UI) and the platform
+// notifications. The C++ core owns everything durable; this module owns
+// nothing that survives process death.
 #import <Foundation/Foundation.h>
 
 #import <RNVelmuxSpecs/RNVelmuxSpecs.h>
 #import <React/RCTBridge.h>
 #import <React/RCTInvalidating.h>
 #import <VelmuxEngine/velmux_bridge.h>
+
+#import "VelmuxEngineHost.h"
 
 #import <atomic>
 #import <string>
@@ -24,12 +27,10 @@ NSString *const kVelmuxEventName = @"velmux.jobEvent";
 @end
 
 @implementation VelmuxEngineModule {
-  VelmuxEngineHandle *_engine;
   dispatch_queue_t _engineQueue;
-  std::atomic<int> _listenerCount;
-  std::atomic<bool> _polling;
-  dispatch_queue_t _pollQueue;
   dispatch_queue_t _sampleQueue;
+  VelmuxEventListenerToken *_eventToken;
+  std::atomic<int> _listenerCount;
 }
 
 RCT_EXPORT_MODULE(VelmuxEngine)
@@ -37,55 +38,35 @@ RCT_EXPORT_MODULE(VelmuxEngine)
 - (instancetype)init {
   self = [super init];
   if (self != nil) {
-    _engine = nullptr;
     _engineQueue = dispatch_queue_create("velmux.engine", DISPATCH_QUEUE_SERIAL);
-    _pollQueue = dispatch_queue_create("velmux.events", DISPATCH_QUEUE_SERIAL);
     _sampleQueue = dispatch_queue_create("velmux.samples", DISPATCH_QUEUE_SERIAL);
     _listenerCount = 0;
-    _polling = false;
+    _eventToken = nil;
   }
   return self;
 }
 
-- (void)dealloc {
-  if (_engine != nullptr) {
-    velmux_engine_destroy(_engine);
-    _engine = nullptr;
-  }
-}
-
 - (void)invalidate {
   // The codegen base (plain NSObject) declares no invalidate; there is no
-  // super implementation to chain into.
-  if (_engine != nullptr) {
-    velmux_engine_destroy(_engine);
-    _engine = nullptr;
+  // super implementation to chain into. The engine is process-owned by
+  // the host and keeps running (spec §22).
+  if (_eventToken != nil) {
+    [[VelmuxEngineHost shared] removeListener:_eventToken];
+    _eventToken = nil;
   }
+  _listenerCount = 0;
 }
 
-// Engine lifecycle: created lazily in a durable per-app directory.
+// Engine access: the process-wide host engine, never owned here.
 - (VelmuxEngineHandle *)engineOrError:(RCTPromiseRejectBlock)reject {
-  if (_engine != nullptr) {
-    return _engine;
-  }
-  NSArray *dirs = NSSearchPathForDirectoriesInDomains(
-      NSApplicationSupportDirectory, NSUserDomainMask, YES);
-  NSString *base =
-      dirs.count > 0 ? dirs[0] : NSTemporaryDirectory();
-  NSString *dir = [base stringByAppendingPathComponent:@"VelmuxEngine"];
-  [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                            withIntermediateDirectories:YES
-                                             attributes:nil
-                                                  error:nil];
-  _engine =
-      velmux_engine_create(dir.UTF8String);
-  if (_engine == nullptr) {
+  VelmuxEngineHandle *engine = [VelmuxEngineHost shared].engine;
+  if (engine == nullptr) {
     if (reject != nil) {
       reject(@"E_ENGINE", @"cannot create the engine", nil);
     }
     return nullptr;
   }
-  return _engine;
+  return engine;
 }
 
 - (NSDictionary *)parseObject:(const std::string &)json {
@@ -223,45 +204,22 @@ RCT_EXPORT_MODULE(VelmuxEngine)
 }
 
 - (void)startEventPolling {
-  if (_listenerCount.load() <= 0 || _polling.exchange(true)) {
+  // The host's pump feeds this module as a listener (and the platform
+  // notifications); registering is idempotent.
+  if (_eventToken != nil || _listenerCount.load() <= 0) {
     return;
   }
   __weak VelmuxEngineModule *weakSelf = self;
-  dispatch_async(_pollQueue, ^{
+  _eventToken = [[VelmuxEngineHost shared] addListener:^(
+      NSDictionary *event) {
     VelmuxEngineModule *strongSelf = weakSelf;
-    if (strongSelf == nil) {
+    if (strongSelf == nil || strongSelf->_listenerCount.load() <= 0) {
       return;
     }
-    while (strongSelf->_listenerCount.load() > 0) {
-      VelmuxEngineHandle *engine = strongSelf->_engine;
-      if (engine == nullptr) {
-        break;
-      }
-      __block char *raw = nullptr;
-      dispatch_sync(strongSelf->_engineQueue, ^{
-        raw = velmux_poll_events(engine);
-      });
-      if (raw != nullptr) {
-        std::string text(raw);
-        velmux_free_string(raw);
-        if (text.size() > 2) { // more than "[]"
-          NSData *data =
-              [NSData dataWithBytes:text.data() length:text.size()];
-          NSError *error = nil;
-          id events = [NSJSONSerialization JSONObjectWithData:data options:0
-                                                         error:&error];
-          if (error == nil && [events isKindOfClass:[NSArray class]]) {
-            for (id event in events) {
-              strongSelf->_eventEmitterCallback(
-                  std::string(kVelmuxEventName.UTF8String), event);
-            }
-          }
-        }
-      }
-      [NSThread sleepForTimeInterval:0.25];
-    }
-    strongSelf->_polling = false;
-  });
+    strongSelf->_eventEmitterCallback(std::string(kVelmuxEventName.UTF8String),
+                                     event);
+  }];
+  [[VelmuxEngineHost shared] wake];
 }
 
 // ---- Spec methods -------------------------------------------------------------
@@ -545,8 +503,12 @@ RCT_EXPORT_MODULE(VelmuxEngine)
                 resolve:(RCTPromiseResolveBlock)resolve
                  reject:(RCTPromiseRejectBlock)reject {
   int remaining = _listenerCount.fetch_sub(int(count)) - int(count);
-  if (remaining < 0) {
+  if (remaining <= 0) {
     _listenerCount.store(0);
+    if (_eventToken != nil) {
+      [[VelmuxEngineHost shared] removeListener:_eventToken];
+      _eventToken = nil;
+    }
   }
   resolve(nil);
 }

@@ -7,7 +7,6 @@ import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.WritableArray
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
-import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
@@ -19,23 +18,16 @@ import org.json.JSONObject
  *
  * Owns no media policy: every decision is made by the C++ core reached
  * through the stable bridge facade. This class translates typed bridge
- * values to/from the engine's JSON contract and forwards job events to JS
- * by polling the engine's bounded event queue (coalesced to UI cadence).
+ * values to/from the engine's JSON contract and forwards job events to JS.
  *
- * The engine lives in the app's durable storage so committed work survives
- * process death; the C++ core owns recovery.
+ * The engine itself is process-owned (EngineHolder, spec §22): it survives
+ * React instance teardown, and the foreground ConversionService keeps the
+ * process alive while jobs run without the UI.
  */
 class VelmuxEngineModule(reactContext: ReactApplicationContext) :
   NativeVelmuxSpec(reactContext) {
 
   private val appContext = reactContext.applicationContext
-  private val engineLock = Any()
-  private var engineHandle: Long = 0L
-
-  private val eventExecutor =
-    Executors.newSingleThreadExecutor { runnable ->
-      Thread(runnable, "velmux-events").apply { isDaemon = true }
-    }
 
   // Sample generation is a synchronous engine call: it runs on its own
   // worker so neither the JS thread nor the event poller ever blocks.
@@ -43,37 +35,17 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
     Executors.newSingleThreadExecutor { runnable ->
       Thread(runnable, "velmux-samples").apply { isDaemon = true }
     }
-  private val listenerCount = AtomicInteger(0)
-  @Volatile private var polling = false
+  private val jsListener = JsEventForwarder()
+  @Volatile private var forwarding = false
 
-  // -- engine lifecycle --------------------------------------------------------
-
-  private fun engine(): Long {
-    synchronized(engineLock) {
-      if (engineHandle == 0L) {
-        val dataDir = File(appContext.filesDir, "velmux").apply { mkdirs() }
-        engineHandle = VelmuxJni.createEngine(dataDir)
-        require(engineHandle != 0L) {
-          "Velmux engine failed to initialize (no backend could start)"
-        }
-      }
-      return engineHandle
-    }
-  }
-
-  private fun destroyEngine() {
-    synchronized(engineLock) {
-      if (engineHandle != 0L) {
-        VelmuxJni.nativeDestroyEngine(engineHandle)
-        engineHandle = 0L
-      }
-    }
+  init {
+    EngineHolder.initialize(appContext)
   }
 
   // -- helpers -------------------------------------------------------------------
 
   private fun callJson(block: (handle: Long) -> ByteArray): String {
-    val bytes = block(engine())
+    val bytes = block(EngineHolder.engine())
     return String(bytes, Charsets.UTF_8)
   }
 
@@ -151,7 +123,7 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
         promise.reject("E_ENGINE", "engine returned no job id")
         return
       }
-      ensurePolling()
+      EngineHolder.wake()
       promise.resolve(jobId)
     } catch (error: JSONException) {
       promise.reject("E_ENGINE", "malformed engine response", error)
@@ -159,36 +131,36 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
   }
 
   override fun cancelJob(jobId: String, promise: Promise) {
-    promise.resolve(VelmuxJni.nativeCancelJob(engine(), jobId))
+    promise.resolve(VelmuxJni.nativeCancelJob(EngineHolder.engine(), jobId))
   }
 
   override fun pauseJob(jobId: String, promise: Promise) {
-    promise.resolve(VelmuxJni.nativePauseJob(engine(), jobId))
+    promise.resolve(VelmuxJni.nativePauseJob(EngineHolder.engine(), jobId))
   }
 
   override fun resumeJob(jobId: String, promise: Promise) {
-    val result = VelmuxJni.nativeResumeJob(engine(), jobId)
+    val result = VelmuxJni.nativeResumeJob(EngineHolder.engine(), jobId)
     if (result) {
-      ensurePolling()
+      EngineHolder.wake()
     }
     promise.resolve(result)
   }
 
   override fun retryJob(jobId: String, promise: Promise) {
-    val result = VelmuxJni.nativeRetryJob(engine(), jobId)
+    val result = VelmuxJni.nativeRetryJob(EngineHolder.engine(), jobId)
     if (result) {
-      ensurePolling()
+      EngineHolder.wake()
     }
     promise.resolve(result)
   }
 
   override fun deleteJob(jobId: String, promise: Promise) {
-    promise.resolve(VelmuxJni.nativeDeleteJob(engine(), jobId))
+    promise.resolve(VelmuxJni.nativeDeleteJob(EngineHolder.engine(), jobId))
   }
 
   override fun updateResources(resources: ReadableMap, promise: Promise) {
     promise.resolve(
-        VelmuxJni.nativeUpdateResources(engine(), JsonBridge.toJsonString(resources)))
+        VelmuxJni.nativeUpdateResources(EngineHolder.engine(), JsonBridge.toJsonString(resources)))
   }
 
   override fun getJob(jobId: String, promise: Promise) {
@@ -201,7 +173,7 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
   }
 
   override fun isJobActive(jobId: String, promise: Promise) {
-    promise.resolve(VelmuxJni.nativeIsJobActive(engine(), jobId))
+    promise.resolve(VelmuxJni.nativeIsJobActive(EngineHolder.engine(), jobId))
   }
 
   override fun listJobs(promise: Promise) {
@@ -236,78 +208,47 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
 
   // -- events -------------------------------------------------------------------------
 
+  /** Forwards engine events to JS while the JS listener count is > 0. */
+  private inner class JsEventForwarder : EngineHolder.EventListener {
+    override fun onJobEvent(event: JSONObject) {
+      if (!forwarding) {
+        return
+      }
+      val emitter = reactApplicationContext
+        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+      emitter.emit(JOB_EVENT_NAME, JsonBridge.toWritableMap(event))
+    }
+  }
+
+  private val jsListenerCount = AtomicInteger(0)
+
   override fun addListener(eventName: String, promise: Promise) {
-    listenerCount.incrementAndGet()
-    ensurePolling()
+    if (jsListenerCount.incrementAndGet() == 1) {
+      forwarding = true
+      EngineHolder.addListener(jsListener)
+    }
     promise.resolve(null)
   }
 
   override fun removeListeners(count: Double, promise: Promise) {
-    val remaining = listenerCount.updateAndGet { old ->
-      (old - count.toInt()).coerceAtLeast(0)
-    }
-    if (remaining == 0) {
-      polling = false
+    if (jsListenerCount.updateAndGet { old ->
+        (old - count.toInt()).coerceAtLeast(0)
+      } == 0 && forwarding
+    ) {
+      forwarding = false
+      EngineHolder.removeListener(jsListener)
     }
     promise.resolve(null)
   }
 
-  private fun ensurePolling() {
-    if (polling) {
-      return
-    }
-    polling = true
-    eventExecutor.execute(::pollLoop)
-  }
-
-  private fun pollLoop() {
-    // Coalesced cadence: fast enough for progress, quiet enough for the
-    // event pipe and notifications (the engine may drop superseded events
-    // under pressure; state transitions are never lost).
-    while (polling && listenerCount.get() > 0) {
-      try {
-        val handle = engine()
-        val bytes = VelmuxJni.nativePollEvents(handle)
-        val text = String(bytes, Charsets.UTF_8)
-        val events = JSONArray(text)
-        if (events.length() > 0) {
-          emitEvents(events)
-        }
-      } catch (error: IllegalStateException) {
-        // Engine unavailable mid-poll (teardown); stop quietly.
-        break
-      } catch (error: JSONException) {
-        // A malformed poll response must not kill the loop.
-      }
-      try {
-        Thread.sleep(POLL_INTERVAL_MS)
-      } catch (interrupted: InterruptedException) {
-        Thread.currentThread().interrupt()
-        break
-      }
-    }
-    polling = false
-  }
-
-  private fun emitEvents(events: JSONArray) {
-    val emitter = reactApplicationContext
-      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-    for (i in 0 until events.length()) {
-      val payload = events.getJSONObject(i)
-      emitter.emit(JOB_EVENT_NAME, JsonBridge.toWritableMap(payload))
-    }
-  }
-
   override fun invalidate() {
-    polling = false
-    listenerCount.set(0)
-    eventExecutor.shutdown()
-    destroyEngine()
+    EngineHolder.removeListener(jsListener)
+    forwarding = false
+    sampleExecutor.shutdown()
     super.invalidate()
   }
 
   private companion object {
     const val JOB_EVENT_NAME = "velmux.jobEvent"
-    const val POLL_INTERVAL_MS = 250L
   }
 }
