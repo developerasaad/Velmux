@@ -1022,11 +1022,13 @@ TEST_CASE("REAL sample generation: representative window, requested settings") {
   const std::string motion =
       generateFixture(env.dir / "motion.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
-                       fixture + "\" -i \"" + motion +
-                       "\" -filter_complex \"[0:v][1:v]concat=n=2:v=1:a=0[v];"
-                       "[0:a][1:a]concat=n=2:v=0:a=1[a]\" -map \"[v]\" -map "
-                       "\"[a]\" -c copy \"" +
+  // Concat the halves with the concat DEMUXER + stream copy (identical
+  // codec parameters; a filtergraph output cannot be stream-copied).
+  const std::filesystem::path listPath = env.dir / "concat-list.txt";
+  writeFile(listPath, "file '" + fixture + "'\nfile '" + motion + "'\n");
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error "
+                                     "-f concat -safe 0 -i \"" +
+                       listPath.string() + "\" -c copy \"" +
                        (env.dir / "mixed.mp4").string() + "\"")
                           .c_str()) == 0);
   const std::string mixed = (env.dir / "mixed.mp4").string();
