@@ -85,16 +85,16 @@ std::optional<AudioCodec> audioCodecFromFourCC(FourCharCode code) {
   }
 }
 
-const char *videoCodecCode(VideoCodec codec) {
+NSString *videoCodecCode(VideoCodec codec) {
   switch (codec) {
   case VideoCodec::H264:
-    return AVVideoCodecH264; // "avc1"
+    return AVVideoCodecTypeH264; // "avc1"
   case VideoCodec::HEVC:
-    return AVVideoCodecHEVC; // "hvc1"
+    return AVVideoCodecTypeHEVC; // "hvc1"
   default:
-    return nullptr; // VideoToolbox encodes H.264 and HEVC (plus ProRes on
-                    // capable hardware, not exposed through AVAssetWriter
-                    // settings portably).
+    return nil; // VideoToolbox encodes H.264 and HEVC (plus ProRes on
+                // capable hardware, not exposed through AVAssetWriter
+                // settings portably).
   }
 }
 
@@ -223,7 +223,7 @@ bool enumerateSupport(NativeSupport &out) {
   addVideo(VideoCodec::H264, true, true, hw264);
   addVideo(VideoCodec::HEVC, true, true, hw265);
   const bool hwProRes =
-      hardwareEncodeSupported(kCMVideoCodecType_ProRes422);
+      hardwareEncodeSupported(kCMVideoCodecType_AppleProRes422);
   addVideo(VideoCodec::ProRes, true, true, hwProRes);
   // VP9: hardware decode is publicly probeable on every Velmux Apple target
   // (VTIsHardwareDecodeSupported: macOS 10.13 / iOS 11+). VideoToolbox has
@@ -407,7 +407,7 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
   }
   session.outputURL = outUrl;
   session.outputFileType = AVFileTypeQuickTimeMovie;
-  const bool endsWith = [&outPath](const char *suffix) {
+  const auto endsWith = [&outPath](const char *suffix) {
     const std::string s(suffix);
     return outPath.size() >= s.size() &&
            outPath.compare(outPath.size() - s.size(), s.size(), s) == 0;
@@ -523,17 +523,17 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
 
   if (wantVideo) {
     // Decode to uncompressed frames (nil settings = native decode).
-    videoOutput = [AVAssetReaderTrackOutput
-        trackOutputWithTrack:videoTrack
-               outputSettings:nil];
+    videoOutput = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:videoTrack
+        outputSettings:nil];
     if (![reader canAddOutput:videoOutput]) {
       result.error = "cannot decode the video track";
       return result;
     }
     [reader addOutput:videoOutput];
 
-    const char *codecCode = videoCodecCode(pipeline.videoCodec);
-    if (codecCode == nullptr) {
+    NSString *codecCode = videoCodecCode(pipeline.videoCodec);
+    if (codecCode == nil) {
       result.error = "VideoToolbox cannot encode this output codec";
       return result;
     }
@@ -552,9 +552,8 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
       bitRate = std::int64_t(area * frameRate * (0.04 + 0.12 * quality));
       bitRate = std::clamp<std::int64_t>(bitRate, 300000, 40000000);
     }
-    NSString *codec = [NSString stringWithUTF8String:codecCode];
     NSDictionary *settings = @{
-      AVVideoCodecKey : codec,
+      AVVideoCodecKey : codecCode,
       AVVideoWidthKey : [NSNumber numberWithDouble:videoTrack.naturalSize.width],
       AVVideoHeightKey : [NSNumber numberWithDouble:videoTrack.naturalSize.height],
       AVVideoCompressionPropertiesKey : @{
@@ -614,9 +613,9 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
       AVSampleRateKey : @(sampleRate),
       AVNumberOfChannelsKey : @(channels),
     };
-    audioOutput = [AVAssetReaderTrackOutput
-        trackOutputWithTrack:audioTrack
-               outputSettings:decodeSettings];
+    audioOutput = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:audioTrack
+        outputSettings:decodeSettings];
     if (![reader canAddOutput:audioOutput]) {
       result.error = "cannot decode the audio track";
       return result;
@@ -669,6 +668,9 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   __block BOOL videoDone = !wantVideo;
   __block BOOL audioDone = !wantAudio;
   __block std::string failure;
+  // Blocks capture C++ locals as const copies: the frame counter must be
+  // __block to stay mutable inside the video block.
+  __block std::int64_t videoFrames = 0;
 
   dispatch_queue_t queue =
       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
@@ -729,7 +731,7 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
           CFRelease(sample);
           return;
         }
-        ++result.framesProcessed;
+        ++videoFrames;
         reportProgress(
             ctx, std::clamp(CMTimeGetSeconds(pts) / totalDurationSec, 0.0,
                             1.0));
@@ -790,6 +792,7 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   if (attrs != nil) {
     result.bytesWritten = [attrs fileSize];
   }
+  result.framesProcessed = videoFrames;
   if (result.framesProcessed == 0 && !wantVideo) {
     result.framesProcessed = 1;
   }
