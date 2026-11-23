@@ -7,11 +7,11 @@ the ultimate truth.
 
 | # | Milestone | State |
 |---|---|---|
-| 0 | Foundation (monorepo, RN app, C++ engine, bridge, backend skeletons, FFmpeg builder foundation, docs, CI) | Mostly complete; FFmpeg mobile artifacts pending (M3) |
+| 0 | Foundation (monorepo, RN app, C++ engine, bridge, backend skeletons, FFmpeg builder foundation, docs, CI) | Complete (M3 artifact consumption closes the last gap) |
 | 1 | First real Android conversion (MP4/H.264/AAC via native APIs) | Implemented (MediaCodec surface-path transcode, MediaExtractor inspection, MediaMuxer remux, MediaCodecList capability reporting via JNI); device/emulator validation pending (instrumented tests written; emulator CI infra pending) |
 | 2 | Capability system and planner | In progress (core-level, host-validated) |
-| 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | In progress: build-android.sh + build-ios.sh written; artifacts building in CI (manual dispatch) |
-| 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Not started |
+| 3 | FFmpeg toolchain (Android/iOS artifacts + manifest) | Implemented: artifacts build in CI (manual dispatch); both app builds consume them (push events) so shipped APKs and the iOS app carry the real FFmpeg backend. First fully-PIC rebuild in flight after the linker-fix round (D-030) |
+| 4 | Hybrid pipeline proof (N→N, F→N, N→F, F→F) | Implemented at the composition level: stage contracts, FFmpeg stage workers, core HybridExecutor, planner hybrid candidates, real F→F proof with ffprobe validation in CI. Native-side participation (Android/Apple stage workers) and device proof of N-involving categories pending |
 | 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending) |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested) |
 | 7 | Persistence/recovery | Complete at the engine level (segmented transcode + crash-safe checkpoint commit + durable resume; REAL cancel/resume fault-injection test passes on CI and locally with ffprobe-verified full-length output) |
@@ -79,23 +79,32 @@ the ultimate truth.
 - React Native app: Home/Convert/Queue/History/Settings; tsc + eslint + jest
   green; durable SAF document picking (requestLongTermAccess).
 - CI on GitHub Actions: core+tests (Linux, with the pinned FFmpeg built
-  in-run), mobile TS checks, Android APK, iOS simulator build, FFmpeg mobile
-  artifacts (manual dispatch, building now).
+  in-run), mobile TS checks, Android APK (with the FFmpeg artifacts), iOS
+  simulator build (with the packaged FFmpeg xcframework), FFmpeg mobile
+  artifacts (manual dispatch).
+- Hybrid stage-composed execution (M4, composition level): the FFmpeg
+  backend exposes demux/decode/encode/mux stage workers; the core-owned
+  HybridExecutor composes them across backends through the Yuv420P
+  CPU-frame interchange; the planner generates hybrid candidates only
+  when no single-backend route exists. A REAL F→F composition runs in CI
+  with ffprobe cross-validation.
 
 ## Known limitations (do not pretend otherwise)
 
-- Android/iOS backends are skeletons: real interfaces and capability
-  reporting, but no working device conversion yet (M1).
-- The Android app links the engine WITHOUT the FFmpeg backend until the
-  mobile artifacts are consumed (M3 wiring: `-PvelmuxFFmpegPrefix=...`);
-  conversions on-device report honest "no compatible pipeline" errors until
-  then.
-- Hybrid stage-composed execution interfaces exist; only whole-pipeline
-  FFmpeg execution is implemented (M4 pending).
+- M1 Android MediaCodec is implemented but awaits device/emulator
+  execution (instrumented tests are written; emulator CI infra pending).
+  The Apple backend (VideoToolbox/AVFoundation execution) compiles in CI;
+  simulator/device execution tests are the next integration step.
+- Hybrid (M4) composition is proven F→F with real files in CI; the
+  native-side stage workers (Android ImageReader decode, Apple encoder
+  stages) and the N→N / F→N / N→F device proofs are pending.
+- Hybrid runs are not checkpointed (v1: restart from zero on retry);
+  whole-pipeline executors keep the segmented-recovery duty.
 - No background hosts/notifications yet (M8).
-- FFmpeg mobile artifacts (out/android, out/ios) are being validated in CI
-  for the first time; armeabi-v7a honestly omits SVT-AV1 (32-bit unsupported
-  upstream), as does the x86_64 iOS simulator slice.
+- The first FFmpeg-wired Android link exposed non-PIC artifacts; the
+  builders are fixed (D-030) and the artifact rebuild is in flight.
+  Until it lands, the Android APK build consumes the older non-PIC
+  artifacts and fails at link — expected and tracked.
 - Recovery fault-injection is covered at the executor level (mid-run
   cancel, durable resume, ffprobe-verified assembly); a full process-kill
   + restart end-to-end test is still pending (the reconcile/requeue logic
