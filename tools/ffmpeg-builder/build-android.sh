@@ -192,6 +192,7 @@ build_one_abi() {
       -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
       -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$prefix" >/dev/null
     cmake --build "$zlib_build" >/dev/null
     cmake --install "$zlib_build" >/dev/null
@@ -236,7 +237,7 @@ ZPC
     lame_tb="$(fetch_tarball lame)"
     lame_src="$(extract_tarball "$lame_tb" "$srctag")"
     (cd "$lame_src" && ./configure \
-       --prefix="$prefix" --disable-shared --enable-static \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic \
        --disable-dependency-tracking --disable-gtktest --disable-nasm \
        --disable-frontend \
        --host="$AUTOCONF_HOST" \
@@ -251,7 +252,7 @@ ZPC
     opus_tb="$(fetch_tarball opus)"
     opus_src="$(extract_tarball "$opus_tb" "$srctag")"
     (cd "$opus_src" && ./configure \
-       --prefix="$prefix" --disable-shared --enable-static \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic \
        --disable-doc --disable-extra-programs \
        --host="$AUTOCONF_HOST" \
        >/dev/null && \
@@ -265,7 +266,7 @@ ZPC
     ogg_tb="$(fetch_tarball libogg)"
     ogg_src="$(extract_tarball "$ogg_tb" "$srctag")"
     (cd "$ogg_src" && ./configure \
-       --prefix="$prefix" --disable-shared --enable-static \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic \
        --host="$AUTOCONF_HOST" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
@@ -276,7 +277,7 @@ ZPC
     vorbis_tb="$(fetch_tarball libvorbis)"
     vorbis_src="$(extract_tarball "$vorbis_tb" "$srctag")"
     (cd "$vorbis_src" && PKG_CONFIG_PATH="$prefix/lib/pkgconfig" ./configure \
-       --prefix="$prefix" --disable-shared --enable-static --disable-docs \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic --disable-docs \
        --host="$AUTOCONF_HOST" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
@@ -348,7 +349,7 @@ ZPC
     local dav1d_log="$build_tmp/dav1d-$abi.log"
     if ! env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
       --prefix="$prefix" --libdir=lib \
-      --default-library=static --buildtype=release \
+      --default-library=static --buildtype=release -Db_staticpic=true \
       --cross-file "$cross_file" \
       -Denable_tools=false -Denable_tests=false "${dav1d_asm_args[@]}" \
       >"$dav1d_log" 2>&1; then
@@ -375,6 +376,7 @@ ZPC
         -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
         -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DCMAKE_FIND_ROOT_PATH="$prefix" \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_APPS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
@@ -397,6 +399,7 @@ ZPC
       -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
       -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_ZLIB=FALSE \
       -DFT_REQUIRE_ZLIB=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE \
@@ -417,6 +420,7 @@ ZPC
       -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
       -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
       -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_FRAMEWORK=OFF \
@@ -437,6 +441,7 @@ ZPC
       -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
       -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$prefix" \
       -DBUILD_SHARED_LIBS=OFF -DHB_BUILD_UTILS=OFF -DHB_BUILD_TESTS=OFF \
       -DHB_HAVE_GLIB=OFF -DHB_HAVE_FREETYPE=ON >/dev/null
@@ -457,7 +462,7 @@ ZPC
     local fribidi_log="$build_tmp/fribidi-$abi.log"
     if ! env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
       --prefix="$prefix" --libdir=lib \
-      --default-library=static --buildtype=release \
+      --default-library=static --buildtype=release -Db_staticpic=true \
       --cross-file "$fribidi_cross" \
       -Ddocs=false -Dtests=false >"$fribidi_log" 2>&1; then
       cat "$fribidi_log" >&2
@@ -478,12 +483,12 @@ ZPC
     ass_src="$(extract_tarball "$ass_tb" "$srctag")"
     # libass uses plain autoconf (no --extra-cflags); flags travel via env.
     (cd "$ass_src" && \
-     CFLAGS="$ABI_CFLAGS -O3 -I$prefix/include" \
+     CFLAGS="$ABI_CFLAGS -O3 -fPIC -I$prefix/include" \
      LDFLAGS="-L$prefix/lib" \
      PKG_CONFIG_PATH="$prefix/lib/pkgconfig" \
      PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" \
      ./configure \
-       --prefix="$prefix" --disable-shared --enable-static \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic \
        --disable-fontconfig --disable-require-system-font-provider \
        --host="$AUTOCONF_HOST" \
        >/dev/null && \
@@ -517,7 +522,7 @@ ZPC
        --cc="$CC" --cxx="$CXX" \
        --ar="$AR" --ranlib="$RANLIB" --nm="$NM" --strip="$STRIP" \
        --sysroot="$SYSROOT" \
-       --extra-cflags="-I$prefix/include $ABI_CFLAGS -O3" \
+       --extra-cflags="-I$prefix/include $ABI_CFLAGS -O3 -fvisibility=hidden" \
        --extra-ldflags="-L$prefix/lib" \
        --disable-shared --enable-static --enable-pic \
        --disable-debug --disable-doc \

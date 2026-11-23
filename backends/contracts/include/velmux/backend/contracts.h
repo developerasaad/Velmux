@@ -17,6 +17,8 @@
 #include "velmux/core/pipeline_fwd.h"
 #include "velmux/core/types.h"
 
+#include "stage.h"
+
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -202,6 +204,11 @@ public:
 
   virtual IInspector *inspector() = 0;
   virtual IPipelineExecutor *executor() = 0;
+
+  // Stage-composition participation (Milestone 4). Backends that can serve
+  // individual pipeline stages return their factory; others keep the
+  // default and stay whole-pipeline only.
+  virtual IStageBackend *stages() { return nullptr; }
 };
 
 } // namespace velmux::backend

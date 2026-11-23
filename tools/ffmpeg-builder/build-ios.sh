@@ -246,6 +246,7 @@ build_one_slice() {
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" >/dev/null
     cmake --build "$zlib_build" >/dev/null
     cmake --install "$zlib_build" >/dev/null
@@ -291,7 +292,7 @@ ZPC
     lame_tb="$(fetch_tarball lame)"
     lame_src="$(extract_tarball "$lame_tb" "$SLICE_TAG")"
     (cd "$lame_src" && ./configure \
-       --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic \
        --disable-dependency-tracking --disable-gtktest --disable-nasm \
        --disable-frontend \
        --host="$SLICE_AUTOCONF_HOST" \
@@ -306,7 +307,7 @@ ZPC
     opus_tb="$(fetch_tarball opus)"
     opus_src="$(extract_tarball "$opus_tb" "$SLICE_TAG")"
     (cd "$opus_src" && ./configure \
-       --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic \
        --disable-doc --disable-extra-programs \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
@@ -320,7 +321,7 @@ ZPC
     ogg_tb="$(fetch_tarball libogg)"
     ogg_src="$(extract_tarball "$ogg_tb" "$SLICE_TAG")"
     (cd "$ogg_src" && ./configure \
-       --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
      make -j"$JOBS" >/dev/null && make install >/dev/null)
@@ -331,7 +332,7 @@ ZPC
     vorbis_tb="$(fetch_tarball libvorbis)"
     vorbis_src="$(extract_tarball "$vorbis_tb" "$SLICE_TAG")"
     (cd "$vorbis_src" && PKG_CONFIG_PATH="$SLICE_PREFIX/lib/pkgconfig" ./configure \
-       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --disable-docs \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic --disable-docs \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
      # libvorbis's configure unconditionally injects the legacy
@@ -390,7 +391,7 @@ ZPC
     local dav1d_log="$build_tmp/dav1d-setup-$SLICE_TAG.log"
     if ! env -u CC -u CXX meson setup "$dav1d_build" "$dav1d_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
-      --default-library=static --buildtype=release \
+      --default-library=static --buildtype=release -Db_staticpic=true \
       --cross-file "$cross_file" --native-file "$native_file" \
       -Denable_tools=false -Denable_tests=false >"$dav1d_log" 2>&1; then
       cat "$dav1d_log" >&2
@@ -418,6 +419,7 @@ ZPC
         -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_APPS=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null
@@ -442,6 +444,7 @@ ZPC
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
       -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_ZLIB=FALSE \
       -DFT_REQUIRE_ZLIB=TRUE -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE \
@@ -464,6 +467,7 @@ ZPC
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
       -DBUILD_SHARED_LIBS=OFF -DPNG_TESTS=OFF -DPNG_TOOLS=OFF \
       -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_FRAMEWORK=OFF \
@@ -494,6 +498,7 @@ ZPC
       -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
       -DHB_HAVE_CORETEXT=OFF \
       -DBUILD_SHARED_LIBS=OFF -DHB_BUILD_UTILS=OFF -DHB_BUILD_TESTS=OFF \
@@ -517,7 +522,7 @@ ZPC
     local fribidi_log="$build_tmp/fribidi-setup-$SLICE_TAG.log"
     if ! env -u CC -u CXX meson setup "$fribidi_build" "$fribidi_src" \
       --prefix="$SLICE_PREFIX" --libdir=lib \
-      --default-library=static --buildtype=release \
+      --default-library=static --buildtype=release -Db_staticpic=true \
       --cross-file "$fribidi_cross" --native-file "$native_file" \
       -Ddocs=false -Dtests=false >"$fribidi_log" 2>&1; then
       cat "$fribidi_log" >&2
@@ -538,12 +543,12 @@ ZPC
     ass_src="$(extract_tarball "$ass_tb" "$SLICE_TAG")"
     # libass uses plain autoconf (no --extra-cflags); flags travel via env.
     (cd "$ass_src" && \
-     CFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -I$SLICE_PREFIX/include" \
+     CFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -fPIC -I$SLICE_PREFIX/include" \
      LDFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -L$SLICE_PREFIX/lib" \
      PKG_CONFIG_PATH="$SLICE_PREFIX/lib/pkgconfig" \
      PKG_CONFIG_LIBDIR="$SLICE_PREFIX/lib/pkgconfig" \
      ./configure \
-       --prefix="$SLICE_PREFIX" --disable-shared --enable-static \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic \
        --disable-fontconfig --disable-require-system-font-provider \
        --host="$SLICE_AUTOCONF_HOST" \
        >/dev/null && \
@@ -575,7 +580,7 @@ ZPC
        --arch="$SLICE_ARCH" \
        --cc="$CC" --cxx="$CXX" \
        --ar="$AR" --ranlib="$RANLIB" --nm="$NM" --strip="$STRIP" \
-       --extra-cflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG -I$SLICE_PREFIX/include" \
+       --extra-cflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG -I$SLICE_PREFIX/include -fvisibility=hidden" \
        --extra-ldflags="-arch $SLICE_ARCH $SLICE_MIN_FLAG -L$SLICE_PREFIX/lib" \
        --disable-shared --enable-static --enable-pic \
        --disable-debug --disable-doc \

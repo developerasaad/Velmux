@@ -14,6 +14,21 @@
 # backend only and the engine reports the FFmpeg backend as absent.
 ffmpeg_root = ENV['VELMUX_FFMPEG_ROOT']
 
+# CocoaPods file patterns must be RELATIVE to the podspec; the workflow
+# packages the artifacts inside the repository checkout, so the absolute
+# VELMUX_FFMPEG_ROOT converts to a repo-relative path here.
+def velmux_ffmpeg_relative(ffmpeg_root)
+  require 'pathname'
+  root = Pathname.new(File.expand_path(ffmpeg_root))
+  spec_dir = Pathname.new(File.expand_path(__dir__))
+  rel = root.relative_path_from(spec_dir)
+  if rel.to_s.start_with?('..')
+    raise "VELMUX_FFMPEG_ROOT must live inside the repository for CocoaPods " \
+          "file patterns (got #{ffmpeg_root})"
+  end
+  rel.to_s
+end
+
 Pod::Spec.new do |spec|
   spec.name = 'VelmuxEngine'
   spec.version = '0.1.0'
@@ -74,7 +89,8 @@ Pod::Spec.new do |spec|
   spec.public_header_files = 'bridge/cpp/velmux_bridge.h'
   spec.source_files = source_files
   if ffmpeg_root && !ffmpeg_root.empty?
-    spec.vendored_frameworks = File.join(ffmpeg_root, 'VelmuxFFmpeg.xcframework')
+    spec.vendored_frameworks = velmux_ffmpeg_relative(ffmpeg_root) +
+                               '/VelmuxFFmpeg.xcframework'
   end
   spec.libraries = 'c++', 'z'
   spec.frameworks = 'AVFoundation', 'VideoToolbox', 'CoreMedia',
