@@ -518,6 +518,57 @@ TEST_CASE("fit-under-size jobs receive a real bitrate budget") {
   CHECK(plan.value().best->estimatedOutputBytes.has_value());
 }
 
+TEST_CASE("fit-under-size budget DRIVES the encode and lands under target") {
+  TestEnv env;
+  // 320x240@12 for 4 s with a 90 kbps AAC track: a 80 KB target leaves
+  // ~63 kbps for H.264 (above the ~41 kbps bpp floor -> feasible), while a
+  // quality-mode CRF encode of this fixture is several times larger. The
+  // budget-derived bitrate must parameterize the REAL encode (spec §17),
+  // not stay an advisory string.
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.goal.kind = GoalKind::FitUnderSize;
+  request.goal.targetSizeBytes = 80'000; // ~160 kbps total for 4 s
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(90));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  REQUIRE(jobs.size() == 1);
+  const std::string outputPath = jobs.front().outputPath;
+  REQUIRE_FALSE(outputPath.empty());
+  const ProbeResult probe = probeWith(outputPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.audioCodec == "aac");
+
+  const auto size = std::filesystem::file_size(outputPath);
+  INFO("output size: " << size << " bytes (target 80000)");
+  // The honest contract: either the output fits, or (after the single
+  // corrective retry) the summary says the target was missed. A silent
+  // overshoot is the failure mode this test forbids.
+  if (size > 80'000) {
+    CHECK(jobs.front().pipelineSummary.find("fit-under-size") !=
+          std::string::npos);
+  }
+  // A budget-driven encode at ~160 kbps cannot reach 150 KB over 4 s
+  // (that would be a 2x ABR overshoot); a quality-mode encode can and
+  // would. This is the discriminator proving the budget drove execution.
+  CHECK(double(size) < 150'000.0);
+}
+
 // ---------------------------------------------------------------------------
 // Subtitle behavior (spec §14: subtitles are first-class streams)
 // ---------------------------------------------------------------------------

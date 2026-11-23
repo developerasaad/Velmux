@@ -125,6 +125,36 @@ private:
 
 } // namespace
 
+namespace {
+
+// Fit-under-size (spec §17): the computed budget DRIVES encoding. The
+// goal-derived bitrate replaces the default quality mode unless the user
+// set an explicit bitrate (explicit user intent is never overridden).
+// Retry determinism: the budget is a pure function of source + request,
+// so a reloaded job computes the same parameters.
+ConversionRequest applyFitUnderSizeBudget(const MediaInfo &info,
+                                           const ConversionRequest &request) {
+  ConversionRequest effective = request;
+  if (request.goal.kind == GoalKind::FitUnderSize &&
+      request.goal.targetSizeBytes > 0 &&
+      request.video.rateControl != RateControl::Bitrate &&
+      !request.video.bitRate.has_value()) {
+    const BitrateBudget budget = computeBitrateBudget(
+        info, request, request.goal.targetSizeBytes);
+    if (budget.feasible && budget.videoBitrate > 0) {
+      effective.video.rateControl = RateControl::Bitrate;
+      effective.video.bitRate = budget.videoBitrate;
+      if (!budget.audioStreamCopy && budget.audioBitrate > 0 &&
+          !effective.audio.bitRate.has_value()) {
+        effective.audio.bitRate = budget.audioBitrate;
+      }
+    }
+  }
+  return effective;
+}
+
+} // namespace
+
 JobManager::JobManager(EngineConfig config, EventBus &events, JobStore &store,
                        CheckpointStore &checkpoints, Planner &planner,
                        TelemetryStore &telemetry)
@@ -218,8 +248,12 @@ Result<SampleResult> JobManager::generateSample(
 
   // Plan against the FULL source so the sample uses exactly the settings
   // the real job would (goal-derived quality, budget, codec routing), then
-  // execute only the chosen window through the same dispatch as jobs.
-  const Result<PlanResult> planned = planner_.plan(info, request);
+  // execute only the chosen window through the same dispatch as jobs. The
+  // fit-under-size budget applies here too: samples must preview the exact
+  // parameters a real job would use.
+  const ConversionRequest effectiveSampleRequest =
+      applyFitUnderSizeBudget(info, request);
+  const Result<PlanResult> planned = planner_.plan(info, effectiveSampleRequest);
   if (!planned.ok()) {
     return Result<SampleResult>(planned.error());
   }
@@ -236,14 +270,14 @@ Result<SampleResult> JobManager::generateSample(
   backend::IBackend *backend = backendFor(pipeline);
   const bool hybridPath =
       backend == nullptr && hybrid_ != nullptr &&
-      hybrid_->canExecute(pipeline, request);
+      hybrid_->canExecute(pipeline, effectiveSampleRequest);
   if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
     return Result<SampleResult>(
         Error::make(ErrorCode::UnsupportedFeature,
                     "no backend could execute the planned pipeline", "core"));
   }
 
-  ConversionRequest sampleRequest = request;
+  ConversionRequest sampleRequest = effectiveSampleRequest;
   sampleRequest.trim.startUs = startUs;
   sampleRequest.trim.endUs = endUs;
 
@@ -682,7 +716,12 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     record->sourceInfo = info;
   }
 
-  PlanResult plan = planner_.plan(info, record->request);
+  // Fit-under-size: apply the budget before planning so the plan's size
+  // estimate and feasibility message describe what will actually execute.
+  const ConversionRequest effectiveRequest =
+      applyFitUnderSizeBudget(info, record->request);
+
+  PlanResult plan = planner_.plan(info, effectiveRequest);
   if (!plan.feasible || !plan.best.has_value()) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
@@ -756,11 +795,8 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   }
   persistAndEmit(*record, "running");
 
-  backend::ExecuteParams params;
-  params.pipeline = pipeline;
-  params.request = record->request;
-  params.outputPath = record->outputPath;
-  params.jobId = jobId;
+  // The run's cancel token: shared with the control path; the executor
+  // observes cooperative cancellation through it.
   std::shared_ptr<backend::CancelToken> cancel;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -769,34 +805,91 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     }
     cancel = running_[jobId].cancel;
   }
-  params.cancel = cancel;
-  params.onProgress =
-      [this, jobId, generation](const backend::ProgressReport &report) {
-        reportProgress(jobId, report.fraction, -1, generation);
+
+  // Dispatch closure: one executor run (whole-pipeline or hybrid) with
+  // checkpoints wired. Used by the first attempt and, when justified, the
+  // fit-under-size corrective retry.
+  const auto dispatchExecution =
+      [&](const ConversionRequest &req) -> backend::ExecuteResult {
+        backend::ExecuteParams params;
+        params.pipeline = pipeline;
+        params.request = req;
+        params.outputPath = record->outputPath;
+        params.jobId = jobId;
+        params.cancel = cancel;
+        params.onProgress =
+            [this, jobId, generation](const backend::ProgressReport &report) {
+              reportProgress(jobId, report.fraction, -1, generation);
+            };
+        CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
+        params.checkpoints = &coordinator;
+        // Recovery input: checkpoints committed by earlier runs of this
+        // job. Fresh jobs have none; paused/resumed/recovered jobs get the
+        // durable set and the executor skips work covered by valid
+        // artifacts.
+        {
+          Error checkpointError;
+          for (const CheckpointRecord &cp :
+               checkpoints_.loadCheckpoints(jobId, checkpointError)) {
+            if (cp.artifactPath.empty()) {
+              continue; // position-only marks carry nothing resumable
+            }
+            backend::CheckpointInfo info2;
+            info2.stage = cp.stage;
+            info2.position = cp.position;
+            info2.artifactPath = cp.artifactPath;
+            params.resumeFrom.push_back(std::move(info2));
+          }
+        }
+        return hybridPath ? hybrid_->execute(params)
+                          : backend->executor()->execute(params);
       };
-  CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
-  params.checkpoints = &coordinator;
-  // Recovery input: checkpoints committed by earlier runs of this job.
-  // Fresh jobs have none; paused/resumed/recovered jobs get the durable
-  // set and the executor skips work covered by valid artifacts.
-  {
-    Error checkpointError;
-    for (const CheckpointRecord &record :
-         checkpoints_.loadCheckpoints(jobId, checkpointError)) {
-      if (record.artifactPath.empty()) {
-        continue; // position-only marks carry nothing resumable for executors
+
+  backend::ExecuteResult execResult = dispatchExecution(effectiveRequest);
+
+  // Fit-under-size corrective retry (spec §17): encoders cannot guarantee
+  // exact output sizes; when the first attempt lands over the target, ONE
+  // re-encode at a proportionally reduced bitrate runs in-place. Bounded to
+  // a single retry; a still-missed target completes honestly with a note —
+  // never a fake guarantee. The retry re-encodes the whole file: the first
+  // attempt's checkpoints describe different encoding decisions.
+  bool fitRetryRan = false;
+  bool fitTargetMissed = false;
+  if (execResult.success &&
+      record->request.goal.kind == GoalKind::FitUnderSize &&
+      record->request.goal.targetSizeBytes > 0 && !cancel->isCancelled()) {
+    const std::int64_t target = record->request.goal.targetSizeBytes;
+    std::int64_t actual = 0;
+    if (fileExistsWithSize(record->outputPath, actual) && actual > target) {
+      std::int64_t baseBitrate = effectiveRequest.video.bitRate.value_or(0);
+      if (baseBitrate <= 0) {
+        const BitrateBudget budget = computeBitrateBudget(
+            info, record->request, target);
+        baseBitrate = budget.videoBitrate;
       }
-      backend::CheckpointInfo info;
-      info.stage = record.stage;
-      info.position = record.position;
-      info.artifactPath = record.artifactPath;
-      params.resumeFrom.push_back(std::move(info));
+      if (baseBitrate > 0) {
+        // 10% safety margin under the proportional scale.
+        const double scale =
+            (double(target) / double(actual)) * 0.90;
+        const std::int64_t newBitrate =
+            std::max<std::int64_t>(
+                std::int64_t(double(baseBitrate) * scale), 10000);
+        if (newBitrate < baseBitrate) {
+          ConversionRequest retryRequest = effectiveRequest;
+          retryRequest.video.rateControl = RateControl::Bitrate;
+          retryRequest.video.bitRate = newBitrate;
+          (void)checkpoints_.deleteCheckpoints(jobId);
+          fitRetryRan = true;
+          execResult = dispatchExecution(retryRequest);
+          if (execResult.success) {
+            std::int64_t after = 0;
+            fitTargetMissed = fileExistsWithSize(record->outputPath, after) &&
+                              after > target;
+          }
+        }
+      }
     }
   }
-
-  const backend::ExecuteResult execResult =
-      hybridPath ? hybrid_->execute(params)
-                 : backend->executor()->execute(params);
 
   // Feed real observations into telemetry (performance learning).
   if (execResult.wallClockSec > 0.0) {
@@ -887,6 +980,15 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
+    if (fitRetryRan) {
+      // Honest fit-under-size outcome in the pipeline summary (shown in
+      // history and job details): a retry happened, and whether it landed
+      // under the target. Never a fake guarantee.
+      running.record.pipeline.summary +=
+          fitTargetMissed
+              ? " [fit-under-size: target not reached after retry]"
+              : " [fit-under-size: retried at a lower bitrate]";
+    }
     running.record.state = JobState::Completed;
     running.record.progress = 1.0;
     running.record.outputSizeBytes = outputBytes;
