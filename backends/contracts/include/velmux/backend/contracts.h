@@ -133,6 +133,21 @@ public:
   // Returns an Error on failure. Must not decode; metadata/demux level only.
   virtual core::Error inspect(const core::MediaSource &source,
                               core::MediaInfo &out) = 0;
+  // Representative-window selection for sample generation (spec §20):
+  // pick the `seconds`-long window with the most compressed bytes — a
+  // demux-level proxy for motion/detail, single pass, no decoding.
+  // Backends that cannot do it return false (the engine then falls back
+  // to a mid-file window).
+  virtual bool representativeWindow(const core::MediaSource &source,
+                                    std::int32_t seconds,
+                                    std::int64_t &startUs,
+                                    std::int64_t &endUs) {
+    (void)source;
+    (void)seconds;
+    (void)startUs;
+    (void)endUs;
+    return false;
+  }
 };
 
 // ---------------------------------------------------------------------------

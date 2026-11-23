@@ -65,6 +65,18 @@ struct CompressionGoal {
   std::int64_t targetSizeBytes = 0;
 };
 
+// A window on the source timeline (spec §15/§16: trimming; §20: sample
+// generation). Microseconds. startUs must be >= 0; endUs < 0 means
+// open-ended (until end of stream). Transcoded output keeps the source
+// timeline's timestamps (matched-source-timestamp comparison, spec §20);
+// stream-copied output snaps its start to the keyframe at/before startUs
+// (compressed data cannot be re-timed without re-encoding).
+struct TimeRange {
+  std::int64_t startUs = 0;
+  std::int64_t endUs = -1;
+  bool active() const { return startUs > 0 || endUs >= 0; }
+};
+
 struct VideoRequest {
   bool enabled = true;
   std::optional<VideoCodec> codec;
@@ -101,6 +113,19 @@ struct ConversionRequest {
   AudioRequest audio;
   SubtitleRequest subtitles;
   ProcessingMode processingMode = ProcessingMode::Auto;
+  // Process only this window of the source (trimming, sample generation).
+  TimeRange trim;
+};
+
+// Result of sample generation (spec §20): a short preview transcode of a
+// representative window using the requested settings. The window keeps
+// source-timeline timestamps so the UI can compare original vs sample at
+// matched positions.
+struct SampleResult {
+  std::string outputPath;
+  std::int64_t startUs = 0;
+  std::int64_t endUs = 0;
+  std::int64_t sizeBytes = -1;
 };
 
 // ---------------------------------------------------------------------------

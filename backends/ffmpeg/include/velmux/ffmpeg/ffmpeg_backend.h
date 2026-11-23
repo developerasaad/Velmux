@@ -30,6 +30,9 @@ class FfmpegInspector final : public velmux::backend::IInspector {
 public:
   velmux::core::Error inspect(const velmux::core::MediaSource &source,
                               velmux::core::MediaInfo &out) override;
+  bool representativeWindow(const velmux::core::MediaSource &source,
+                            std::int32_t seconds, std::int64_t &startUs,
+                            std::int64_t &endUs) override;
 };
 
 class FfmpegExecutor final : public velmux::backend::IPipelineExecutor {

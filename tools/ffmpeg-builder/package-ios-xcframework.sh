@@ -46,6 +46,9 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # --- Merge each slice into a single static archive -------------------------------------------
+# CocoaPods requires every slice of a vendored static-library xcframework
+# to expose the SAME binary name, so each slice's merged archive is
+# libvelmux_ffmpeg.a inside its own slice directory.
 declare -a slice_archives=()
 for slice in iphoneos iphonesimulator; do
   libs=()
@@ -55,7 +58,8 @@ for slice in iphoneos iphonesimulator; do
   if [ "${#libs[@]}" -eq 0 ]; then
     die "[$slice] no static libraries found in $IOS_ROOT/$slice/lib"
   fi
-  out="$work/libvelmux_ffmpeg_$slice.a"
+  out="$work/$slice/libvelmux_ffmpeg.a"
+  mkdir -p "$work/$slice"
   log "[$slice] merging ${#libs[@]} libraries"
   libtool -static -o "$out" "${libs[@]}"
   slice_archives+=("$out")

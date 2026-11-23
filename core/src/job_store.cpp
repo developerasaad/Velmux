@@ -218,9 +218,22 @@ Error SqliteStore::migrate() {
               "  updated_at INTEGER NOT NULL,"
               "  started_at INTEGER,"
               "  finished_at INTEGER,"
-              "  schema_version INTEGER NOT NULL DEFAULT 1"
+              "  schema_version INTEGER NOT NULL DEFAULT 1,"
+              "  trim_start_us INTEGER NOT NULL DEFAULT 0,"
+              "  trim_end_us INTEGER NOT NULL DEFAULT -1"
               ")", error)) {
       return error;
+    }
+    if (current < 2) {
+      // v2: trim window on the request (spec §15/§16/§20). ALTER ADD
+      // COLUMN appends, so every existing positional read stays valid.
+      if (!exec("ALTER TABLE jobs ADD COLUMN trim_start_us INTEGER NOT NULL "
+                "DEFAULT 0", error) ||
+          !exec("ALTER TABLE jobs ADD COLUMN trim_end_us INTEGER NOT NULL "
+                "DEFAULT -1", error) ||
+          !exec("UPDATE schema_version SET version = 2", error)) {
+        return error;
+      }
     }
     if (!exec("CREATE TABLE IF NOT EXISTS checkpoints ("
               "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -406,8 +419,9 @@ Error JobStore::insertJob(const JobRecord &record) {
       "output_path, output_container, goal_kind, goal_target_bytes, "
       "video_json, audio_json, subtitles_json, processing_mode, "
       "pipeline_json, source_info_json, progress, input_size, output_size, "
-      "error, created_at, updated_at, started_at, finished_at, schema_version) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      "error, created_at, updated_at, started_at, finished_at, schema_version, "
+      "trim_start_us, trim_end_us) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
   sqlite3_stmt *stmt = db_.prepare(sql, error);
   if (stmt == nullptr) {
     return error;
@@ -442,6 +456,8 @@ Error JobStore::insertJob(const JobRecord &record) {
   sqlite3_bind_text(stmt, 13,
                     std::to_string(int(record.request.processingMode)).c_str(),
                     -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt, 25, record.request.trim.startUs);
+  sqlite3_bind_int64(stmt, 26, record.request.trim.endUs);
   sqlite3_bind_text(stmt, 14, record.pipeline.summary.c_str(), -1,
                     SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 15, "", -1, SQLITE_TRANSIENT);
@@ -583,6 +599,16 @@ JobRecord JobStore::rowToRecord(sqlite3_stmt &stmt) {
   record.progress = sqlite3_column_double(&stmt, 15);
   record.inputSizeBytes = sqlite3_column_int64(&stmt, 16);
   record.outputSizeBytes = sqlite3_column_int64(&stmt, 17);
+  // 0-based column order: ... finished_at=22, schema_version=23,
+  // trim_start_us=24, trim_end_us=25.
+  record.request.trim.startUs =
+      sqlite3_column_type(&stmt, 24) == SQLITE_INTEGER
+          ? sqlite3_column_int64(&stmt, 24)
+          : 0;
+  record.request.trim.endUs =
+      sqlite3_column_type(&stmt, 25) == SQLITE_INTEGER
+          ? sqlite3_column_int64(&stmt, 25)
+          : -1;
   record.error = columnText(stmt, 18);
   record.createdAtMs = sqlite3_column_int64(&stmt, 19);
   record.updatedAtMs = sqlite3_column_int64(&stmt, 20);

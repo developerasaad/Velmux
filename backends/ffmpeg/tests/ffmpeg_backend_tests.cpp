@@ -954,3 +954,113 @@ TEST_CASE("hybrid executor refuses shapes outside its v1 contract") {
     CHECK_FALSE(hybrid.canExecute(bad, request));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Trim + sample generation (spec §15/§16/§20)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("REAL trim: transcode only the requested window") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 4.0);
+
+  ConversionRequest request = transcodeRequest(
+      fixture, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
+  request.trim.startUs = 1'000'000;
+  request.trim.endUs = 3'000'000;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  const std::string outPath = jobs.front().outputPath;
+  REQUIRE(std::filesystem::exists(outPath));
+
+  // INDEPENDENT cross-check: the output covers only the window. The
+  // transcode keeps source-timeline timestamps (matched-comparison
+  // convention), so the file's span is ~[1s, 3s]: length ~2s, and
+  // definitely far from the 4s source.
+  const ProbeResult probe = probeWith(outPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.durationSec > 1.5);
+  CHECK(probe.durationSec < 3.5);
+  CHECK(std::filesystem::file_size(outPath) > 4096);
+}
+
+TEST_CASE("trim validation rejects inverted windows") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+
+  ConversionRequest request = transcodeRequest(
+      fixture, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
+  request.trim.startUs = 2'000'000;
+  request.trim.endUs = 1'000'000;
+  const Result<PlanResult> plan =
+      env.engine->plan(MediaSource{fixture, "in.mp4"}, request);
+  REQUIRE(plan.ok());
+  REQUIRE_FALSE(plan.value().feasible);
+  CHECK(plan.value().message.find("Trim") != std::string::npos);
+}
+
+TEST_CASE("REAL sample generation: representative window, requested settings") {
+  TestEnv env;
+  // Static half + motion half: the representative picker must land in the
+  // motion half (denser compressed bytes).
+  const std::string fixture =
+      generateFixture(env.dir / "static.mp4", "color=black:size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const std::string motion =
+      generateFixture(env.dir / "motion.mp4", "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+                       fixture + "\" -i \"" + motion +
+                       "\" -filter_complex \"[0:v][1:v]concat=n=2:v=1:a=0[v];"
+                       "[0:a][1:a]concat=n=2:v=0:a=1[a]\" -map \"[v]\" -map "
+                       "\"[a]\" -c copy \"" +
+                       (env.dir / "mixed.mp4").string() + "\"")
+                          .c_str()) == 0);
+  const std::string mixed = (env.dir / "mixed.mp4").string();
+  REQUIRE(std::filesystem::file_size(mixed) > 1024);
+
+  const Result<SampleResult> sample = env.engine->generateSample(
+      transcodeRequest(mixed, Container::Mp4, VideoCodec::VP9,
+                       AudioCodec::Aac),
+      1);
+  REQUIRE(sample.ok());
+  INFO("sample error: " << sample.error().message);
+  const SampleResult &s = sample.value();
+
+  // The window must sit inside the motion (second) half.
+  CHECK(s.startUs >= 2'000'000);
+  CHECK(s.endUs - s.startUs <= 1'500'000);
+  REQUIRE(std::filesystem::exists(s.outputPath));
+
+  // INDEPENDENT cross-check: sample is real VP9 media of the right span.
+  const ProbeResult probe = probeWith(s.outputPath);
+  CHECK(probe.videoCodec == "vp9");
+  CHECK(probe.width == 320);
+  CHECK(probe.height == 240);
+  CHECK(probe.durationSec > 0.7);
+  CHECK(probe.durationSec < 3.0);
+  CHECK(s.sizeBytes > 4096);
+}
+
+TEST_CASE("sample generation fails honestly on a broken source") {
+  TestEnv env;
+  writeFile(env.dir / "broken.mp4", "not a media file at all");
+  const Result<SampleResult> sample = env.engine->generateSample(
+      transcodeRequest((env.dir / "broken.mp4").string(), Container::Mp4,
+                       VideoCodec::H264, AudioCodec::Aac),
+      2);
+  REQUIRE_FALSE(sample.ok());
+}

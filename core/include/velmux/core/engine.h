@@ -42,10 +42,15 @@ public:
   VelmuxEngine(const VelmuxEngine &) = delete;
   VelmuxEngine &operator=(const VelmuxEngine &) = delete;
 
-  // --- Frontend operations (mirror the RN bridge contract) ---
+  // Inspect (or reuse submitted inspection) then plan.
   Result<MediaInfo> inspect(const MediaSource &source);
   Result<PlanResult> plan(const MediaSource &source,
                           const ConversionRequest &request);
+  // Sample generation (spec §20): short preview of the requested settings
+  // over the densest section of the source. Synchronous (hosts call off
+  // the UI thread); output lands under <dataDir>/samples.
+  Result<SampleResult> generateSample(const ConversionRequest &request,
+                                       std::int32_t sampleSeconds);
   Result<std::string> startJob(const ConversionRequest &request);
   Result<bool> cancelJob(const std::string &jobId);
   Result<bool> pauseJob(const std::string &jobId);

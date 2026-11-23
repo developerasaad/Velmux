@@ -60,6 +60,16 @@ char *velmux_inspect(VelmuxEngineHandle *engine, const char *uri,
 // {"feasible":bool,"message":..,"estimatedOutputBytes":..,"pipelineSummary":..}
 char *velmux_plan(VelmuxEngineHandle *engine, const char *requestJson);
 
+// Sample generation (spec §20): synchronously transcode a short
+// representative window of the source with the requested settings.
+// requestJson follows the velmux_plan request schema (trim is ignored —
+// the engine picks the window); sampleSeconds is the preview length.
+// Returns {"ok":true,"path":...,"startUs":...,"endUs":...,"sizeBytes":...}
+// or {"error":"..."}; the caller frees with velmux_free_string. Runs on
+// the calling thread: hosts invoke it off the UI thread.
+char *velmux_generate_sample(VelmuxEngineHandle *engine,
+                             const char *requestJson, int sampleSeconds);
+
 // Start a durable job from a request. Payload: {"jobId":"..."}.
 char *velmux_start_job(VelmuxEngineHandle *engine, const char *requestJson);
 

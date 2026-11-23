@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "velmux/core/engine.h"
 
 #include "velmux/backend/contracts.h"
@@ -140,6 +141,69 @@ Result<MediaInfo> VelmuxEngine::inspect(const MediaSource &source) {
 Result<PlanResult> VelmuxEngine::plan(const MediaSource &source,
                                       const ConversionRequest &request) {
   return jobs_->plan(source, request);
+}
+
+Result<SampleResult> VelmuxEngine::generateSample(
+    const ConversionRequest &request, std::int32_t sampleSeconds) {
+  if (sampleSeconds <= 0) {
+    return Result<SampleResult>(Error::make(ErrorCode::InvalidArgument,
+                                            "sample duration must be positive",
+                                            "core"));
+  }
+  // Samples live under <dataDir>/samples with a sanitized, collision-safe
+  // name; overwriting a previous sample of the same source is intended
+  // (they are disposable previews).
+  std::filesystem::path dir = std::filesystem::path(config_.dataDir) / "samples";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  std::string stem = request.source.displayName;
+  const std::size_t dot = stem.rfind('.');
+  if (dot != std::string::npos && dot > 0) {
+    stem = stem.substr(0, dot);
+  }
+  std::string safe;
+  for (char c : stem) {
+    const bool okChar = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+    safe.push_back(okChar ? c : '_');
+  }
+  if (safe.empty()) {
+    safe = "sample";
+  }
+  const char *ext = "mp4";
+  switch (request.outputContainer.value_or(Container::Mp4)) {
+    case Container::Mkv:
+    case Container::WebM:
+      ext = "mkv";
+      if (request.outputContainer.value_or(Container::Mp4) ==
+          Container::WebM) {
+        ext = "webm";
+      }
+      break;
+    case Container::Mov:
+      ext = "mov";
+      break;
+    case Container::M4a:
+      ext = "m4a";
+      break;
+    case Container::Mp3:
+      ext = "mp3";
+      break;
+    case Container::Ogg:
+      ext = "ogg";
+      break;
+    case Container::Wav:
+      ext = "wav";
+      break;
+    case Container::Flac:
+      ext = "flac";
+      break;
+    default:
+      break;
+  }
+  const std::string outPath =
+      (dir / (safe + "-sample." + ext)).string();
+  return jobs_->generateSample(request, sampleSeconds, outPath);
 }
 
 Result<std::string> VelmuxEngine::startJob(const ConversionRequest &request) {

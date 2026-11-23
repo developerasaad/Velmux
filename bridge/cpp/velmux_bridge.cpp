@@ -687,6 +687,26 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
     return std::nullopt;
   }
 
+  // trim { startUs?, endUs? } — window on the source timeline
+  // (spec §15/§16 trimming; §20 sample generation).
+  if (const JsonValue *trim = root.find("trim");
+      trim != nullptr && trim->kind == JsonValue::Kind::Object) {
+    if (auto startUs = getOptInt(*trim, "startUs")) {
+      if (*startUs < 0) {
+        error = "trim.startUs must not be negative";
+        return std::nullopt;
+      }
+      request.trim.startUs = *startUs;
+    }
+    if (auto endUs = getOptInt(*trim, "endUs")) {
+      if (*endUs >= 0 && *endUs <= request.trim.startUs) {
+        error = "trim.endUs must be after trim.startUs";
+        return std::nullopt;
+      }
+      request.trim.endUs = *endUs;
+    }
+  }
+
   return request;
 }
 
@@ -911,6 +931,35 @@ char *velmux_plan(VelmuxEngineHandle *handle, const char *requestJson) {
   } else {
     out += ",\"estimatedOutputBytes\":null,\"pipelineSummary\":\"\"";
   }
+  out += "}";
+  return allocString(out);
+}
+
+char *velmux_generate_sample(VelmuxEngineHandle *handle,
+                             const char *requestJson, int sampleSeconds) {
+  if (handle == nullptr || requestJson == nullptr) {
+    return allocString(errorJson("engine or request is null"));
+  }
+  if (sampleSeconds <= 0) {
+    return allocString(errorJson("sampleSeconds must be positive"));
+  }
+  std::string parseError;
+  const auto request =
+      bridgeNS::requestFromJson(requestJson, parseError);
+  if (!request.has_value()) {
+    return allocString(errorJson(parseError));
+  }
+  const Result<SampleResult> sample = handle->engine->generateSample(
+      *request, sampleSeconds);
+  if (!sample.ok()) {
+    return allocString(errorJson(sample.error().message));
+  }
+  std::string out = "{";
+  out += "\"ok\":true";
+  out += ",\"path\":" + bridgeNS::quoted(sample.value().outputPath);
+  out += ",\"startUs\":" + std::to_string(sample.value().startUs);
+  out += ",\"endUs\":" + std::to_string(sample.value().endUs);
+  out += ",\"sizeBytes\":" + std::to_string(sample.value().sizeBytes);
   out += "}";
   return allocString(out);
 }

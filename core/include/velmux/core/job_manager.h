@@ -73,6 +73,15 @@ public:
   Result<PlanResult> plan(const MediaSource &source,
                           const ConversionRequest &request);
 
+  // Sample generation (spec §20): synchronously produce a short preview
+  // of the REQUESTED settings over a representative window. Not a durable
+  // job — bounded work, no checkpoints, no queue. Runs on the calling
+  // thread; hosts call it off the UI thread. Cancellation is not wired in
+  // v1 (samples are short by construction).
+  Result<SampleResult> generateSample(const ConversionRequest &request,
+                                      std::int32_t sampleSeconds,
+                                      const std::string &outputPath);
+
   // Create a durable job; persists before returning. The job enters the
   // queue; the scheduler starts it when resources allow.
   Result<std::string> submit(const ConversionRequest &request,

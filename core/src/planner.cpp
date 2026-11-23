@@ -131,6 +131,18 @@ PlanResult Planner::plan(const MediaInfo &source,
         "can be preserved, removed, or burned in.";
     return result;
   }
+  // Trim window sanity (spec §15/§16). Executors clamp against the real
+  // duration; an inverted or empty window is a request error.
+  if (request.trim.endUs >= 0 && request.trim.endUs <= request.trim.startUs) {
+    result.feasible = false;
+    result.message = "Trim window is empty: end must come after start.";
+    return result;
+  }
+  if (request.trim.startUs < 0) {
+    result.feasible = false;
+    result.message = "Trim start must not be negative.";
+    return result;
+  }
   if (request.subtitles.policy == SubtitlePolicy::BurnIn &&
       !request.subtitles.externalUri.has_value() && !source.hasSubtitles()) {
     result.feasible = false;

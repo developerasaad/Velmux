@@ -9,6 +9,7 @@
 #include "velmux/core/validation.h"
 
 #include <atomic>
+#include <filesystem>
 #include <chrono>
 #include <cstring>
 #include <random>
@@ -172,6 +173,135 @@ Result<PlanResult> JobManager::plan(const MediaSource &source,
   PlanResult result = planner_.plan(inspected.value(), request);
   (void)telemetry_.recordPlanningLatency(result.planningMs);
   return Result<PlanResult>(std::move(result));
+}
+
+Result<SampleResult> JobManager::generateSample(
+    const ConversionRequest &request, std::int32_t sampleSeconds,
+    const std::string &outputPath) {
+  if (sampleSeconds <= 0) {
+    return Result<SampleResult>(Error::make(ErrorCode::InvalidArgument,
+                                            "sample duration must be positive",
+                                            "core"));
+  }
+  // Duration drives the window; a representative sample needs one.
+  const Result<MediaInfo> inspected = inspect(request.source);
+  if (!inspected.ok()) {
+    return Result<SampleResult>(inspected.error());
+  }
+  const MediaInfo &info = inspected.value();
+  if (info.durationSec <= 0.0) {
+    return Result<SampleResult>(Error::make(
+        ErrorCode::InspectionFailed,
+        "cannot determine the source duration for sampling", "core"));
+  }
+  const std::int64_t durationUs =
+      std::int64_t(info.durationSec * 1000000.0);
+  const std::int64_t windowLenUs =
+      std::min<std::int64_t>(std::int64_t(sampleSeconds) * 1000000,
+                             durationUs);
+
+  // Representative window (spec §20): the densest section per a backend's
+  // demux-level scan. Mid-file fallback when no backend can pick (avoids
+  // the abrupt intro/outro regions by starting a quarter in).
+  std::int64_t startUs =
+      std::max<std::int64_t>((durationUs - windowLenUs) / 4, 0);
+  std::int64_t endUs = startUs + windowLenUs;
+  const std::int32_t windowSeconds =
+      std::max<std::int32_t>(std::int32_t(windowLenUs / 1000000), 1);
+  for (backend::IBackend *backend : backends_) {
+    if (backend->inspector() != nullptr &&
+        backend->inspector()->representativeWindow(
+            request.source, windowSeconds, startUs, endUs)) {
+      break;
+    }
+  }
+
+  // Plan against the FULL source so the sample uses exactly the settings
+  // the real job would (goal-derived quality, budget, codec routing), then
+  // execute only the chosen window through the same dispatch as jobs.
+  const Result<PlanResult> planned = planner_.plan(info, request);
+  if (!planned.ok()) {
+    return Result<SampleResult>(planned.error());
+  }
+  if (!planned.value().feasible || !planned.value().best.has_value()) {
+    return Result<SampleResult>(Error::make(
+        ErrorCode::UnsupportedFeature,
+        planned.value().message.empty()
+            ? "no compatible pipeline for the requested settings"
+            : planned.value().message,
+        "core"));
+  }
+  const Pipeline pipeline = planned.value().best->pipeline;
+
+  backend::IBackend *backend = backendFor(pipeline);
+  const bool hybridPath =
+      backend == nullptr && hybrid_ != nullptr &&
+      hybrid_->canExecute(pipeline, request);
+  if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
+    return Result<SampleResult>(
+        Error::make(ErrorCode::UnsupportedFeature,
+                    "no backend could execute the planned pipeline", "core"));
+  }
+
+  ConversionRequest sampleRequest = request;
+  sampleRequest.trim.startUs = startUs;
+  sampleRequest.trim.endUs = endUs;
+
+  backend::ExecuteParams params;
+  params.pipeline = pipeline;
+  params.request = sampleRequest;
+  params.outputPath = outputPath;
+  // No checkpoints for samples: single bounded pass, restartable by
+  // regenerating (documented limitation, not silent behavior).
+  params.jobId = "";
+  params.cancel = std::make_shared<backend::CancelToken>();
+  const backend::ExecuteResult execResult =
+      hybridPath ? hybrid_->execute(params)
+                 : backend->executor()->execute(params);
+  if (!execResult.success) {
+    return Result<SampleResult>(execResult.error);
+  }
+
+  // Independent validation before reporting success (spec §27): codecs,
+  // streams, geometry, minimum size. Duration stays unchecked — a trimmed
+  // window legitimately differs from the source.
+  if (validator_ != nullptr) {
+    ValidationExpectation expect;
+    expect.container = pipeline.container;
+    if (sampleRequest.video.enabled && !info.video.empty()) {
+      expect.videoCodec = pipeline.videoCodec;
+      expect.expectedHeight = sampleRequest.video.resolutionHeight.value_or(
+          info.video.front().height);
+    } else {
+      expect.expectVideo = false;
+    }
+    if (sampleRequest.audio.enabled && !info.audio.empty()) {
+      expect.audioCodec = pipeline.audioCodec;
+    } else if (!sampleRequest.audio.enabled) {
+      expect.expectAudio = false;
+    }
+    const ValidationReport report = validator_->validate(outputPath, expect);
+    if (!report.ok) {
+      std::string problems;
+      for (const std::string &p : report.problems) {
+        problems += p + "; ";
+      }
+      return Result<SampleResult>(Error::make(
+          ErrorCode::OutputValidationFailed,
+          "sample failed output validation: " + problems, "core"));
+    }
+  }
+
+  SampleResult sample;
+  sample.outputPath = outputPath;
+  sample.startUs = startUs;
+  sample.endUs = endUs;
+  std::error_code ec;
+  sample.sizeBytes = std::filesystem::file_size(outputPath, ec);
+  if (ec) {
+    sample.sizeBytes = -1;
+  }
+  return Result<SampleResult>(std::move(sample));
 }
 
 Result<std::string> JobManager::submit(const ConversionRequest &request,
