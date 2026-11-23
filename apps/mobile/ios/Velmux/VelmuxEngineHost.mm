@@ -5,6 +5,8 @@
 #import <UserNotifications/UserNotifications.h>
 #import <BackgroundTasks/BackgroundTasks.h>
 
+#import <VelmuxEngine/velmux_bridge.h>
+
 #import <mutex>
 
 static NSString *const kVelmuxBGTaskId = @"com.velmux.mobile.resume";
@@ -15,9 +17,6 @@ static const NSTimeInterval kVelmuxPollInterval = 0.25;
 // ~12s of fully idle polling before the timer stops.
 static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 
-@implementation VelmuxEventListenerToken
-@end
-
 @interface VelmuxEngineHost ()
 @property (atomic, assign) VelmuxEngineHandle *engine;
 @property (strong) dispatch_queue_t queue;
@@ -25,8 +24,8 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 @property (nullable, strong) dispatch_source_t timer;
 @property (assign) BOOL timerRunning;
 @property (assign) NSInteger idleRounds;
-@property (strong) NSMutableDictionary<VelmuxEventListenerToken *,
-                                       void (^)(NSDictionary *)> *listeners;
+@property (strong) NSMutableDictionary<NSUUID *, void (^)(NSDictionary *)>
+    *listeners;
 @property (strong) NSMutableDictionary<NSString *, NSDictionary *> *jobStates;
 @end
 
@@ -75,11 +74,11 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 
 #pragma mark - Listeners / polling
 
-- (VelmuxEventListenerToken *)addListener:(void (^)(NSDictionary *))listener {
+- (NSUUID *)addListener:(void (^)(NSDictionary *))listener {
   if (listener == nil) {
     return nil;
   }
-  VelmuxEventListenerToken *token = [[VelmuxEventListenerToken alloc] init];
+  NSUUID *token = [NSUUID UUID];
   void (^copied)(NSDictionary *) = [listener copy];
   dispatch_async(_queue, ^{
     self->_listeners[token] = copied;
@@ -88,7 +87,7 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
   return token;
 }
 
-- (void)removeListener:(VelmuxEventListenerToken *)token {
+- (void)removeListener:(NSUUID *)token {
   if (token == nil) {
     return;
   }
@@ -300,14 +299,14 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 - (void)registerBackgroundTasks {
   [[BGTaskScheduler sharedScheduler]
       registerTaskForIdentifier:kVelmuxBGTaskId
-                   usingQueue:nil
-                launchHandler:^(__kindof BGTask *task) {
-                  if ([task isKindOfClass:[BGProcessingTask class]]) {
-                    [self runResumeTask:(BGProcessingTask *)task];
-                  } else {
-                    [task setTaskCompletedWithSuccess:YES];
-                  }
-                }];
+                     usingQueue:nil
+                  launchHandler:^(BGTask *task) {
+                    if ([task isKindOfClass:[BGProcessingTask class]]) {
+                      [self runResumeTask:(BGProcessingTask *)task];
+                    } else {
+                      [task setTaskCompletedWithSuccess:YES];
+                    }
+                  }];
 }
 
 /// BGProcessingTask body: resume INTERRUPTED jobs, keep the task alive

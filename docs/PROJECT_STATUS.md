@@ -15,7 +15,7 @@ the ultimate truth.
 | 5 | Complete V1 media support | Partial (subtitle preserve/burn-in/offset done; extraction rejected honestly per D-013; bitmap burn-in pending; TRIM implemented and tested: transcode windows keep source timestamps, stream copy snaps to keyframes) |
 | 6 | Compression intelligence | Partial (budget math implemented + unit tested; SAMPLE GENERATION implemented end-to-end: representative-window picker, engine op, bridge facade, TurboModule surface, real-file tests) |
 | 7 | Persistence/recovery | Complete at the engine level (segmented transcode + crash-safe checkpoint commit + durable resume; REAL cancel/resume fault-injection test passes on CI and locally with ffprobe-verified full-length output) |
-| 8 | Background and notifications | Not started |
+| 8 | Background and notifications | Implemented (hosts + notifications, CI-validated builds; on-device behavior pending): Android foreground service (dataSync) with aggregate progress + Cancel action + terminal notifications, process-owned engine surviving React teardown; iOS BGProcessingTask resume for INTERRUPTED jobs, beginBackgroundTask window, UNUserNotifications. Simulator/device behavior validation pending |
 | 9 | Batch scheduler | Partial (resource-aware scheduler implemented + unit tested) |
 | 10 | Premium UX polish | In progress (design system + screens scaffolded) |
 | 11 | Performance measurement | Partial (planning micro-benchmark + telemetry) |

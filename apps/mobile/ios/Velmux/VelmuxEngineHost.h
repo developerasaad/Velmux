@@ -17,15 +17,16 @@
 //  - BGProcessingTask registration/submission so the system can grant a
 //    longer window later to resume INTERRUPTED jobs (never user-paused
 //    ones — that pause is an explicit decision).
+//
+// This header is compiled into the Swift bridging PCH: it must stay free
+// of the VelmuxEngine pod module. The engine handle is forward-declared
+// as the opaque C struct it is; VelmuxEngineHost.mm imports the real
+// facade header.
 #import <Foundation/Foundation.h>
 
-#import <VelmuxEngine/velmux_bridge.h>
+typedef struct VelmuxEngineHandle VelmuxEngineHandle;
 
 NS_ASSUME_NONNULL_BEGIN
-
-/// Opaque listener token; pass to -removeListener:.
-@interface VelmuxEventListenerToken : NSObject
-@end
 
 @interface VelmuxEngineHost : NSObject
 
@@ -33,12 +34,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// The process-wide engine, created lazily in durable Application
 /// Support storage. Never destroyed: the process owns it.
-- (VelmuxEngineHandle *)engine;
+- (nullable VelmuxEngineHandle *)engine;
 
 /// Cheap event blocks; called on the host's serial queue.
 /// Returns a token for -removeListener:.
-- (VelmuxEventListenerToken *)addListener:(void (^)(NSDictionary *event))listener;
-- (void)removeListener:(VelmuxEventListenerToken *)token;
+- (NSUUID *)addListener:(void (^)(NSDictionary *event))listener;
+- (void)removeListener:(NSUUID *)token;
 
 /// Restarts the event poll timer if it is not running (cheap when it is).
 - (void)wake;

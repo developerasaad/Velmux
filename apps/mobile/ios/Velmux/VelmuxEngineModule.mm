@@ -29,7 +29,7 @@ NSString *const kVelmuxEventName = @"velmux.jobEvent";
 @implementation VelmuxEngineModule {
   dispatch_queue_t _engineQueue;
   dispatch_queue_t _sampleQueue;
-  VelmuxEventListenerToken *_eventToken;
+  NSUUID *_eventToken;
   std::atomic<int> _listenerCount;
 }
 
