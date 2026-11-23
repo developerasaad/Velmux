@@ -13,6 +13,8 @@ export interface VideoStreamInfo {
   bitRate: number;
   pixelFormat: string;
   hdr: boolean;
+  /** CEA-608/708 captions detected in the video bitstream. */
+  hasClosedCaptions: boolean;
 }
 export interface AudioStreamInfo {
   codec: string;
@@ -52,6 +54,26 @@ export interface ConversionRequest {
     rateControl: 'auto' | 'bitrate' | 'quality';
     bitRate: number | null;
     quality: number | null;
+    /** Geometry transforms (spec video ops). Order: crop -> rotate -> flip. */
+    crop: {x: number; y: number; width: number; height: number} | null;
+    rotationDegrees: 0 | 90 | 180 | 270;
+    flipHorizontal: boolean;
+    flipVertical: boolean;
+    /** Advanced encoder controls (spec advanced controls). */
+    profile: string | null;
+    level: string | null;
+    pixelFormat:
+      | 'yuv420p'
+      | 'yuv422p'
+      | 'yuv444p'
+      | 'yuv420p10le'
+      | 'yuv422p10le'
+      | 'yuv444p10le'
+      | null;
+    gopSize: number | null;
+    bFrames: number | null;
+    /** HDR handling: auto preserves where the output can carry it. */
+    hdrPolicy: 'auto' | 'toneMapToSdr';
   };
   audio: {
     enabled: boolean;
@@ -59,6 +81,23 @@ export interface ConversionRequest {
     bitRate: number | null;
     sampleRate: number | null;
     channels: number | null;
+    /** Audio DSP chain (spec audio ops). */
+    gainDb: number | null;
+    fadeInMs: number | null;
+    fadeOutMs: number | null;
+    normalizeLoudness: boolean;
+    playbackSpeed: number | null;
+    removeSilence: boolean;
+    /** PCM bit depth for PCM/WAV output. */
+    pcmBitDepth: 16 | 24 | 32 | null;
+    /** Multi-track: -1 = first; a valid index selects that track. */
+    sourceTrackIndex: number;
+    allTracks: boolean;
+    /** Replace source audio with an external file. */
+    replaceAudioUri: string | null;
+    /** Cover art: external image embed + attached-picture preservation. */
+    coverArtUri: string | null;
+    preserveCoverArt: boolean;
   };
   subtitles: {
     policy: 'preserve' | 'remove' | 'extract' | 'burnIn';
@@ -69,6 +108,8 @@ export interface ConversionRequest {
   // Window on the source timeline, microseconds (spec §15/§16 trimming).
   // endUs null = open-ended.
   trim: {startUs: number; endUs: number | null} | null;
+  /** Metadata policy: false preserves tags, true strips them. */
+  stripMetadata: boolean;
 }
 export interface JobSnapshot {
   id: string;

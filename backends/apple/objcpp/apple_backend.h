@@ -1,10 +1,10 @@
 // Apple native backend — VideoToolbox / AVFoundation / CoreMedia
 // implementation of the Velmux backend contracts.
 //
-// The real execution lives in apple_pipeline.mm (Objective-C++, Apple
-// platforms only). Non-Apple hosts resolve the pipeline symbols to honest
-// unavailable stubs (apple_backend.cpp) and the engine does not register
-// this backend.
+// The real execution lives in apple_pipeline.mm and apple_stages.mm
+// (Objective-C++, Apple platforms only). Non-Apple hosts resolve the
+// pipeline symbols to honest unavailable stubs (apple_backend.cpp) and
+// the engine does not register this backend.
 //
 // Ownership (docs/BACKEND_POLICY.md): this backend executes native codec
 // work; it NEVER decides fallbacks. It reports capabilities and errors; the
@@ -12,6 +12,7 @@
 #pragma once
 
 #include "apple_pipeline.h"
+#include "apple_stages.h"
 #include "velmux/backend/contracts.h"
 
 namespace velmux::apple {
@@ -56,10 +57,16 @@ public:
 
   velmux::backend::IInspector *inspector() override { return &inspector_; }
   velmux::backend::IPipelineExecutor *executor() override { return &executor_; }
+  // Milestone 4: stage workers for hybrid (stage-composed) pipelines.
+  // Real factories on Apple platforms (apple_stages.mm); honest nulls
+  // elsewhere (apple_backend.cpp) — and stage participation is only
+  // reported in the capabilities when the media stack initialized.
+  velmux::backend::IStageBackend *stages() override { return &stageBackend_; }
 
 private:
   AppleInspector inspector_;
   AppleExecutor executor_;
+  media::AppleStageBackend stageBackend_;
   bool mediaAvailable_ = false;
   media::NativeSupport support_;
 

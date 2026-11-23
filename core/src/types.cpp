@@ -219,4 +219,41 @@ const char *errorCodeName(ErrorCode code) {
   return "unknown-error";
 }
 
+// ---------------------------------------------------------------------------
+// Pixel formats
+// ---------------------------------------------------------------------------
+
+namespace {
+struct PixelFormatEntry {
+  PixelFormat format;
+  const char *name;
+};
+const PixelFormatEntry kPixelFormatNames[] = {
+    {PixelFormat::Yuv420P, "yuv420p"},
+    {PixelFormat::Yuv422P, "yuv422p"},
+    {PixelFormat::Yuv444P, "yuv444p"},
+    {PixelFormat::Yuv420P10Le, "yuv420p10le"},
+    {PixelFormat::Yuv422P10Le, "yuv422p10le"},
+    {PixelFormat::Yuv444P10Le, "yuv444p10le"},
+};
+} // namespace
+
+const char *pixelFormatName(PixelFormat format) {
+  for (const auto &entry : kPixelFormatNames) {
+    if (entry.format == format) {
+      return entry.name;
+    }
+  }
+  return "unknown-pixel-format";
+}
+
+std::optional<PixelFormat> pixelFormatFromName(const std::string &name) {
+  for (const auto &entry : kPixelFormatNames) {
+    if (name == entry.name) {
+      return entry.format;
+    }
+  }
+  return std::nullopt;
+}
+
 } // namespace velmux::core

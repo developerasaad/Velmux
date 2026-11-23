@@ -140,13 +140,14 @@ export const VIDEO_LEVELS: readonly string[] = [
   '5.2',
 ];
 
+// Engine-supported encode pixel formats (request contract): 8/10-bit
+// planar YUV in 4:2:0/4:2:2/4:4:4. Capture-oriented formats (nv12,
+// p010le) and 12-bit are not encode targets and stay off the list.
 export const PIXEL_FORMATS: readonly string[] = [
   'Auto',
   'yuv420p',
   'yuv422p',
   'yuv444p',
-  'nv12',
-  'p010le',
 ];
 
-export const BIT_DEPTHS: readonly number[] = [8, 10, 12];
+export const BIT_DEPTHS: readonly number[] = [8, 10];

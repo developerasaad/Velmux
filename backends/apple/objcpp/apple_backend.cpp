@@ -1,10 +1,10 @@
 // Apple native backend — VideoToolbox / AVFoundation / CoreMedia
 // implementation of the Velmux backend contracts.
 //
-// The real execution lives in apple_pipeline.mm (Objective-C++, compiled
-// on Apple platforms only). On other hosts the pipeline symbols resolve to
-// the honest unavailable stubs below and the engine does not register this
-// backend.
+// The real execution lives in apple_pipeline.mm and apple_stages.mm
+// (Objective-C++, compiled on Apple platforms only). On other hosts the
+// pipeline symbols resolve to the honest unavailable stubs below and the
+// engine does not register this backend.
 //
 // Ownership (docs/BACKEND_POLICY.md): this backend executes native codec
 // work; it NEVER decides fallbacks. It reports capabilities and errors; the
@@ -64,6 +64,12 @@ BackendCapabilities AppleBackend::capabilities() const {
   if (!mediaAvailable_) {
     return caps;
   }
+  // Milestone 4: the Apple stage workers decode to planar Yuv420P through
+  // AVAssetReader and encode/mux from CPU frames through VideoToolbox +
+  // AVAssetWriter (apple_stages.mm). Reported only when the media stack
+  // actually initialized — non-Apple hosts never claim participation.
+  caps.stageDecodeToCpuFrames = true;
+  caps.stageEncodeFromCpuFrames = true;
   // AVAssetWriter/ExportSession write the QuickTime/mp4 family (plus 3GP).
   for (const Container c :
        {Container::Mp4, Container::M4v, Container::M4a, Container::Mov,
@@ -263,6 +269,21 @@ RunResult transcodeFile(const std::string &, const std::string &,
   result.error = "Apple media APIs are not available in this process";
   return result;
 }
+
+// Stage workers (Milestone 4): honest null factories off Apple platforms.
+// The declarations stay valid (apple_backend.h holds the IStageBackend
+// member on every host); the backend never claims stage participation
+// there, so the hybrid executor never asks for these.
+
+backend::IVideoStageDecoder *AppleStageBackend::createVideoDecoder() {
+  return nullptr;
+}
+
+backend::IVideoStageEncoder *AppleStageBackend::createVideoEncoder() {
+  return nullptr;
+}
+
+backend::IMuxStage *AppleStageBackend::createMux() { return nullptr; }
 
 } // namespace velmux::apple::media
 

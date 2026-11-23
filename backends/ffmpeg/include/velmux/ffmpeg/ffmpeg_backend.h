@@ -56,7 +56,7 @@ private:
   velmux::backend::ExecuteResult
   executeTranscodeRange(const velmux::backend::ExecuteParams &params,
                         std::int64_t rangeStartUs, std::int64_t rangeEndUs,
-                        bool rangeActive);
+                        bool rangeActive, bool isSegmentRun = false);
   // Long-job path: transcode in independently finalized, validated and
   // committed segments, then assemble. Resumes from committed artifacts.
   velmux::backend::ExecuteResult

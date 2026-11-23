@@ -14,8 +14,8 @@ fi
 
 BUILDER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOADS_DIR="${VELMUX_DOWNLOADS_DIR:-$BUILDER_ROOT/downloads}"
-SRC_DIR="$BUILDER_ROOT/src"
-OUT_DIR="$BUILDER_ROOT/out"
+SRC_DIR="${VELMUX_SRC_DIR:-$BUILDER_ROOT/src}"
+OUT_DIR="${VELMUX_OUT_DIR:-$BUILDER_ROOT/out}"
 
 JOBS="${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 

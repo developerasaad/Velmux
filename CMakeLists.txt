@@ -172,8 +172,11 @@ add_library(velmux_backend_apple
   backends/apple/objcpp/apple_backend.cpp)
 if(APPLE)
   target_sources(velmux_backend_apple PRIVATE
-    backends/apple/objcpp/apple_pipeline.mm)
+    backends/apple/objcpp/apple_pipeline.mm
+    backends/apple/objcpp/apple_stages.mm)
   set_source_files_properties(backends/apple/objcpp/apple_pipeline.mm
+    PROPERTIES LANGUAGE OBJCXX)
+  set_source_files_properties(backends/apple/objcpp/apple_stages.mm
     PROPERTIES LANGUAGE OBJCXX)
   # AVFoundation/VideoToolbox/CoreMedia/CoreVideo for the native pipeline.
   target_link_libraries(velmux_backend_apple PUBLIC

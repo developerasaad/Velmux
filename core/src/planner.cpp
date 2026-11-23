@@ -186,6 +186,40 @@ PlanResult Planner::plan(const MediaInfo &source,
     result.message = "Trim start must not be negative.";
     return result;
   }
+  // Advanced-control sanity (spec §18): range checks here, capability
+  // routing below. Invalid values are request errors, never silently
+  // clamped into a different encode.
+  if (request.video.gopSize.has_value() && *request.video.gopSize < 1) {
+    result.feasible = false;
+    result.message = "GOP size must be at least 1 frame.";
+    return result;
+  }
+  if (request.video.bFrames.has_value() && *request.video.bFrames < 0) {
+    result.feasible = false;
+    result.message = "B-frame count must not be negative.";
+    return result;
+  }
+  // Track selection sanity: -1 = first track; otherwise a real index.
+  if (request.audio.sourceTrackIndex < -1 ||
+      request.audio.sourceTrackIndex >=
+          static_cast<std::int32_t>(source.audio.size())) {
+    result.feasible = false;
+    result.message =
+        std::string("Audio track index ") +
+        std::to_string(request.audio.sourceTrackIndex) +
+        " is outside this source (0.." +
+        std::to_string(source.audio.empty() ? 0 : source.audio.size() - 1) +
+        ").";
+    return result;
+  }
+  // Replacing audio while processing all source tracks is contradictory.
+  if (request.audio.replaceAudioUri.has_value() && request.audio.allTracks) {
+    result.feasible = false;
+    result.message =
+        "Replacing audio cannot be combined with processing all source "
+        "audio tracks.";
+    return result;
+  }
   if (request.subtitles.policy == SubtitlePolicy::BurnIn &&
       !request.subtitles.externalUri.has_value() && !source.hasSubtitles()) {
     result.feasible = false;
@@ -298,8 +332,23 @@ PlanResult Planner::plan(const MediaInfo &source,
       // Burn-in rewrites the video pixels: it can never stream-copy.
       request.subtitles.policy != SubtitlePolicy::BurnIn;
   const bool canStreamCopyAudio =
-      wantsAudio && source.audio.front().codec == outAudioCodec &&
-      features_.audioSupport(outAudioCodec).streamCopy &&
+      wantsAudio &&
+      // Replacement audio is a different stream: never a copy of the
+      // source's audio.
+      !request.audio.replaceAudioUri.has_value() &&
+      // With allTracks, every track must be copyable into the target
+      // container as-is; a mixed copy/encode result is not "stream copy".
+      (!request.audio.allTracks ||
+       std::all_of(source.audio.begin(), source.audio.end(), [&](
+                       const AudioStream &track) {
+         return track.codec == outAudioCodec &&
+                features_.audioSupport(track.codec).streamCopy &&
+                features_.containerAccepts(outContainer, track.codec);
+       })) &&
+      (request.audio.allTracks ||
+       (source.audio.front().codec == outAudioCodec &&
+        features_.audioSupport(outAudioCodec).streamCopy &&
+        features_.containerAccepts(outContainer, source.audio.front().codec))) &&
       !request.audio.sampleRate.has_value() &&
       !request.audio.channels.has_value() &&
       !request.audio.bitRate.has_value() &&
@@ -396,6 +445,39 @@ PlanResult Planner::plan(const MediaInfo &source,
          request.audio.playbackSpeed.has_value() ||
          request.audio.removeSilence) &&
         !caps->audioDsp) {
+      return;
+    }
+    // Advanced encoder tuning (spec §18): profile/level/pixel format/
+    // GOP/B-frames only route to backends that implement the controls.
+    const bool wantsEncoderTuning =
+        request.video.profile.has_value() ||
+        request.video.level.has_value() ||
+        request.video.pixelFormat.has_value() ||
+        request.video.gopSize.has_value() || request.video.bFrames.has_value();
+    if (wantsVideo && wantsEncoderTuning && !caps->videoEncoderTuning) {
+      return;
+    }
+    // HDR -> SDR conversion (spec §9) needs a tone-mapping backend; only
+    // meaningful when the source is actually HDR.
+    if (wantsVideo && !streamCopy &&
+        request.video.hdrPolicy == HdrPolicy::ToneMapToSdr &&
+        source.hasVideo() && source.video.front().hdr &&
+        !caps->hdrToneMapping) {
+      return;
+    }
+    // Multi-track audio and explicit track selection (spec §9).
+    if (wantsAudio &&
+        ((request.audio.allTracks && source.audio.size() > 1) ||
+         request.audio.sourceTrackIndex >= 0) &&
+        !caps->multiTrackAudio) {
+      return;
+    }
+    // Audio replacement and cover art (spec §9/§10).
+    if (request.audio.replaceAudioUri.has_value() &&
+        !caps->audioReplacement) {
+      return;
+    }
+    if (request.audio.coverArtUri.has_value() && !caps->coverArt) {
       return;
     }
     if (!streamCopy) {
@@ -586,8 +668,21 @@ PlanResult Planner::plan(const MediaInfo &source,
       request.audio.fadeInMs.has_value() ||
       request.audio.fadeOutMs.has_value() || request.audio.normalizeLoudness ||
       request.audio.playbackSpeed.has_value() || request.audio.removeSilence;
+  // v1 stage contracts carry no advanced encoder tuning and no multi-track
+  // / replacement / cover-art audio handling: such requests stay on
+  // whole-pipeline backends.
+  const bool wantsAdvancedAudio =
+      (request.audio.allTracks && source.audio.size() > 1) ||
+      request.audio.sourceTrackIndex >= 0 ||
+      request.audio.replaceAudioUri.has_value() ||
+      request.audio.coverArtUri.has_value();
+  const bool wantsEncoderTuning =
+      request.video.profile.has_value() || request.video.level.has_value() ||
+      request.video.pixelFormat.has_value() ||
+      request.video.gopSize.has_value() || request.video.bFrames.has_value();
   if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim &&
-      !wantsTransform && !wantsAudioDsp) {
+      !wantsTransform && !wantsAudioDsp && !wantsAdvancedAudio &&
+      !wantsEncoderTuning) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&
@@ -740,18 +835,46 @@ PlanResult Planner::plan(const MediaInfo &source,
   result.best = result.alternates.front();
   result.feasible = true;
 
+  // Post-selection notes (advisories). They compose: closed captions,
+  // budget warnings and future notes append rather than replace.
+  const auto addNote = [&result](const std::string &note) {
+    if (note.empty()) {
+      return;
+    }
+    if (!result.message.empty()) {
+      result.message += " ";
+    }
+    result.message += note;
+  };
+
+  // Closed-caption honesty (spec §11): CEA-608/708 captions ride the
+  // video elementary stream. Transcoding rewrites it and drops them;
+  // stream copy keeps them. Say so instead of losing them silently.
+  if (source.hasVideo() && source.video.front().hasClosedCaptions) {
+    if (result.best->pipeline.videoStreamCopy) {
+      addNote(
+          "Closed captions (CEA-608/708) detected; stream copy preserves "
+          "them in the video bitstream.");
+    } else {
+      addNote(
+          "Closed captions (CEA-608/708) detected; this transcode drops "
+          "them because they ride the video bitstream. Use stream copy "
+          "(same codec) to keep them.");
+    }
+  }
+
   // Fit-under-size feasibility cross-check with real budget math.
   if (request.goal.kind == GoalKind::FitUnderSize &&
       request.goal.targetSizeBytes > 0) {
     const BitrateBudget budget = computeBitrateBudget(
         source, request, request.goal.targetSizeBytes);
     if (!budget.feasible) {
-      result.message = budget.message;
+      addNote(budget.message);
     } else if (result.best->estimatedOutputBytes.value_or(0) >
                std::int64_t(request.goal.targetSizeBytes * 1.10)) {
-      result.message =
+      addNote(
           "Estimated output exceeds the target size; consider a lower "
-          "resolution or bitrate for a safer margin.";
+          "resolution or bitrate for a safer margin.");
     }
   }
 

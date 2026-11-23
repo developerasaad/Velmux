@@ -71,6 +71,19 @@ struct BackendCapabilities {
   // Can this backend encode video from CPU frames and mux the result
   // (with stream-copied audio) for a hybrid pipeline?
   bool stageEncodeFromCpuFrames = false;
+  // Can the backend honor advanced encoder tuning (profile, level, pixel
+  // format, GOP size, B-frame count)? When false, the planner routes
+  // requests setting any of those elsewhere (refusing when nowhere can).
+  bool videoEncoderTuning = false;
+  // Can the backend process every source audio track (multi-track output
+  // with language metadata) and select among them?
+  bool multiTrackAudio = false;
+  // Can the backend replace the source audio with an external file?
+  bool audioReplacement = false;
+  // Can the backend embed external cover art and carry attached pictures?
+  bool coverArt = false;
+  // Can the backend tone-map HDR sources to SDR during a transcode?
+  bool hdrToneMapping = false;
   // Free-form implementation label, e.g. "ffmpeg 7.1.1 (static, feature
   // selected)" or "MediaCodec (OMX.qcom.video.encoder.avc)".
   std::string implementation;

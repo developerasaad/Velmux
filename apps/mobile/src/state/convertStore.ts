@@ -544,10 +544,38 @@ export function computeGoalLabel(draft: ConvertDraft): string {
   return PRESET_LABELS[draft.basePreset];
 }
 
+/**
+ * Maps the draft's advanced extras (profile, level, chroma, bit depth)
+ * onto the engine's pixel-format contract. Returns null when nothing was
+ * selected (encoder default). Unsupported combinations cannot occur: the
+ * option lists only offer the engine-supported set.
+ */
+function enginePixelFormat(
+  extras: AdvancedExtras,
+): ConversionRequest['video']['pixelFormat'] {
+  if (!extras.pixelFormat && extras.bitDepth == null) {
+    return null;
+  }
+  const chroma = extras.pixelFormat ?? 'yuv420p';
+  const tenBit = extras.bitDepth === 10;
+  switch (chroma) {
+    case 'yuv422p':
+      return tenBit ? 'yuv422p10le' : 'yuv422p';
+    case 'yuv444p':
+      return tenBit ? 'yuv444p10le' : 'yuv444p';
+    default:
+      return tenBit ? 'yuv420p10le' : 'yuv420p';
+  }
+}
+
 export function computeRequest(draft: ConvertDraft): ConversionRequest | null {
   if (!draft.source) {
     return null;
   }
+  const profile =
+    draft.extras.profile != null
+      ? draft.extras.profile.toLowerCase()
+      : null;
   return {
     source: draft.source,
     outputName: null,
@@ -561,6 +589,18 @@ export function computeRequest(draft: ConvertDraft): ConversionRequest | null {
       rateControl: draft.video.rateControl,
       bitRate: draft.video.bitRate,
       quality: draft.video.quality,
+      // Geometry transforms: no controls in the draft yet (the engine
+      // contract carries them; the convert screen wires them).
+      crop: null,
+      rotationDegrees: 0,
+      flipHorizontal: false,
+      flipVertical: false,
+      profile,
+      level: draft.extras.level,
+      pixelFormat: enginePixelFormat(draft.extras),
+      gopSize: draft.extras.gopSize,
+      bFrames: draft.extras.bFrames,
+      hdrPolicy: 'auto',
     },
     audio: {
       enabled: draft.audio.enabled,
@@ -568,6 +608,19 @@ export function computeRequest(draft: ConvertDraft): ConversionRequest | null {
       bitRate: draft.audio.bitRate,
       sampleRate: draft.audio.sampleRate,
       channels: draft.audio.channels,
+      // Audio DSP: no controls in the draft yet (engine contract ready).
+      gainDb: null,
+      fadeInMs: null,
+      fadeOutMs: null,
+      normalizeLoudness: false,
+      playbackSpeed: null,
+      removeSilence: false,
+      pcmBitDepth: null,
+      sourceTrackIndex: -1,
+      allTracks: false,
+      replaceAudioUri: null,
+      coverArtUri: null,
+      preserveCoverArt: true,
     },
     subtitles: {
       policy: draft.subtitles.policy,
@@ -576,5 +629,6 @@ export function computeRequest(draft: ConvertDraft): ConversionRequest | null {
     },
     processingMode: draft.processingMode,
     trim: null,
+    stripMetadata: draft.extras.metadata === 'strip',
   };
 }

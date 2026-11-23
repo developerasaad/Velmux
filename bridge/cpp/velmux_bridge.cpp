@@ -646,6 +646,40 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
     if (!error.empty()) {
       return std::nullopt;
     }
+    // Advanced encoder controls (spec §18).
+    request.video.profile = getOptString(*video, "profile");
+    request.video.level = getOptString(*video, "level");
+    if (auto fmt = getOptString(*video, "pixelFormat")) {
+      request.video.pixelFormat = pixelFormatFromName(*fmt);
+      if (!request.video.pixelFormat.has_value()) {
+        error = "unknown pixel format: " + *fmt;
+        return std::nullopt;
+      }
+    }
+    if (auto gop = getOptInt(*video, "gopSize")) {
+      if (*gop < 1) {
+        error = "gopSize must be at least 1";
+        return std::nullopt;
+      }
+      request.video.gopSize = std::int32_t(*gop);
+    }
+    if (auto bframes = getOptInt(*video, "bFrames")) {
+      if (*bframes < 0) {
+        error = "bFrames must be non-negative";
+        return std::nullopt;
+      }
+      request.video.bFrames = std::int32_t(*bframes);
+    }
+    const std::string hdrPolicy =
+        getOptString(*video, "hdrPolicy").value_or("auto");
+    if (hdrPolicy == "auto") {
+      request.video.hdrPolicy = HdrPolicy::Auto;
+    } else if (hdrPolicy == "toneMapToSdr") {
+      request.video.hdrPolicy = HdrPolicy::ToneMapToSdr;
+    } else {
+      error = "unknown hdrPolicy: " + hdrPolicy;
+      return std::nullopt;
+    }
   }
 
   // audio { enabled, codec?, bitRate?, sampleRate?, channels? }
@@ -730,6 +764,25 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
       }
       request.audio.pcmBitDepth = std::int32_t(*depth);
     }
+    if (auto track = getOptInt(*audio, "sourceTrackIndex")) {
+      if (*track < -1) {
+        error = "sourceTrackIndex must be -1 or a track number";
+        return std::nullopt;
+      }
+      request.audio.sourceTrackIndex = std::int32_t(*track);
+    }
+    request.audio.allTracks =
+        getBool(*audio, "allTracks", false, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
+    request.audio.replaceAudioUri = getOptString(*audio, "replaceAudioUri");
+    request.audio.coverArtUri = getOptString(*audio, "coverArtUri");
+    request.audio.preserveCoverArt =
+        getBool(*audio, "preserveCoverArt", true, error);
+    if (!error.empty()) {
+      return std::nullopt;
+    }
   }
 
   // subtitles { policy, externalUri?, timingOffsetMs }
@@ -751,6 +804,12 @@ std::optional<ConversionRequest> requestFromJson(const std::string &json,
     request.subtitles.externalUri = getOptString(*subs, "externalUri");
     request.subtitles.timingOffsetMs =
         std::int32_t(getOptInt(*subs, "timingOffsetMs").value_or(0));
+  }
+
+  // Metadata policy (top-level; applies to the whole output).
+  request.stripMetadata = getBool(root, "stripMetadata", false, error);
+  if (!error.empty()) {
+    return std::nullopt;
   }
 
   // processingMode
@@ -842,6 +901,8 @@ std::string mediaInfoToJson(const MediaInfo &info) {
     out += ",\"bitRate\":" + std::to_string(v.bitRate);
     out += ",\"pixelFormat\":" + quoted(v.pixelFormat);
     out += ",\"hdr\":" + std::string(v.hdr ? "true" : "false");
+    out += ",\"hasClosedCaptions\":" +
+           std::string(v.hasClosedCaptions ? "true" : "false");
     out += "}";
   }
   out += "],\"audio\":[";

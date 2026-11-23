@@ -60,6 +60,9 @@ Pod::Spec.new do |spec|
   source_files = [
     'core/src/**/*.cpp',
     'bridge/cpp/*.cpp',
+    # Apple backend: whole-pipeline executor (apple_pipeline.mm) and the
+    # Milestone 4 stage workers for hybrid pipelines (apple_stages.mm),
+    # both picked up by the glob below.
     'backends/apple/objcpp/*.{cpp,mm,h}',
     'third_party/sqlite/sqlite3.{c,h}',
     'bridge/cpp/velmux_bridge.h',

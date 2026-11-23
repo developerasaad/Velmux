@@ -12,12 +12,13 @@
   "dependencies": {
     "nasm": {
       "version": "2.16.03",
-      "url": "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.gz",
+      "url": "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.xz",
       "mirrors": [
-        "https://github.com/netwide-assembler/nasm/archive/refs/tags/nasm-2.16.03.tar.gz"
+        "https://ftp2.osuosl.org/pub/blfs/conglomeration/nasm/nasm-2.16.03.tar.xz"
       ],
-      "sha256": "5bc940dd8a4245686976a8f7e96ba9340a0915f2d5b88356874890e207bdb581",
-      "host_only": true
+      "sha256": "1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148",
+      "host_only": true,
+      "note": "nasm.us serves cloud-unfriendly stalls and the GitHub tag archive is NOT byte-identical to the release tarball (its checksum can never match). The OSUOSL BLFS mirror carries the pristine upstream .tar.xz; its checksum was verified against the extracted source."
     },
     "zlib": {
       "version": "1.3.1",
@@ -89,9 +90,10 @@
       "version": "2.3.0",
       "url": "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v2.3.0/SVT-AV1-v2.3.0.tar.gz",
       "mirrors": [
-        "https://github.com/OpenVisualCloud/SVT-AV1/archive/refs/tags/v2.3.0.tar.gz"
+        "https://src.fedoraproject.org/repo/pkgs/rpms/SVT-AV1/SVT-AV1-2.3.0.tar.gz/sha512/f86ced4728f8334d40cb52a9be1c397e2a8419299ae92295cfd4f81f8678332bce4dc6d8ca48f303d337cfb6e04122f084b5a0359f17aa8a07b5b6795afcfb93/SVT-AV1-2.3.0.tar.gz"
       ],
-      "sha256": "ebb0b484ef4a0dc281e94342a9f73ad458496f5d3457eca7465bec943910c6c3"
+      "sha256": "ebb0b484ef4a0dc281e94342a9f73ad458496f5d3457eca7465bec943910c6c3",
+      "note": "gitlab archives stall from some cloud IPs; the old OpenVisualCloud GitHub mirror is gone (404). The Fedora lookaside carries the pristine upstream tarball (sha512-verified path)."
     },
     "freetype": {
       "version": "2.13.3",

@@ -153,6 +153,25 @@ enum class SubtitleFormat : std::uint8_t {
 
 enum class MediaKind : std::uint8_t { Video, Audio, Subtitle, Data };
 
+// Output pixel formats the request model can name (advanced controls,
+// spec §18). Encoders accept a subset; the planner only routes such
+// requests to backends reporting `videoEncoderTuning`.
+enum class PixelFormat : std::uint8_t {
+  Yuv420P,     // 4:2:0 8-bit — the universal default
+  Yuv422P,     // 4:2:2 8-bit
+  Yuv444P,     // 4:4:4 8-bit
+  Yuv420P10Le, // 4:2:0 10-bit little-endian
+  Yuv422P10Le, // 4:2:2 10-bit little-endian
+  Yuv444P10Le, // 4:4:4 10-bit little-endian
+};
+
+// HDR handling policy for transcodes (spec §9: preserve HDR where
+// compatible, convert HDR -> SDR where supported).
+enum class HdrPolicy : std::uint8_t {
+  Auto,        // preserve HDR signaling when the output path can carry it
+  ToneMapToSdr, // convert HDR (PQ/HLG, wide gamut) to 8-bit SDR BT.709
+};
+
 enum class CodecOp : std::uint8_t { Decode, Encode, StreamCopy };
 
 // Per-codec operation support (shared by feature and capability
@@ -175,6 +194,8 @@ std::optional<VideoCodec> videoCodecFromName(const std::string &name);
 std::optional<AudioCodec> audioCodecFromName(const std::string &name);
 std::optional<Container> containerFromName(const std::string &name);
 std::optional<SubtitleFormat> subtitleFormatFromName(const std::string &name);
+const char *pixelFormatName(PixelFormat format);
+std::optional<PixelFormat> pixelFormatFromName(const std::string &name);
 
 // ---------------------------------------------------------------------------
 // Errors

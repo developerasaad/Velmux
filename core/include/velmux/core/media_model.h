@@ -28,6 +28,10 @@ struct VideoStream {
   std::int64_t bitRate = 0; // bits per second, 0 when unknown
   std::string pixelFormat; // backend-reported name, e.g. "yuv420p"
   bool hdr = false;
+  // CEA-608/708 captions detected in the video elementary stream (A53 side
+  // data at inspection). They ride the video bitstream: stream copy keeps
+  // them, transcoding drops them (surfaced honestly, spec §11).
+  bool hasClosedCaptions = false;
   // Track labels when the container carries more than one track.
   std::string language; // BCP-47-ish tag as reported, may be empty
   bool isDefault = false;

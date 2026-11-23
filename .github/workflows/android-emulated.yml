@@ -45,11 +45,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # google_apis images, not "default": the API 29 default image
+          # hangs during headless boot on modern emulator builds (observed:
+          # sys.boot_completed never set within 9 minutes with KVM working).
+          # google_apis images are the CI-proven set.
           - api-level: 29
             # Product floor: Android 10 / API 29 (docs/DECISIONS.md D-003).
-            image: system-images;android-29;default;x86_64
+            image: system-images;android-29;google_apis;x86_64
           - api-level: 34
-            image: system-images;android-34;default;x86_64
+            image: system-images;android-34;google_apis;x86_64
     env:
       ANDROID_AVD_HOME: /home/runner/.android/avd
     steps:
@@ -147,24 +151,47 @@ jobs:
             --sdcard 2048M \
             --force
           # Keep the emulator from trying to load a heavy default profile.
+          printf '\n' >> "$ANDROID_AVD_HOME/velmux-api${{ matrix.api-level }}.avd/config.ini"
           cat >> "$ANDROID_AVD_HOME/velmux-api${{ matrix.api-level }}.avd/config.ini" <<EOF
           hw.ramSize=3072
           hw.lcd.density=240
           hw.lcd.width=720
           hw.lcd.height=1280
-          disk.dataPartition.size=6G
+          disk.dataPartition.size=2G
+          hw.keyboard=yes
           EOF
 
       - name: Boot emulator
-        timeout-minutes: 15
+        timeout-minutes: 18
         run: |
           export PATH="/usr/local/lib/android/sdk/emulator:/usr/local/lib/android/sdk/platform-tools:$PATH"
           nohup emulator -avd velmux-api${{ matrix.api-level }} \
-            -no-window -no-audio -no-boot-anim -no-snapshot \
-            -gpu swiftshader_indirect -accel on \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on -cores 2 \
             > /tmp/emulator.log 2>&1 &
           adb wait-for-device
-          timeout 540 adb shell 'while [ -z "$(getprop sys.boot_completed)" ]; do sleep 2; done'
+          # Poll with visibility: print boot progress markers every 30 s so
+          # a hang is diagnosable from the log alone.
+          for i in $(seq 1 30); do
+            BOOT="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+            if [ "$BOOT" = "1" ]; then
+              echo "boot completed after ~$((i * 30))s"
+              break
+            fi
+            if ! pgrep -x emulator >/dev/null 2>&1; then
+              echo "emulator process died; log tail:"
+              tail -50 /tmp/emulator.log
+              exit 1
+            fi
+            sleep 30
+          done
+          BOOT="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+          if [ "$BOOT" != "1" ]; then
+            echo "boot never completed; emulator log tail:"
+            tail -80 /tmp/emulator.log
+            adb devices -l || true
+            exit 1
+          fi
           # Some system services settle slightly after boot_completed.
           sleep 10
           adb shell getprop sys.boot_completed
@@ -196,8 +223,12 @@ jobs:
         run: |
           export PATH="/usr/local/lib/android/sdk/platform-tools:$PATH"
           mkdir -p /tmp/diag
-          adb bugreport /tmp/diag/bugreport.zip > /dev/null 2>&1 || true
+          # Bounded: a bugreport against a half-booted emulator can hang
+          # indefinitely (observed eating 40 minutes of job time).
+          timeout 90 adb bugreport /tmp/diag/bugreport.zip > /dev/null 2>&1 || true
           cp /tmp/emulator.log /tmp/diag/ 2>/dev/null || true
+          adb shell getprop > /tmp/diag/getprop.txt 2>/dev/null || true
+          adb devices -l > /tmp/diag/devices.txt 2>/dev/null || true
 
       - name: Upload diagnostics on failure
         if: failure()

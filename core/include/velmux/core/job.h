@@ -103,6 +103,17 @@ struct VideoRequest {
   std::int32_t rotationDegrees = 0;
   bool flipHorizontal = false;
   bool flipVertical = false;
+  // Advanced encoder controls (spec §18). All optional: nullopt keeps
+  // the encoder default. Only backends reporting `videoEncoderTuning`
+  // receive requests that set any of these (planner-enforced; hybrid
+  // stage contracts do not carry them in v1).
+  std::optional<std::string> profile; // e.g. "baseline"/"main"/"high"
+  std::optional<std::string> level;   // e.g. "4.0"/"5.1"
+  std::optional<PixelFormat> pixelFormat;
+  std::optional<std::int32_t> gopSize; // >= 1 keyframe interval in frames
+  std::optional<std::int32_t> bFrames; // >= 0 B-frames between references
+  // HDR handling for transcodes (spec §9).
+  HdrPolicy hdrPolicy = HdrPolicy::Auto;
 };
 
 struct AudioRequest {
@@ -124,6 +135,20 @@ struct AudioRequest {
   bool removeSilence = false; // shortens pauses; duration-only checks relax
   // PCM output bit depth (16/24/32); meaningful for PCM/WAV output.
   std::optional<std::int32_t> pcmBitDepth;
+  // Multi-track audio (spec §9): -1 selects the first source audio track;
+  // a valid index selects that track. With allTracks, every source audio
+  // track is processed (encoded or copied) with its language metadata.
+  std::int32_t sourceTrackIndex = -1;
+  bool allTracks = false;
+  // Replace the source's audio with this external audio file (spec §9).
+  // The output timeline follows the video stream; a shorter/longer
+  // replacement is honestly reflected in the result.
+  std::optional<std::string> replaceAudioUri;
+  // Embed this external image as cover art / attached picture (spec §10).
+  std::optional<std::string> coverArtUri;
+  // Carry the source's attached pictures into the output (when the
+  // container supports them).
+  bool preserveCoverArt = true;
 };
 
 struct SubtitleRequest {
@@ -145,6 +170,9 @@ struct ConversionRequest {
   ProcessingMode processingMode = ProcessingMode::Auto;
   // Process only this window of the source (trimming, sample generation).
   TimeRange trim;
+  // Metadata policy (spec advanced controls): false preserves container
+  // and stream tags through transcode/remux; true strips them.
+  bool stripMetadata = false;
 };
 
 // Result of sample generation (spec §20): a short preview transcode of a
