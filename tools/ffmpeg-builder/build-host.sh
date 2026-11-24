@@ -61,6 +61,12 @@ if [ -d "$HOST_PREFIX" ] && ! identity_matches "$HOST_PREFIX" "$HOST_IDENTITY"; 
 fi
 
 mkdir -p "$HOST_PREFIX" "$SRC_DIR"
+# Stamp the identity BEFORE building: an interrupted run then resumes with
+# the same tree identity (the per-library "already installed" checks skip
+# completed work) instead of wiping partial progress on every restart.
+# A stamped-but-incomplete prefix still fails host_build_complete, so
+# partial artifacts can never masquerade as a valid build.
+write_identity "$HOST_PREFIX" "$HOST_IDENTITY" "host FFmpeg (resumable build), jobs=$JOBS"
 BUILD_TMP="$SRC_DIR/build-host"
 mkdir -p "$BUILD_TMP"
 

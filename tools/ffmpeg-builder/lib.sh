@@ -89,10 +89,23 @@ else:
 PY
 }
 
+# ua_for_url <url> — print the User-Agent to use for a host, if any.
+# Some hosts (code.videolan.org) reject plain curl/wget requests and need
+# a browser-like UA; others (gitlab.com) run bot protection that REJECTS
+# fake browser UAs while allowing the honest curl default. Nothing is
+# printed for hosts that prefer the default.
+ua_for_url() {
+  case "$1" in
+    https://code.videolan.org/* | http://code.videolan.org/*)
+      printf '%s' "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+      ;;
+  esac
+}
+
 # download <name> — fetch + verify the pinned tarball recorded in versions.json.
 # Tries the canonical URL first, then mirrors. Skips when the cached file
-# already matches its checksum. A browser-like User-Agent is used because some
-# canonical hosts (code.videolan.org) reject plain curl/wget requests.
+# already matches its checksum. The User-Agent is chosen per host
+# (see ua_for_url).
 fetch_tarball() {
   local name="$1"
   local version url sha256 fname
@@ -120,10 +133,13 @@ fetch_tarball() {
     [ -n "$mirror" ] && urls+=("$mirror")
   done < <(json_field "$BUILDER_ROOT/versions.json" "dependencies.$name.mirrors")
 
-  local ok=0
+  local ok=0 ua
   for u in "${urls[@]}"; do
     log "downloading $name $version from $u"
-    if curl -fsL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+    ua="$(ua_for_url "$u")"
+    local ua_args=()
+    [ -n "$ua" ] && ua_args=(-A "$ua")
+    if curl -fsL "${ua_args[@]}" \
         --retry 3 --connect-timeout 30 \
         --speed-limit 1024 --speed-time 60 --max-time 900 \
         -o "$dest" "$u"; then ok=1; break; fi
