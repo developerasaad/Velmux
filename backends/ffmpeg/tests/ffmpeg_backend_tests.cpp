@@ -426,6 +426,46 @@ TEST_CASE("REAL transcode: H.264/AAC MP4 -> VP9/Opus WebM with validation") {
   CHECK(std::filesystem::file_size(outputPath) > 8192);
 }
 
+TEST_CASE("REAL transcode: H.264 MP4 -> HEVC (libx265) MP4 with validation") {
+  TestEnv env;
+  // The feature matrix requires HEVC ENCODE through FFmpeg (libx265),
+  // not only through MediaCodec/VideoToolbox. A real software HEVC
+  // encode, validated by the engine's own output validator plus an
+  // independent ffprobe cross-check.
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  // Explicit quality (not bitrate) exercises the CRF path for libx265.
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::Mp4, VideoCodec::HEVC,
+                       AudioCodec::Aac);
+  request.video.quality = 60;
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto jobs = env.engine->listJobs();
+  REQUIRE(jobs.size() == 1);
+  const JobSnapshot &job = jobs.front();
+  const std::string outputPath = job.outputPath;
+  REQUIRE(std::filesystem::exists(outputPath));
+
+  const ProbeResult probe = probeWith(outputPath);
+  CHECK(probe.videoCodec == "hevc");
+  CHECK(probe.audioCodec == "aac");
+  CHECK(probe.width == 320);
+  CHECK(probe.height == 240);
+  CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+  CHECK(std::filesystem::file_size(outputPath) > 8192);
+}
+
 TEST_CASE("REAL transcode: resolution downscale to 144p") {
   TestEnv env;
   const std::string fixture =

@@ -43,7 +43,7 @@ validate_api_level() {
 # ---------------------------------------------------------------------------
 # build.sh argument parsing
 # ---------------------------------------------------------------------------
-# Outputs (echo, one per line — callers read with mapfile):
+# Outputs (echo, one per line — callers read with a while-read loop):
 #   targets:<comma-separated>   (android, ios, ffmpeg-host, ffmpeg-android,
 #                                ffmpeg-ios)
 #   release | debug

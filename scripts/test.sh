@@ -21,7 +21,13 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/targets.sh
 . "$SCRIPTS_DIR/lib/targets.sh"
 
-mapfile -t ARGS < <(parse_test_args "$@")
+# Read parse_test_args' line output into ARGS. while-read over process
+# substitution, not mapfile: macOS runners still ship bash 3.2, where
+# mapfile does not exist.
+ARGS=()
+while IFS= read -r line; do
+  ARGS+=("$line")
+done < <(parse_test_args "$@")
 # parse_test_args prints nothing only for the help path (usage went to
 # stderr, subshell exited 0) — propagate the clean exit.
 [ "${#ARGS[@]}" -gt 0 ] || exit 0
