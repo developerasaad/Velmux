@@ -214,6 +214,9 @@ struct AndroidStageDecoder::Impl {
   AMediaExtractor *extractor = nullptr;
   AMediaCodec *codec = nullptr;
   AImageReader *reader = nullptr;
+  // Borrowed from the reader via AImageReader_getWindow: owned by the
+  // reader (NDK header: 'Do NOT call ANativeWindow_release on it.
+  // Instead, use AImageReader_delete'). Held only to configure the codec.
   ANativeWindow *window = nullptr;
   int extractorFd = -1; // source fd; closed after the extractor dies
   int videoTrack = -1;
@@ -240,9 +243,15 @@ AndroidStageDecoder::~AndroidStageDecoder() {
     AMediaCodec_stop(d.codec);
     AMediaCodec_delete(d.codec);
   }
-  if (d.window != nullptr) {
-    ANativeWindow_release(d.window);
-  }
+  // The window is NOT released here: AImageReader_getWindow returns a
+  // pointer owned by the reader ('Do NOT call ANativeWindow_release on
+  // it. Instead, use AImageReader_delete' — NdkImageReader.h). Releasing
+  // it destroyed the reader's own Surface underneath it, and the
+  // subsequent AImageReader_delete dereferenced the freed object —
+  // SIGSEGV in ~AImageReader/RefBase::decStrong, observed on the API 29
+  // and 34 emulators (the instrumented hybrid tests, 2026-11-24). The
+  // codec must be deleted first (it holds its own surface reference from
+  // configure); AImageReader_delete then tears the window down safely.
   if (d.reader != nullptr) {
     AImageReader_delete(d.reader);
   }
