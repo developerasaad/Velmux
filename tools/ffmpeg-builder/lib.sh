@@ -199,8 +199,11 @@ fetch_tarball() {
     [ -n "$ua" ] && ua_args=(-A "$ua")
     # ${arr[@]+...}: bash 3.2 (macOS runners) treats the expansion of an
     # EMPTY array under set -u as an unbound variable; expand conditionally.
+    # --retry-all-errors: plain --retry only covers slow/transient failures
+    # (timeouts, 5xx); a DNS resolver hiccup, TLS handshake failure, or an
+    # instant 4xx fails in milliseconds and used to kill the whole build.
     if curl -fsL ${ua_args[@]+"${ua_args[@]}"} \
-        --retry 3 --connect-timeout 30 \
+        --retry 3 --retry-all-errors --connect-timeout 30 \
         --speed-limit 1024 --speed-time 60 --max-time 900 \
         -o "$dest" "$u"; then ok=1; break; fi
     rm -f "$dest"
@@ -237,7 +240,9 @@ fetch_ffmpeg() {
     log "downloading ffmpeg $version from $u"
     # Stall protection: some mirrors accept the connection then stall the
     # body forever (nasm.us did exactly that from CI networks).
-    if curl -fL --retry 3 --connect-timeout 30 \
+    # --retry-all-errors: see fetch_tarball — instant failures (DNS, TLS,
+    # connection refused, HTTP 4xx) must be retried too, not just timeouts.
+    if curl -fL --retry 3 --retry-all-errors --connect-timeout 30 \
         --speed-limit 1024 --speed-time 60 --max-time 900 \
         -o "$dest" "$u"; then ok=1; break; fi
     rm -f "$dest"

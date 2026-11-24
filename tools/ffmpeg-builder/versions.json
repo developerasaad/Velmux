@@ -128,7 +128,9 @@
     "harfbuzz": {
       "version": "10.2.0",
       "url": "https://github.com/harfbuzz/harfbuzz/releases/download/10.2.0/harfbuzz-10.2.0.tar.xz",
-      "mirrors": [],
+      "mirrors": [
+        "https://distfiles.macports.org/harfbuzz/harfbuzz-10.2.0.tar.xz"
+      ],
       "sha256": "620e3468faec2ea8685d32c46a58469b850ef63040b3565cde05959825b48227"
     },
     "fribidi": {
