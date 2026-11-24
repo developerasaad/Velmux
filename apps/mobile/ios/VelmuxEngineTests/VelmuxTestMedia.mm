@@ -108,9 +108,18 @@ CMSampleBufferRef makeAudioSampleBuffer(
       CMTimeMake(frames, int32_t(asbd.mSampleRate)),
       CMTimeMake(startFrame, int32_t(asbd.mSampleRate)), kCMTimeInvalid};
   CMSampleBufferRef sample = nullptr;
-  status = CMSampleBufferCreate(kCFAllocatorDefault, block, true, format,
-                                CMItemCount(frames), 1, &timing, 0, nullptr,
-                                &sample);
+  // CreateReady (not Create): the PCM data is complete in the block buffer,
+  // so there is no makeDataReady callback semantics to wire. NULL/0 sample
+  // sizes make CoreMedia derive per-sample sizes from the PCM format
+  // description (mBytesPerFrame) — the same call shape the engine's Apple
+  // mux stage uses (apple_stages.mm). The previous CMSampleBufferCreate
+  // call passed this 10-argument list against the 12-argument signature
+  // (and swapped sampleTimingArray/numSampleTimingEntries); it could never
+  // have compiled — the target had simply never been built in CI before
+  // the cold-launch gate went green.
+  status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, format,
+                                     CMItemCount(frames), &timing, 1, nullptr,
+                                     0, &sample);
   CFRelease(block); // the sample buffer retains its own reference
   if (status != noErr || sample == nullptr) {
     return nullptr;
