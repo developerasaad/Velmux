@@ -51,11 +51,11 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Frame-rate conversion | IMPLEMENTED + VERIFIED | FFmpeg transcode re-times onto a constant output grid (duplication/dropping), composes with burn-in + segmented recovery |
 | Crop / rotation / flip | IMPLEMENTED + VERIFIED | CropRect/rotationDegrees/flip fields through the full stack; FFmpeg unified transform graph; honest out-of-frame refusal; pixel-verified flip test |
 | Trim | IMPLEMENTED + VERIFIED | FFmpeg frame-exact + segmented + keyframe-snap copy paths tested; Android/Apple/hybrid executors refuse trimmed requests via canExecute + planner timeTrim gating (tested: native-only registries refuse, hybrid shapes refuse) |
-| Remove/replace audio, audio extraction | IMPLEMENTED + VERIFIED | remove+extract = tested; replace-audio: external lane paced onto the video timeline (host test: differently-long replacement, output follows video duration) |
-| Multiple audio tracks / language tracks | IMPLEMENTED + VERIFIED | allTracks carries every lane with language metadata (host test: eng+fra MKV) |
+| Remove/replace audio, audio extraction | IMPLEMENTED + VERIFIED (2026-11-24 correction: replace-audio was a dead control through the job-store round trip until D-059 — the request field was not persisted; verified for real after the round-trip fix) | remove+extract = tested; replace-audio: external lane paced onto the video timeline (host test: differently-long replacement, output follows video duration) |
+| Multiple audio tracks / language tracks | IMPLEMENTED + VERIFIED (2026-11-24 correction: allTracks did not survive the job-store round trip until D-059; the eng+fra test passed only because the -1 default also keeps every lane — the field itself was lost) | allTracks carries every lane with language metadata (host test: eng+fra MKV) |
 | Fast remux / stream copy | IMPLEMENTED + VERIFIED | remux tests; planner prefers copy |
 | Batch processing | IMPLEMENTED + VERIFIED | engine+scheduler per-job isolation; Home multi-select batch conversion wired to real job submission (`jobsStore`, host tests for scheduler) |
-| Metadata preservation | IMPLEMENTED + VERIFIED | container+stream tags through transcode and remux (D-047); stripMetadata; hardening test with ~600 KB of container tags |
+| Metadata preservation | IMPLEMENTED + VERIFIED (2026-11-24 correction: stripMetadata was a dead control until D-059 — the flag was not persisted, strip requests silently preserved tags) | container+stream tags through transcode and remux (D-047); stripMetadata now verified end-to-end; hardening test with ~600 KB of container tags (the test itself SIGSEGV'd in CI from a dangling event subscriber — fixed with RAII subscriptions, D-059 notes) |
 | HDR preservation where compatible | IMPLEMENTED + VERIFIED (copy path) | stream copy preserves bitstream+signaling (host test asserts bt2020/PQ tags survive remux) |
 | HDR → SDR where supported | NOT OFFERED in this build (honest gating) | the pinned filter set has no PQ/HLG-capable converter: colorspace handles SDR gamma curves only, and tonemap needs float pixels that only zscale produces (libzimg is not wired — D-056). The planner refuses HDR→SDR routes with a reason instead of producing a broken or washed-out result; HDR PRESERVATION works (stream copy + 10-bit tagging, verified) |
 | Output validation | IMPLEMENTED + VERIFIED | `core/src/validation.cpp` + independent ffprobe cross-checks in tests |
@@ -70,7 +70,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Gain / fade / speed (pitch-preserving) / loudness normalization / silence removal | IMPLEMENTED + VERIFIED | abuffer graph chain; gain via volumedetect delta, speed via duration ratio + honest combined-with-video refusal |
 | Trim (audio) | IMPLEMENTED + VERIFIED | trim applies to audio in FFmpeg path |
 | Metadata | IMPLEMENTED + VERIFIED | container + stream tags through transcode and remux |
-| Cover art | IMPLEMENTED + VERIFIED | external image attaches with the attached_pic disposition; source pictures preserve on request (host test) |
+| Cover art | IMPLEMENTED + VERIFIED (2026-11-24 correction: coverArtUri was lost in the job-store round trip until D-059, so the "host test" never actually exercised embedding — it ran for the first time after the SIGSEGV fix and exposed the loss; attached pictures also no longer count as content video in inspection/validation) | external image attaches with the attached_pic disposition; source pictures preserve on request (host test, now genuinely running) |
 | Batch | IMPLEMENTED + VERIFIED (shared batch UI) | Home multi-select drives per-job scheduling |
 
 ## 7. Compression intelligence (spec §17)
@@ -132,7 +132,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|
 | Truncated source / disappearing source / unwritable destination / malformed media / bad sidecar / damaged checkpoint | IMPLEMENTED + VERIFIED (host CI) |
 | Invalid timestamps fixture | IMPLEMENTED + VERIFIED | MPEG-TS with backward PTS jump mid-stream (fixture verified non-monotonic by packet-level ffprobe): converts honestly or fails with a real error; never fake success, hang, or crash |
-| Very large metadata | IMPLEMENTED + VERIFIED | ~600 KB of container tags: remux preserves them, stripMetadata drops them, output duration/size cross-checked |
+| Very large metadata | IMPLEMENTED + VERIFIED (2026-11-24: this test SEGFAULTED in CI — doctest's never-entered tests count as skipped, so the earlier VERIFIED claim was wrong; now green under ASan/UBSan with the full 48-test suite actually running) | ~600 KB of container tags: remux preserves them, stripMetadata drops them, output duration/size cross-checked |
 | Process termination | ANALOGUE VERIFIED (teardown-based); real SIGKILL-restart E2E pending a suitable environment (see §12) |
 | Storage exhaustion | IMPLEMENTED + VERIFIED (mapping; see §12) |
 | App upgrade / schema migration | IMPLEMENTED + VERIFIED (v1→v2 ALTER TABLE migration is exercised by job-store tests on old-schema DBs) |
