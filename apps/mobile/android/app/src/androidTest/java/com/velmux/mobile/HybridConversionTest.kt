@@ -31,6 +31,7 @@ package com.velmux.mobile
 import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
@@ -53,213 +54,347 @@ class HybridConversionTest {
 
   // ---- Fixture generation (real encoders, real muxer; duplicated from
   // NativeConversionTest, which stays an independent suite) ---------------------
+  //
+  // The generator is deterministic-by-construction:
+  //  - encoders are chosen by NAME from MediaCodecList after checking the
+  //    target size/rate/channels against their real capabilities, and the
+  //    video input color format is picked from the chosen encoder's
+  //    supported color formats (Planar/SemiPlanar preferred: tight-packed
+  //    Y + neutral chroma is exact for 16-aligned dimensions; Flexible
+  //    falls back to the Image API);
+  //  - encoded samples produced BEFORE both output formats are known (the
+  //    muxer cannot start yet) are buffered and flushed the moment
+  //    MediaMuxer.start() succeeds — nothing is discarded, so no track can
+  //    end up sample-less (a sample-less added track makes muxer.stop()
+  //    throw, which is how this generator used to fail);
+  //  - tracks are added ONLY from the INFO_OUTPUT_FORMAT_CHANGED format
+  //    (it carries csd-0/csd-1; the configure-time outputFormat does not);
+  //  - EOS is queued for both encoders and draining continues until output
+  //    EOS is observed on both, bounded by a deadline so CI can never hang;
+  //  - every resource is released in finally, and generation fails with a
+  //    precise message if no real media sample reached a track.
 
   private class GeneratedMedia(val path: String, val durationUs: Long,
                                val width: Int, val height: Int)
 
+  /** A media sample copied out of the codec buffer (safe to hold). */
+  private class PendingSample(val data: ByteArray, val ptsUs: Long, val flags: Int)
+
   /**
-   * Encodes synthetic frames (moving color gradient) with a real H.264
-   * encoder and a real AAC encoder into an MP4.
+   * First "video/avc" encoder (MediaCodecList order is stable per device)
+   * whose real capabilities cover 320x240@24fps, plus a supported YUV420
+   * input color format. Emulator software encoders (OMX.google.* /
+   * c2.android.*) always list Planar or SemiPlanar.
+   */
+  private fun pickAvcEncoder(width: Int, height: Int, frameRate: Int): Pair<String, Int> {
+    val planar = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar
+    val semiPlanar = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar
+    val flexible = MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
+    for (info in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
+      if (!info.isEncoder || !info.supportedTypes.contains("video/avc")) continue
+      val caps = info.getCapabilitiesForType("video/avc") ?: continue
+      val video = caps.videoCapabilities ?: continue
+      if (!video.widthRange.contains(width) || !video.heightRange.contains(height)) continue
+      if (!video.supportedFrameRates.contains(frameRate)) continue
+      val color = when {
+        planar in caps.colorFormats -> planar
+        semiPlanar in caps.colorFormats -> semiPlanar
+        flexible in caps.colorFormats -> flexible
+        else -> continue
+      }
+      return Pair(info.name, color)
+    }
+    throw IllegalStateException(
+        "no video/avc encoder on this device supports ${width}x${height}@${frameRate}")
+  }
+
+  /** First "audio/mp4a-latm" encoder covering 44100Hz stereo. */
+  private fun pickAacEncoder(sampleRate: Int, channels: Int): String {
+    for (info in MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos) {
+      if (!info.isEncoder || !info.supportedTypes.contains("audio/mp4a-latm")) continue
+      val caps = info.getCapabilitiesForType("audio/mp4a-latm") ?: continue
+      val audio = caps.audioCapabilities ?: continue
+      if (!audio.supportedSampleRates.contains(sampleRate)) continue
+      if (audio.maxInputChannels < channels) continue
+      return info.name
+    }
+    throw IllegalStateException(
+        "no audio/mp4a-latm encoder on this device supports ${sampleRate}Hz/$channelsch")
+  }
+
+  private val fixtureTimeoutMs = 60_000L
+
+  /**
+   * Encodes synthetic frames (moving luminance gradient, neutral chroma)
+   * with a real H.264 encoder and a real AAC encoder into an MP4.
    */
   private fun generateMp4(seconds: Int): GeneratedMedia {
     val width = 320
     val height = 240
     val frameRate = 24
     val totalFrames = seconds * frameRate
+    val sampleRate = 44100
+    val channels = 2
+    val bytesPerAudioFrame = 2 * channels
+
+    val (videoCodecName, videoColorFormat) = pickAvcEncoder(width, height, frameRate)
+    val audioCodecName = pickAacEncoder(sampleRate, channels)
+
     val out = File(context.cacheDir, "velmux-fixture-${System.nanoTime()}.mp4")
     val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-    val videoFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
-      setInteger(MediaFormat.KEY_COLOR_FORMAT,
-          MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-      setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
-      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-    }
-    val videoEncoder = MediaCodec.createEncoderByType("video/avc")
-    videoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-    videoEncoder.start()
-
-    val sampleRate = 44100
-    val channels = 2
-    val audioFormat = MediaFormat.createAudioFormat("audio/mp4a-latm", sampleRate, channels).apply {
-      setInteger(MediaFormat.KEY_BIT_RATE, 96_000)
-    }
-    val audioEncoder = MediaCodec.createEncoderByType("audio/mp4a-latm")
-    audioEncoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-    audioEncoder.start()
-
+    var videoEncoder: MediaCodec? = null
+    var audioEncoder: MediaCodec? = null
     var muxerStarted = false
-    var videoTrack = -1
-    var audioTrack = -1
-
-    val yuv = ByteArray(width * height * 3 / 2)
-    var frameIndex = 0
-    val bytesPerAudioFrame = 2 * channels
-    var audioBytesFed = 0L
-    val audioChunk = ByteArray(sampleRate * bytesPerAudioFrame / 2) // ~500ms
-
-    fun ensureMuxerStarted() {
-      if (!muxerStarted && videoTrack >= 0 && audioTrack >= 0) {
-        muxer.start()
-        muxerStarted = true
+    try {
+      val videoFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, videoColorFormat)
+        setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
+        setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
       }
-    }
+      videoEncoder = MediaCodec.createByCodecName(videoCodecName)
+      videoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      videoEncoder.start()
 
-    fun writeSample(track: Int, buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
-      if (track < 0 || info.size <= 0) {
-        return
+      val audioFormat = MediaFormat.createAudioFormat("audio/mp4a-latm", sampleRate, channels).apply {
+        setInteger(MediaFormat.KEY_BIT_RATE, 96_000)
       }
-      val data = ByteArray(info.size)
-      buffer.position(info.offset)
-      buffer.limit(info.offset + info.size)
-      buffer.get(data)
-      val muxInfo = MediaCodec.BufferInfo()
-      muxInfo.set(0, info.size, info.presentationTimeUs, info.flags)
-      muxer.writeSampleData(track, ByteBuffer.wrap(data), muxInfo)
-    }
+      audioEncoder = MediaCodec.createByCodecName(audioCodecName)
+      audioEncoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      audioEncoder.start()
 
-    fun drainVideo(): Boolean {
+      var videoTrack = -1
+      var audioTrack = -1
+      var videoSamples = 0
+      var audioSamples = 0
+      var videoEosQueued = false
+      var audioEosQueued = false
+      var videoEosSeen = false
+      var audioEosSeen = false
+      val videoPending = ArrayList<PendingSample>()
+      val audioPending = ArrayList<PendingSample>()
       val info = MediaCodec.BufferInfo()
-      while (true) {
-        val id = videoEncoder.dequeueOutputBuffer(info, 0)
-        if (id >= 0) {
-          val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-          if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-            if (!muxerStarted) {
-              if (videoTrack < 0) {
-                videoTrack = muxer.addTrack(videoEncoder.outputFormat)
-                ensureMuxerStarted()
-              }
-            }
-            if (muxerStarted) {
-              writeSample(videoTrack, videoEncoder.getOutputBuffer(id)!!, info)
-            }
-          }
-          videoEncoder.releaseOutputBuffer(id, false)
-          if (eos) return false
-        } else if (id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-          if (videoTrack < 0) {
-            videoTrack = muxer.addTrack(videoEncoder.outputFormat)
-            ensureMuxerStarted()
-          }
-        } else {
-          return true
+      val deadline = System.nanoTime() + fixtureTimeoutMs * 1_000_000
+
+      // Tight-packed YUV420 frame with neutral chroma: byte-identical for
+      // Planar and SemiPlanar at 16-aligned dimensions (chroma ordering is
+      // irrelevant when every U/V byte is 0x80).
+      val yuv = ByteArray(width * height * 3 / 2)
+      var frameIndex = 0
+      var audioBytesFed = 0L
+      val audioChunk = ByteArray(sampleRate * bytesPerAudioFrame / 10) // ~100ms
+
+      fun notExpired() {
+        check(System.nanoTime() < deadline) {
+          "fixture generation timed out after ${fixtureTimeoutMs}ms " +
+          "(fed=$frameIndex/$totalFrames video frames, " +
+          "videoSamples=$videoSamples, audioSamples=$audioSamples, " +
+          "muxerStarted=$muxerStarted)"
         }
       }
-    }
 
-    fun drainAudio(): Boolean {
-      val info = MediaCodec.BufferInfo()
-      while (true) {
-        val id = audioEncoder.dequeueOutputBuffer(info, 0)
-        if (id >= 0) {
-          val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-          if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-            if (!muxerStarted) {
-              if (audioTrack < 0) {
-                audioTrack = muxer.addTrack(audioEncoder.outputFormat)
-                ensureMuxerStarted()
-              }
-            }
-            if (muxerStarted) {
-              writeSample(audioTrack, audioEncoder.getOutputBuffer(id)!!, info)
-            }
+      // Track registration: ONLY the format delivered by
+      // INFO_OUTPUT_FORMAT_CHANGED (or, defensively, the encoder's
+      // outputFormat after a real output buffer exists) — it embeds the
+      // codec-specific data (csd-0/csd-1) the muxer needs.
+      fun registerTrack(encoder: MediaCodec, isVideo: Boolean) {
+        if (isVideo && videoTrack < 0) {
+          videoTrack = muxer.addTrack(encoder.outputFormat)
+        } else if (!isVideo && audioTrack < 0) {
+          audioTrack = muxer.addTrack(encoder.outputFormat)
+        }
+        if (!muxerStarted && videoTrack >= 0 && audioTrack >= 0) {
+          muxer.start()
+          muxerStarted = true
+          // Flush everything buffered while the muxer could not start —
+          // per-track PTS stay monotonic (encoder output order).
+          for (sample in videoPending) {
+            val muxInfo = MediaCodec.BufferInfo()
+            muxInfo.set(0, sample.data.size, sample.ptsUs, sample.flags)
+            muxer.writeSampleData(videoTrack, ByteBuffer.wrap(sample.data), muxInfo)
+            videoSamples++
           }
-          audioEncoder.releaseOutputBuffer(id, false)
-          if (eos) return false
-        } else if (id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-          if (audioTrack < 0) {
-            audioTrack = muxer.addTrack(audioEncoder.outputFormat)
-            ensureMuxerStarted()
+          videoPending.clear()
+          for (sample in audioPending) {
+            val muxInfo = MediaCodec.BufferInfo()
+            muxInfo.set(0, sample.data.size, sample.ptsUs, sample.flags)
+            muxer.writeSampleData(audioTrack, ByteBuffer.wrap(sample.data), muxInfo)
+            audioSamples++
           }
-        } else {
-          return true
+          audioPending.clear()
         }
       }
-    }
 
-    fun feedVideoFrame() {
-      val index = videoEncoder.dequeueInputBuffer(10_000)
-      if (index < 0) {
-        return
+      // Codec-config buffers are NOT media samples; size<=0 carries no
+      // sample. Pre-start media is buffered; post-start media is written.
+      fun handleSample(isVideo: Boolean, buffer: ByteBuffer, sampleInfo: MediaCodec.BufferInfo) {
+        if (sampleInfo.size <= 0) return
+        if (sampleInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) return
+        val data = ByteArray(sampleInfo.size)
+        buffer.position(sampleInfo.offset)
+        buffer.limit(sampleInfo.offset + sampleInfo.size)
+        buffer.get(data)
+        if (isVideo) {
+          if (videoTrack < 0) registerTrack(videoEncoder!!, true)
+          if (muxerStarted) {
+            val muxInfo = MediaCodec.BufferInfo()
+            muxInfo.set(0, data.size, sampleInfo.presentationTimeUs, sampleInfo.flags)
+            muxer.writeSampleData(videoTrack, ByteBuffer.wrap(data), muxInfo)
+            videoSamples++
+          } else {
+            videoPending.add(PendingSample(data, sampleInfo.presentationTimeUs, sampleInfo.flags))
+          }
+        } else {
+          if (audioTrack < 0) registerTrack(audioEncoder!!, false)
+          if (muxerStarted) {
+            val muxInfo = MediaCodec.BufferInfo()
+            muxInfo.set(0, data.size, sampleInfo.presentationTimeUs, sampleInfo.flags)
+            muxer.writeSampleData(audioTrack, ByteBuffer.wrap(data), muxInfo)
+            audioSamples++
+          } else {
+            audioPending.add(PendingSample(data, sampleInfo.presentationTimeUs, sampleInfo.flags))
+          }
+        }
       }
-      val input = videoEncoder.getInputBuffer(index)!!
-      input.clear()
-      val stripe = (frameIndex * 4) % 256
-      var p = 0
-      for (i in 0 until width * height) {
-        yuv[p++] = ((i / width + stripe) and 0xFF).toByte()
-      }
-      for (i in 0 until width * height / 4) {
-        yuv[p++] = 128.toByte()
-      }
-      for (i in 0 until width * height / 4) {
-        yuv[p++] = 128.toByte()
-      }
-      input.put(yuv)
-      val ptsUs = frameIndex * 1_000_000L / frameRate
-      videoEncoder.queueInputBuffer(index, 0, yuv.size, ptsUs, 0)
-      frameIndex++
-    }
 
-    fun feedAudioChunk() {
-      val index = audioEncoder.dequeueInputBuffer(10_000)
-      if (index < 0) {
-        return
+      // Drain until output EOS; INFO_TRY_AGAIN_LATER only ends THIS pass
+      // (the outer loop keeps calling), never the generation.
+      fun drain(isVideo: Boolean, timeoutUs: Long): Boolean {
+        val encoder = if (isVideo) videoEncoder!! else audioEncoder!!
+        while (true) {
+          val id = encoder.dequeueOutputBuffer(info, timeoutUs)
+          if (id >= 0) {
+            val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+            if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+              handleSample(isVideo, encoder.getOutputBuffer(id)!!, info)
+            }
+            encoder.releaseOutputBuffer(id, false)
+            if (eos) return false
+          } else if (id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            registerTrack(encoder, isVideo)
+          } else {
+            return true
+          }
+        }
       }
-      val input = audioEncoder.getInputBuffer(index)!!
-      input.clear()
-      for (i in audioChunk.indices step bytesPerAudioFrame) {
-        val v = (Math.sin((audioBytesFed + i) / 32.0) * 12000).toInt()
-        audioChunk[i] = (v and 0xFF).toByte()
-        audioChunk[i + 1] = (v shr 8).toByte()
-        audioChunk[i + 2] = (v and 0xFF).toByte()
-        audioChunk[i + 3] = (v shr 8).toByte()
-      }
-      val chunk = minOf(audioChunk.size, input.remaining())
-      input.put(audioChunk, 0, chunk)
-      audioEncoder.queueInputBuffer(index, 0, chunk,
-          audioBytesFed * 1_000_000L / (sampleRate * bytesPerAudioFrame), 0)
-      audioBytesFed += chunk
-    }
 
-    while (frameIndex < totalFrames) {
-      feedVideoFrame()
-      feedAudioChunk()
-      drainVideo()
-      drainAudio()
-    }
-    // End of stream for both encoders, then drain to completion.
-    while (true) {
-      val index = videoEncoder.dequeueInputBuffer(50_000)
-      if (index >= 0) {
-        videoEncoder.queueInputBuffer(index, 0, 0,
-            totalFrames * 1_000_000L / frameRate,
-            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-        break
+      fun feedVideoFrame() {
+        val index = videoEncoder!!.dequeueInputBuffer(10_000)
+        if (index < 0) return
+        val ptsUs = frameIndex * 1_000_000L / frameRate
+        if (videoColorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible) {
+          val image = videoEncoder!!.getInputImage(index)
+          if (image != null) {
+            val stripe = (frameIndex * 4) % 256
+            var span = 0
+            for (planeIdx in 0..2) {
+              val plane = image.planes[planeIdx]
+              val rows = if (planeIdx == 0) height else height / 2
+              val cols = if (planeIdx == 0) width else width / 2
+              val buffer = plane.buffer
+              for (row in 0 until rows) {
+                var pos = row * plane.rowStride
+                for (col in 0 until cols) {
+                  buffer.position(pos)
+                  buffer.put(if (planeIdx == 0) ((row + stripe) and 0xFF).toByte()
+                             else 128.toByte())
+                  pos += plane.pixelStride
+                }
+              }
+              span += plane.rowStride * (rows - 1) + plane.pixelStride * (cols - 1) + 1
+            }
+            videoEncoder!!.queueInputBuffer(index, 0, span, ptsUs, 0)
+            frameIndex++
+            return
+          }
+        }
+        // Planar/SemiPlanar (or an encoder without Image support): the
+        // tight-packed buffer with neutral chroma.
+        val input = videoEncoder!!.getInputBuffer(index)!!
+        input.clear()
+        val stripe = (frameIndex * 4) % 256
+        var p = 0
+        for (i in 0 until width * height) {
+          yuv[p++] = ((i / width + stripe) and 0xFF).toByte()
+        }
+        for (i in 0 until width * height / 2) {
+          yuv[p++] = 128.toByte()
+        }
+        val fill = minOf(yuv.size, input.remaining())
+        input.put(yuv, 0, fill)
+        videoEncoder!!.queueInputBuffer(index, 0, fill, ptsUs, 0)
+        frameIndex++
       }
-      drainVideo()
-    }
-    while (true) {
-      val index = audioEncoder.dequeueInputBuffer(50_000)
-      if (index >= 0) {
-        audioEncoder.queueInputBuffer(index, 0, 0,
-            audioBytesFed * 1_000_000L / (sampleRate * bytesPerAudioFrame),
-            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-        break
+
+      fun feedAudioChunk() {
+        val index = audioEncoder!!.dequeueInputBuffer(10_000)
+        if (index < 0) return
+        val input = audioEncoder!!.getInputBuffer(index)!!
+        input.clear()
+        for (i in audioChunk.indices step bytesPerAudioFrame) {
+          val v = (Math.sin((audioBytesFed + i) / 32.0) * 12000).toInt()
+          audioChunk[i] = (v and 0xFF).toByte()
+          audioChunk[i + 1] = (v shr 8).toByte()
+          audioChunk[i + 2] = (v and 0xFF).toByte()
+          audioChunk[i + 3] = (v shr 8).toByte()
+        }
+        val chunk = minOf(audioChunk.size, input.remaining())
+        input.put(audioChunk, 0, chunk)
+        audioEncoder!!.queueInputBuffer(index, 0, chunk,
+            audioBytesFed * 1_000_000L / (sampleRate * bytesPerAudioFrame), 0)
+        audioBytesFed += chunk
       }
-      drainAudio()
+
+      fun queueEos(encoder: MediaCodec, ptsUs: Long): Boolean {
+        val index = encoder.dequeueInputBuffer(50_000)
+        if (index < 0) return false
+        encoder.queueInputBuffer(index, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+        return true
+      }
+
+      val videoEosPts = totalFrames * 1_000_000L / frameRate
+
+      while (!(videoEosQueued && audioEosQueued && videoEosSeen && audioEosSeen)) {
+        notExpired()
+        if (frameIndex < totalFrames) {
+          feedVideoFrame()
+          feedAudioChunk()
+        } else {
+          if (!videoEosQueued) videoEosQueued = queueEos(videoEncoder!!, videoEosPts)
+          if (!audioEosQueued) {
+            audioEosQueued = queueEos(audioEncoder!!,
+                (audioBytesFed + audioChunk.size) * 1_000_000L /
+                    (sampleRate * bytesPerAudioFrame))
+          }
+        }
+        if (!videoEosSeen) videoEosSeen = !drain(isVideo = true, timeoutUs = 10_000)
+        if (!audioEosSeen) audioEosSeen = !drain(isVideo = false, timeoutUs = 10_000)
+      }
+
+      // The fixture is only usable when both tracks carry REAL media.
+      check(muxerStarted) {
+        "fixture muxer never started (no encoder delivered an output format); " +
+        "video=$videoCodecName audio=$audioCodecName"
+      }
+      check(videoSamples > 0) {
+        "the video encoder ($videoCodecName) produced no media samples"
+      }
+      check(audioSamples > 0) {
+        "the audio encoder ($audioCodecName) produced no media samples"
+      }
+      muxer.stop()
+    } finally {
+      // Resources are always released, on success and on every failure
+      // path (a leaked MediaCodec keeps emulator CI flaky for the tests
+      // that run after this one).
+      for (encoder in listOf(videoEncoder, audioEncoder)) {
+        if (encoder == null) continue
+        try { encoder.stop() } catch (_: Exception) {}
+        try { encoder.release() } catch (_: Exception) {}
+      }
+      muxer.release()
     }
-    var videoAlive = true
-    var audioAlive = true
-    while (videoAlive || audioAlive) {
-      if (videoAlive) videoAlive = drainVideo()
-      if (audioAlive) audioAlive = drainAudio()
-    }
-    videoEncoder.stop(); videoEncoder.release()
-    audioEncoder.stop(); audioEncoder.release()
-    muxer.stop(); muxer.release()
     assertTrue(out.length() > 1024)
     return GeneratedMedia(out.absolutePath,
         totalFrames * 1_000_000L / frameRate, width, height)
