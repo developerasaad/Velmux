@@ -36,6 +36,7 @@ inline int qualityToCrf(VideoCodec codec, std::int32_t quality) {
   const int q = std::clamp(quality, 0, 100);
   switch (codec) {
     case VideoCodec::H264: // libx264 crf 0..51
+    case VideoCodec::Hevc: // libx265 crf 0..51
       return 51 - (q * 51) / 100;
     case VideoCodec::AV1: // libsvtav1 crf 0..63
     case VideoCodec::VP9: // libvpx-vp9 crf 0..63
@@ -52,6 +53,9 @@ inline const char *encoderNameFor(VideoCodec codec) {
   switch (codec) {
     case VideoCodec::H264:
       return "libx264";
+    case VideoCodec::Hevc:
+      // Pinned since the x265 3.6 build (feature matrix: HEVC D+E+C).
+      return "libx265";
     case VideoCodec::AV1:
       return "libsvtav1";
     case VideoCodec::VP8:
@@ -65,7 +69,7 @@ inline const char *encoderNameFor(VideoCodec codec) {
     case VideoCodec::Mjpeg:
       return "mjpeg";
     default:
-      return nullptr; // HEVC software encoder not pinned in V1 host build
+      return nullptr; // no software encoder for this codec in the pinned build
   }
 }
 

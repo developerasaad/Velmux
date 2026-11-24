@@ -31,7 +31,7 @@ ensure_meson
 # the host build intentionally uses the system zlib when available.
 host_build_complete() {
   local lib
-  for lib in libx264.a libmp3lame.a libopus.a libogg.a libvorbis.a \
+  for lib in libx264.a libx265.a libmp3lame.a libopus.a libogg.a libvorbis.a \
              libvpx.a libdav1d.a libSvtAv1Enc.a libfreetype.a libpng16.a \
              libharfbuzz.a libfribidi.a libass.a libavcodec.a libavformat.a \
              libavutil.a libavfilter.a libswscale.a libswresample.a; do
@@ -105,6 +105,22 @@ if [ ! -f "$HOST_PREFIX/lib/libx264.a" ]; then
      --disable-cli --enable-static --enable-pic --disable-opencl >/dev/null && \
    make -j"$JOBS" >/dev/null && make install >/dev/null)
   log "x264 installed"
+fi
+
+# --- x265 (HEVC software encoder; feature matrix requires HEVC encode
+#     through FFmpeg, not only through MediaCodec/VideoToolbox) -------------
+x265_tb="$(fetch_tarball x265)"
+x265_src="$(extract_tarball "$x265_tb")"
+if [ ! -f "$HOST_PREFIX/lib/libx265.a" ]; then
+  log "building x265"
+  x265_build="$BUILD_TMP/x265"
+  mkdir -p "$x265_build"
+  (cd "$x265_build" && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+     -DCMAKE_INSTALL_PREFIX="$HOST_PREFIX" \
+     -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_ASSEMBLY=ON \
+     "$x265_src/source" >/dev/null && \
+   cmake --build . >/dev/null && cmake --install . >/dev/null)
+  log "x265 installed"
 fi
 
 # --- lame (MP3) ---------------------------------------------------------------
@@ -318,7 +334,7 @@ if [ ! -f "$HOST_PREFIX/lib/libavcodec.a" ]; then
      --disable-avdevice \
      --disable-autodetect \
      --enable-pthreads \
-     --enable-gpl --enable-libx264 \
+     --enable-gpl --enable-libx264 --enable-libx265 \
      --enable-libmp3lame \
      --enable-libopus \
      --enable-libvorbis \

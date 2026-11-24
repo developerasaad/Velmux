@@ -30,7 +30,7 @@ REQUIRED_DECODERS = {
 
 REQUIRED_ENCODERS = {
     # video
-    "libx264", "libsvtav1", "libvpx", "libvpx-vp9", "mpeg4", "ffv1",
+    "libx264", "libx265", "libsvtav1", "libvpx", "libvpx-vp9", "mpeg4", "ffv1",
     "mjpeg", "libx264rgb",
     # audio
     "aac", "libmp3lame", "libopus", "libvorbis", "flac", "pcm_s16le", "ac3",

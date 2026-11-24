@@ -38,6 +38,17 @@
       "sha256": "d053c9d86988d6bc78237ca5205865c5ddf99c98ef4cd9927eec8f6d388f6dd9",
       "note": "code.videolan.org git-archive tarballs are regenerated per request (byte-unstable); the GitHub mirror's per-commit codeload archives are deterministic and verified to match this checksum."
     },
+    "x265": {
+      "version": "3.6",
+      "url": "https://distfiles.macports.org/x265/x265_3.6.tar.gz",
+      "file": "x265_3.6.tar.gz",
+      "mirrors": [
+        "https://bitbucket.org/multicoreware/x265_git/downloads/x265_3.6.tar.gz",
+        "https://deb.debian.org/debian/pool/main/x/x265/x265_3.6.orig.tar.gz"
+      ],
+      "sha256": "663531f341c5389f460d730e62e10a4fcca3428ca2ca109693867bc5fe2e2807",
+      "note": "HEVC software encode for the FFmpeg backend (feature matrix: HEVC D+E+C). bitbucket (the canonical host) is unreliable from cloud CI networks; the MacPorts distfiles mirror carries the pristine upstream tarball."
+    },
     "lame": {
       "version": "3.100",
       "url": "https://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz",

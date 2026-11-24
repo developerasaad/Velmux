@@ -239,6 +239,28 @@ ZPC
     log "[$abi] x264 installed"
   fi
 
+  # --- x265 (cmake cross; HEVC software encode for the FFmpeg backend) ------
+  if [ ! -f "$prefix/lib/libx265.a" ]; then
+    log "[$abi] building x265"
+    x265_tb="$(fetch_tarball x265)"
+    x265_src="$(extract_tarball "$x265_tb" "$srctag")"
+    x265_build="$build_tmp/x265"
+    rm -rf "$x265_build"
+    # ENABLE_ASSEMBLY=OFF: x265's asm path expects nasm on x86 and is not
+    # wired for NDK cross targets; C++ intrinsics carry the real speed.
+    cmake -G Ninja -S "$x265_src/source" -B "$x265_build" \
+      -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+      -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DCMAKE_FIND_ROOT_PATH="$prefix" \
+      -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_ASSEMBLY=OFF \
+      >/dev/null
+    cmake --build "$x265_build" >/dev/null
+    cmake --install "$x265_build" >/dev/null
+    log "[$abi] x265 installed"
+  fi
+
   # --- lame (autoconf, in-tree per ABI) --------------------------------------
   if [ ! -f "$prefix/lib/libmp3lame.a" ]; then
     log "[$abi] building lame"
@@ -540,7 +562,7 @@ ZPC
        --disable-autodetect \
        --disable-x86asm \
        --enable-pthreads \
-       --enable-gpl --enable-libx264 \
+       --enable-gpl --enable-libx264 --enable-libx265 \
        --enable-libmp3lame \
        --enable-libopus \
        --enable-libvorbis \

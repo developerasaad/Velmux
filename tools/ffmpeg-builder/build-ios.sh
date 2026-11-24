@@ -294,6 +294,30 @@ ZPC
     log "[$slice] x264 installed"
   fi
 
+  # --- x265 (cmake cross; HEVC software encode for the FFmpeg backend) -----
+  if [ ! -f "$SLICE_PREFIX/lib/libx265.a" ]; then
+    log "[$slice] building x265"
+    x265_tb="$(fetch_tarball x265)"
+    x265_src="$(extract_tarball "$x265_tb" "$SLICE_TAG")"
+    x265_build="$build_tmp/x265"
+    rm -rf "$x265_build"
+    # ENABLE_ASSEMBLY=OFF: x265's nasm path cannot cross-compile for Apple
+    # slices; the C++ intrinsics path is the supported one.
+    cmake -G Ninja -S "$x265_src/source" -B "$x265_build" \
+      -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_OSX_SYSROOT="$SLICE_SDK" \
+      -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DCMAKE_FIND_ROOT_PATH="$SLICE_PREFIX" \
+      -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_ASSEMBLY=OFF \
+      >/dev/null
+    cmake --build "$x265_build" >/dev/null
+    cmake --install "$x265_build" >/dev/null
+    log "[$slice] x265 installed"
+  fi
+
   # --- lame (autoconf) -------------------------------------------------------------
   if [ ! -f "$SLICE_PREFIX/lib/libmp3lame.a" ]; then
     log "[$slice] building lame"
@@ -598,7 +622,7 @@ ZPC
        --disable-autodetect \
        --disable-x86asm \
        --enable-pthreads \
-       --enable-gpl --enable-libx264 \
+       --enable-gpl --enable-libx264 --enable-libx265 \
        --enable-libmp3lame \
        --enable-libopus \
        --enable-libvorbis \
