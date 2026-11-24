@@ -82,6 +82,12 @@ void initFfmpegLabel() {
 // Shared helpers (avErrorString, makeAvError, qualityToCrf,
 // encoderNameFor) live in ffmpeg_util.h.
 
+// Forward declaration: the attached-picture helper is defined further
+// down (near the other cover-art helpers) but used by the transcode and
+// remux setup paths that appear earlier in this file.
+AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
+                            std::string &err);
+
 // Maps a request-model pixel format (spec §18 advanced controls) to the
 // libavutil pixel format. AV_PIX_FMT_NONE means "unknown" (refused).
 AVPixelFormat avPixFmtFor(core::PixelFormat format) {
