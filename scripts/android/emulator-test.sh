@@ -249,7 +249,7 @@ verify_launch() {
   # The activity must actually be resumed (not a blank/crashed launch).
   # Android 13+: MainActivity asks for POST_NOTIFICATIONS once at startup
   # (M8 product behavior), so on a fresh install the system permission
-  # dialog legitimately covers it — mResumedActivity is then
+  # dialog legitimately covers it — the resumed activity is then
   # GrantPermissionsActivity, not a launch failure. Dismiss the dialog
   # exactly like a user who refuses (BACK key = denial) and still require
   # MainActivity to become the resumed activity afterwards. That also
@@ -257,20 +257,28 @@ verify_launch() {
   # conversions. The activity class name (com.android.permissioncontroller
   # ...GrantPermissionsActivity) is stable across the controller's package
   # renames, so the class name alone is matched.
+  # The dump line differs by API level: API 29 prints
+  # 'mResumedActivity: ActivityRecord{...}', API 34 prints
+  # 'ResumedActivity: ActivityRecord{...}' and 'topResumedActivity=...'.
+  # Matching the 'ResumedActivity' substring (which 'mResumedActivity'
+  # also contains) covers every format; 'mLastPausedActivity' lines never
+  # match it, so a paused-but-listed velmux activity cannot false-positive
+  # (verified against captured API 29 and API 34 bugreports in both the
+  # dialog-up and app-resumed states).
   local resumed dismissed=0 i
   for i in $(seq 1 10); do
     resumed="$(timeout 10 adb shell dumpsys activity activities 2>/dev/null | tr -d '\r')"
-    if printf '%s' "$resumed" | grep -q "mResumedActivity.*com.velmux.mobile"; then
+    if printf '%s' "$resumed" | grep -q "ResumedActivity.*com.velmux.mobile"; then
       break
     fi
     if [ "$dismissed" -lt 2 ] && printf '%s' "$resumed" \
-        | grep -q "mResumedActivity.*GrantPermissionsActivity"; then
+        | grep -q "ResumedActivity.*GrantPermissionsActivity"; then
       adb_t shell input keyevent 4  # BACK: refuse the runtime permission
       dismissed=$((dismissed + 1))
     fi
     sleep 2
   done
-  printf '%s' "$resumed" | grep -q "mResumedActivity.*com.velmux.mobile" \
+  printf '%s' "$resumed" | grep -q "ResumedActivity.*com.velmux.mobile" \
     || vdie "$phase: MainActivity is not the resumed activity"
   # Keep it alive for a sustained window; a late crash (JNI load failure,
   # TurboModule registration, engine startup) must fail the run.
