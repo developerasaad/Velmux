@@ -172,6 +172,13 @@ nohup emulator -avd "$AVD_NAME" \
 boot_completed() {
   [ "$(timeout 10 adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]
 }
+# The 'emulator' launcher execs qemu-system-x86_64, so the process name
+# changes almost immediately — pgrep -x emulator reports a FALSE death
+# while the machine is booting happily. The command line of both the
+# launcher and the qemu child always carries "-avd <name>": match that.
+emulator_alive() {
+  pgrep -f -- "-avd $AVD_NAME" >/dev/null 2>&1
+}
 BOOT_OK=0
 for i in $(seq 1 48); do
   if boot_completed; then
@@ -179,7 +186,7 @@ for i in $(seq 1 48); do
     BOOT_OK=1
     break
   fi
-  if ! pgrep -x emulator > /dev/null 2>&1; then
+  if ! emulator_alive; then
     vlog "emulator process died; log tail:"
     tail -50 "$EMU_LOG" >&2 || true
     vdie "emulator exited during boot"
@@ -283,4 +290,4 @@ vlog "emulator test run complete (API $API)"
 # (CI runners are ephemeral; this is a no-op cost there).
 adb_t emu kill
 sleep 3
-pgrep -x emulator > /dev/null 2>&1 && pkill -x emulator 2>/dev/null || true
+emulator_alive && pkill -f -- "-avd $AVD_NAME" 2>/dev/null || true
