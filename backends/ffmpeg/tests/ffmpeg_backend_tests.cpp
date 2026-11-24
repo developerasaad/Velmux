@@ -184,6 +184,23 @@ ConversionRequest transcodeRequest(const std::string &sourcePath,
 
 class EventWaiter final : public IJobEventSink {
 public:
+  // RAII subscription: constructing with a bus subscribes, and the
+  // destructor unsubscribes — a waiter scoped to one job can never
+  // dangle on an engine that outlives it. (The exact lifetime bug that
+  // crashed the huge-metadata hardening test: Run 1's block-scoped
+  // waiter died while still subscribed; Run 2's events were then
+  // delivered into its reused stack slot — a stack-use-after-scope,
+  // SIGSEGV under doctest.)
+  explicit EventWaiter(EventBus &bus) : bus_(&bus) { bus_->subscribe(this); }
+  EventWaiter() = default;
+  ~EventWaiter() override {
+    if (bus_ != nullptr) {
+      bus_->unsubscribe(this);
+    }
+  }
+  EventWaiter(const EventWaiter &) = delete;
+  EventWaiter &operator=(const EventWaiter &) = delete;
+
   void onJobEvent(const JobEvent &event) override {
     std::lock_guard<std::mutex> lock(mutex_);
     last = event;
@@ -209,6 +226,7 @@ public:
   }
 
 private:
+  EventBus *bus_ = nullptr;
   std::mutex mutex_;
   std::condition_variable done;
   std::optional<JobEvent> last;
@@ -431,8 +449,7 @@ TEST_CASE("REAL transcode: H.264/AAC MP4 -> VP9/Opus WebM with validation") {
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(
       transcodeRequest(fixture, Container::WebM, VideoCodec::VP9,
                        AudioCodec::Opus));
@@ -471,8 +488,7 @@ TEST_CASE("REAL transcode: H.264 MP4 -> HEVC (libx265) MP4 with validation") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   // Explicit quality (not bitrate) exercises the CRF path for libx265.
   ConversionRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::HEVC,
@@ -507,8 +523,7 @@ TEST_CASE("REAL transcode: resolution downscale to 144p") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=10",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac, /*height=*/144));
@@ -536,8 +551,7 @@ TEST_CASE("REAL remux: same codecs into MKV avoids re-encoding") {
                       "sine=frequency=440:sample_rate=44100", 2.0);
   const auto before = std::filesystem::file_size(fixture);
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(
       transcodeRequest(fixture, Container::Mkv, VideoCodec::H264,
                        AudioCodec::Aac));
@@ -613,8 +627,7 @@ TEST_CASE("fit-under-size budget DRIVES the encode and lands under target") {
   request.goal.kind = GoalKind::FitUnderSize;
   request.goal.targetSizeBytes = 80'000; // ~160 kbps total for 4 s
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
 
@@ -677,8 +690,7 @@ TEST_CASE("rotation swaps output dimensions and crop cuts the frame") {
                        AudioCodec::Aac);
   request.video.rotationDegrees = 90;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -697,8 +709,7 @@ TEST_CASE("rotation swaps output dimensions and crop cuts the frame") {
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
   cropped.video.crop = CropRect{0, 0, 160, 240};
-  EventWaiter waiter2;
-  env.engine->events().subscribe(&waiter2);
+  EventWaiter waiter2(env.engine->events());
   const Result<std::string> jobId2 = env.engine->startJob(cropped);
   REQUIRE(jobId2.ok());
   const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(60));
@@ -726,8 +737,7 @@ TEST_CASE("flip mirrors pixels (independent raw-frame cross-check)") {
                        AudioCodec::Aac);
   request.video.flipHorizontal = true;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -757,8 +767,7 @@ TEST_CASE("crop outside the frame is refused, not mangled") {
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
   request.video.crop = CropRect{310, 0, 100, 100}; // past the right edge
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -803,8 +812,7 @@ TEST_CASE("audio gain changes loudness by the requested amount") {
   request.audio.gainDb = -12.0;
 
   const double before = meanVolumeDb(fixture);
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -832,8 +840,7 @@ TEST_CASE("playback speed stretches audio-only output by 1/speed") {
   request.video.enabled = false;
   request.audio.playbackSpeed = 2.0;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -869,8 +876,7 @@ TEST_CASE("PCM bit depth selects the exact PCM encoder variant") {
   request.video.enabled = false;
   request.audio.pcmBitDepth = 24;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -897,8 +903,7 @@ TEST_CASE("metadata survives transcode and remux") {
                           .c_str()) == 0);
 
   // Transcode path.
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(
       transcodeRequest(tagged, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac, {}, 400'000));
@@ -926,8 +931,7 @@ TEST_CASE("metadata survives transcode and remux") {
   CHECK(titleOf(jobs.front().outputPath) == "VelmuxMetaTitle");
 
   // Remux path.
-  EventWaiter waiter2;
-  env.engine->events().subscribe(&waiter2);
+  EventWaiter waiter2(env.engine->events());
   const Result<std::string> jobId2 = env.engine->startJob(
       transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                        AudioCodec::Aac));
@@ -979,8 +983,7 @@ TEST_CASE("HARDENING: invalid timestamps never produce fake success") {
     CHECK_FALSE(jobId.error().message.empty());
     return;
   }
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
   if (terminal->state == JobState::Completed) {
@@ -1065,8 +1068,7 @@ TEST_CASE("REAL transcode preserves subtitle tracks (MKV/H.264+SRT -> HEVC? no: 
   ConversionRequest request =
       transcodeRequest(mkv, Container::Mkv, VideoCodec::H264, AudioCodec::Aac,
                        /*height=*/144);
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -1246,8 +1248,7 @@ TEST_CASE("REAL bitmap burn-in: embedded PGS composited into the video") {
   request.subtitles.policy = SubtitlePolicy::BurnIn;
   request.goal.kind = GoalKind::Custom;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -1313,8 +1314,7 @@ TEST_CASE("bitmap burn-in with external PGS and timing offset") {
   request.subtitles.timingOffsetMs = 1000; // cue becomes [2s, 4s)
   request.goal.kind = GoalKind::Custom;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -1368,8 +1368,7 @@ TEST_CASE("bitmap burn-in refuses geometry transforms honestly") {
   request.video.rotationDegrees = 90; // incompatible with bitmap cues
   request.goal.kind = GoalKind::Custom;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -1390,8 +1389,7 @@ TEST_CASE("REAL burn-in: embedded SRT rendered into the video (libass)") {
   ConversionRequest request = transcodeRequest(mkv, Container::Mp4,
                                                 VideoCodec::H264, AudioCodec::Aac);
   request.subtitles.policy = SubtitlePolicy::BurnIn;
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
@@ -1427,8 +1425,7 @@ TEST_CASE("REAL burn-in: external SRT with timing offset") {
   request.subtitles.policy = SubtitlePolicy::BurnIn;
   request.subtitles.externalUri = srt.string();
   request.subtitles.timingOffsetMs = 2000;
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
@@ -1741,8 +1738,7 @@ TEST_CASE("REAL trim: transcode only the requested window") {
   request.trim.startUs = 1'000'000;
   request.trim.endUs = 3'000'000;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
 
@@ -1861,8 +1857,7 @@ TEST_CASE("REAL extraction: MKV/SRT track to a sidecar .srt through the engine")
   request.audio.enabled = false;
   request.subtitles.policy = SubtitlePolicy::Extract;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
 
@@ -1912,8 +1907,7 @@ TEST_CASE("REAL extraction: MP4 mov_text decodes to SRT") {
   request.audio.enabled = false;
   request.subtitles.policy = SubtitlePolicy::Extract;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -2024,8 +2018,7 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
         env.engine->inspect(MediaSource{truncated, "cut.mp4"});
     REQUIRE(inspected.ok());
     const double inspectedDuration = inspected.value().durationSec;
-    EventWaiter waiter;
-    env.engine->events().subscribe(&waiter);
+    EventWaiter waiter(env.engine->events());
     const Result<std::string> jobId = env.engine->startJob(request);
     REQUIRE(jobId.ok());
     const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2062,8 +2055,7 @@ TEST_CASE("HARDENING: source disappearing before a resume fails cleanly") {
                        AudioCodec::Opus);
 
   // Phase 1: start, then pause while running.
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   // Wait until it is actually running, then pause.
@@ -2100,8 +2092,7 @@ TEST_CASE("HARDENING: unwritable output destination fails cleanly") {
   const std::string outputs = env.dir.string() + "/outputs";
   REQUIRE(::chmod(outputs.c_str(), 0555) == 0);
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2172,8 +2163,7 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
   // Completed must mean the sentinel tag survived and the output covers
   // the source duration.
   {
-    EventWaiter waiter;
-    env.engine->events().subscribe(&waiter);
+    EventWaiter waiter(env.engine->events());
     const Result<std::string> jobId = env.engine->startJob(
         transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                          AudioCodec::Aac));
@@ -2205,8 +2195,7 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
         transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                          AudioCodec::Aac, 144, 400'000);
     strip.stripMetadata = true;
-    EventWaiter waiter2;
-    env.engine->events().subscribe(&waiter2);
+    EventWaiter waiter2(env.engine->events());
     const Result<std::string> jobId2 = env.engine->startJob(strip);
     REQUIRE(jobId2.ok());
     const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
@@ -2367,8 +2356,7 @@ TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") 
         env.engine->inspect(MediaSource{broken, "nonmono.ts"});
     REQUIRE(inspected.ok());
     const double inspectedDuration = inspected.value().durationSec;
-    EventWaiter waiter;
-    env.engine->events().subscribe(&waiter);
+    EventWaiter waiter(env.engine->events());
     const Result<std::string> jobId = env.engine->startJob(request);
     REQUIRE(jobId.ok());
     const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2416,8 +2404,7 @@ TEST_CASE("REAL multi-track audio: allTracks carries every lane with language") 
                        AudioCodec::Aac);
   request.audio.allTracks = true;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2459,8 +2446,7 @@ TEST_CASE("REAL replace audio: external audio rides the video timeline") {
                        AudioCodec::Aac);
   request.audio.replaceAudioUri = replacement;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2499,8 +2485,7 @@ TEST_CASE("REAL cover art: external image attaches to audio-only output") {
   request.video.enabled = false;
   request.audio.coverArtUri = cover;
 
-  EventWaiter waiter;
-  env.engine->events().subscribe(&waiter);
+  EventWaiter waiter(env.engine->events());
   const Result<std::string> jobId = env.engine->startJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -2542,12 +2527,14 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
 
   // Transcode (default 8-bit H.264): the pinned build offers no PQ/HLG
   // tone-map, so the PLANNER refuses the route honestly instead of
-  // producing washed-out output — infeasible with a reason. (An explicit
+  // producing washed-out output — infeasible with a reason. The height
+  // change forces a real re-encode: a same-shape request would honestly
+  // plan as stream copy (HDR preserved, never gated). (An explicit
   // ToneMapToSdr request is refused by the same gate.)
   {
     ConversionRequest request =
         transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
-                         AudioCodec::Aac);
+                         AudioCodec::Aac, 144);
     const Result<PlanResult> plan =
         env.engine->plan(MediaSource{hdr, "hdr.mp4"}, request);
     REQUIRE(plan.ok());
@@ -2557,7 +2544,7 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
     // Explicit ToneMapToSdr is refused by the same planner gate.
     ConversionRequest tm =
         transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
-                         AudioCodec::Aac);
+                         AudioCodec::Aac, 144);
     tm.video.hdrPolicy = HdrPolicy::ToneMapToSdr;
     const Result<PlanResult> planTm =
         env.engine->plan(MediaSource{hdr, "hdr.mp4"}, tm);
@@ -2575,8 +2562,7 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
     remux.audio.codec = AudioCodec::Aac; // audio re-encode keeps it a
                                          // single-backend FFmpeg job
     // Planner prefers stream copy for matching codecs; no transform asked.
-    EventWaiter waiter2;
-    env.engine->events().subscribe(&waiter2);
+    EventWaiter waiter2(env.engine->events());
     const Result<std::string> jobId2 = env.engine->startJob(remux);
     REQUIRE(jobId2.ok());
     const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));

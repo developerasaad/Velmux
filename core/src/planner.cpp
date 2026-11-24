@@ -748,9 +748,36 @@ PlanResult Planner::plan(const MediaInfo &source,
       request.video.profile.has_value() || request.video.level.has_value() ||
       request.video.pixelFormat.has_value() ||
       request.video.gopSize.has_value() || request.video.bFrames.has_value();
+  // Geometry/rate changes mirror HybridExecutor::canExecute (v1 hybrid
+  // carries source geometry and rate): planning a hybrid route the
+  // executor must then refuse would surface as a mid-job execution error
+  // instead of an honest infeasible plan.
+  const bool wantsGeometryChange =
+      request.video.resolutionHeight.has_value() ||
+      request.video.frameRate.has_value();
+  // HDR sources never ride the hybrid interchange: the CPU-frame pipeline
+  // re-encodes PQ/HLG pixels through the default 8-bit SDR path — the same
+  // washed-out output the single-backend HDR gate refuses. Only a
+  // tone-mapping stage-decode backend (none in the pinned v1 set) could
+  // compose this honestly.
+  const bool hdrSource =
+      wantsVideo && source.hasVideo() && source.video.front().hdr;
+  // registeredBackends() returns BY VALUE: materialize one vector —
+  // calling it twice for begin()/end() would iterate two different
+  // temporaries (a heap-buffer-overflow caught by ASan on the first full
+  // sanitizer run of this code).
+  const std::vector<BackendId> registeredBackends = caps_.registeredBackends();
+  const bool anyStageDecoderToneMaps = std::any_of(
+      registeredBackends.begin(), registeredBackends.end(),
+      [this](BackendId id) {
+        const auto *caps = caps_.capabilitiesOf(id);
+        return caps != nullptr && caps->stageDecodeToCpuFrames &&
+               caps->hdrToneMapping;
+      });
   if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim &&
       !wantsTransform && !wantsAudioDsp && !wantsAdvancedAudio &&
-      !wantsEncoderTuning) {
+      !wantsEncoderTuning && !wantsGeometryChange &&
+      !(hdrSource && !anyStageDecoderToneMaps)) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&

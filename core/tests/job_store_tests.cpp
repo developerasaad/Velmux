@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdio>
+#include <optional>
 #include <filesystem>
 
 using namespace velmux::core;
@@ -96,6 +97,48 @@ TEST_CASE("insert and load round-trips the full request") {
   CHECK(loaded->inputSizeBytes == 2'000'000'000);
   CHECK(loaded->progress == doctest::Approx(0.42));
   CHECK(loaded->startedAtMs == 1500);
+}
+
+TEST_CASE("advanced-control request fields survive the store round-trip") {
+  // Regression (D-040 bug class): executeJob reloads the request from the
+  // store, so any field missing from the serialization silently reverts
+  // to its default mid-flight. This exact mechanism made stripMetadata a
+  // dead control (strip requests preserved metadata) and made cover-art /
+  // replace-audio requests execute as plain transcodes.
+  TempDb db;
+  JobRecord record = sampleJob("job-adv", JobState::Queued);
+  record.request.stripMetadata = true;
+  record.request.audio.sourceTrackIndex = 1;
+  record.request.audio.allTracks = true;
+  record.request.audio.replaceAudioUri = "file:///tmp/replacement.m4a";
+  record.request.audio.coverArtUri = "file:///tmp/cover.png";
+  record.request.audio.preserveCoverArt = false;
+  REQUIRE(db.jobs().insertJob(record).ok());
+
+  Error error;
+  const auto loaded = db.jobs().loadJob("job-adv", error);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->request.stripMetadata);
+  CHECK(loaded->request.audio.sourceTrackIndex == 1);
+  CHECK(loaded->request.audio.allTracks);
+  CHECK(loaded->request.audio.replaceAudioUri ==
+        std::optional<std::string>("file:///tmp/replacement.m4a"));
+  CHECK(loaded->request.audio.coverArtUri ==
+        std::optional<std::string>("file:///tmp/cover.png"));
+  CHECK_FALSE(loaded->request.audio.preserveCoverArt);
+
+  // Defaults must stay defaults when the fields are unset (a fresh v3
+  // database and a migrated v2 row both read back identically).
+  const JobRecord plain = sampleJob("job-plain", JobState::Queued);
+  REQUIRE(db.jobs().insertJob(plain).ok());
+  const auto loadedPlain = db.jobs().loadJob("job-plain", error);
+  REQUIRE(loadedPlain.has_value());
+  CHECK_FALSE(loadedPlain->request.stripMetadata);
+  CHECK(loadedPlain->request.audio.sourceTrackIndex == -1);
+  CHECK_FALSE(loadedPlain->request.audio.allTracks);
+  CHECK_FALSE(loadedPlain->request.audio.replaceAudioUri.has_value());
+  CHECK_FALSE(loadedPlain->request.audio.coverArtUri.has_value());
+  CHECK(loadedPlain->request.audio.preserveCoverArt);
 }
 
 TEST_CASE("update persists state transitions") {

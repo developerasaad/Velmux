@@ -215,6 +215,32 @@ public:
 
 class EventRecorder final : public IJobEventSink {
 public:
+  // RAII subscription (same lifetime contract as EventWaiter in the
+  // backend tests): constructing with a bus subscribes and the
+  // destructor unsubscribes, so a recorder scoped inside a test block can
+  // never dangle on an engine that outlives it. Sites that deliberately
+  // outlive their engine (EngineEnv's member) keep the bare constructor
+  // and the explicit subscribe.
+  explicit EventRecorder(EventBus &bus) : bus_(&bus) { bus_->subscribe(this); }
+  EventRecorder() = default;
+  ~EventRecorder() override {
+    if (bus_ != nullptr) {
+      bus_->unsubscribe(this);
+    }
+  }
+  EventRecorder(const EventRecorder &) = delete;
+  EventRecorder &operator=(const EventRecorder &) = delete;
+
+  // Drop the RAII subscription early: for tests that destroy the ENGINE
+  // while the recorder is still in scope (explicit engine.reset()), the
+  // destructor must not touch the dead engine's bus.
+  void detach() {
+    if (bus_ != nullptr) {
+      bus_->unsubscribe(this);
+      bus_ = nullptr;
+    }
+  }
+
   void onJobEvent(const JobEvent &event) override {
     std::lock_guard<std::mutex> lock(mutex_);
     events.push_back(event);
@@ -266,6 +292,7 @@ private:
   }
   mutable std::mutex mutex_;
   std::condition_variable done;
+  EventBus *bus_ = nullptr;
 };
 
 class EngineEnv {
@@ -471,8 +498,7 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
     auto engine =
         VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
     REQUIRE(engine != nullptr);
-    EventRecorder recorder;
-    engine->events().subscribe(&recorder);
+    EventRecorder recorder(engine->events());
 
     const Result<std::string> submitted = engine->startJob(request);
     REQUIRE(submitted.ok());
@@ -481,7 +507,10 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
                 .waitForState(JobState::Running, std::chrono::seconds(5))
                 .has_value());
     // Engine destruction runs the shutdown contract: running jobs become
-    // recoverable, never silently canceled.
+    // recoverable, never silently canceled. Detach first: the engine's
+    // EventBus dies with the engine, and the recorder (still in scope)
+    // must not unsubscribe from the freed bus in its destructor.
+    recorder.detach();
     engine.reset();
   }
 
@@ -505,8 +534,7 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
     auto engine =
         VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
     REQUIRE(engine != nullptr);
-    EventRecorder recorder;
-    engine->events().subscribe(&recorder);
+    EventRecorder recorder(engine->events());
     const auto terminal =
         recorder.waitForTerminal(std::chrono::seconds(10));
     REQUIRE(terminal.has_value());
@@ -560,8 +588,7 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
   }
 
   // Job 1 executes on the failing backend and fails for real.
-  EventRecorder recorder;
-  engine->events().subscribe(&recorder);
+  EventRecorder recorder(engine->events());
   const Result<std::string> first = engine->startJob(request);
   REQUIRE(first.ok());
   const auto terminal = recorder.waitForTerminal(std::chrono::seconds(10));
@@ -600,8 +627,7 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
   }
 
   // Job 2 completes through the working backend.
-  EventRecorder secondRecorder;
-  engine->events().subscribe(&secondRecorder);
+  EventRecorder secondRecorder(engine->events());
   const Result<std::string> second = engine->startJob(request);
   REQUIRE(second.ok());
   const auto terminal2 =

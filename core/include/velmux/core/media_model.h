@@ -60,6 +60,11 @@ struct MediaInfo {
   std::vector<VideoStream> video;
   std::vector<AudioStream> audio;
   std::vector<SubtitleStream> subtitles;
+  // Attached pictures (cover art) carried by the container. They are
+  // metadata, NOT timeline content: never listed in `video`, never counted
+  // by hasVideo(). Consumers that need to know about cover art read this
+  // count (spec §10: attached pictures preserved/embedded per request).
+  int attachedPictures = 0;
 
   bool hasVideo() const { return !video.empty(); }
   bool hasAudio() const { return !audio.empty(); }

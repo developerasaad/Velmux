@@ -908,6 +908,17 @@ Error FfmpegInspector::inspect(const MediaSource &source, MediaInfo &out) {
     }();
     switch (par->codec_type) {
       case AVMEDIA_TYPE_VIDEO: {
+        // Attached pictures are cover art — METADATA, not timeline
+        // content (the executor preserves/embeds them per request, spec
+        // §10). They must not appear as a video lane: a cover-only MP3 is
+        // an audio source, and an output with video disabled plus embedded
+        // cover art must validate as "no video stream" (the old behavior
+        // failed such outputs with "Expected no video stream, but found
+        // one").
+        if (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+          ++out.attachedPictures;
+          break;
+        }
         if (auto codec = videoCodecFromAv(par->codec_id)) {
           VideoStream vs;
           vs.codec = *codec;

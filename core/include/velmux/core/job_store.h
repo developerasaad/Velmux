@@ -83,7 +83,7 @@ public:
   // Removes the job AND its checkpoint rows (cascade).
   Error deleteJob(const std::string &id);
 
-  static constexpr std::int32_t kSchemaVersion = 2;
+  static constexpr std::int32_t kSchemaVersion = 3;
 
 private:
   static JobRecord rowToRecord(sqlite3_stmt &stmt);

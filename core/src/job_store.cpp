@@ -220,7 +220,8 @@ Error SqliteStore::migrate() {
               "  finished_at INTEGER,"
               "  schema_version INTEGER NOT NULL DEFAULT 1,"
               "  trim_start_us INTEGER NOT NULL DEFAULT 0,"
-              "  trim_end_us INTEGER NOT NULL DEFAULT -1"
+              "  trim_end_us INTEGER NOT NULL DEFAULT -1,"
+              "  strip_metadata INTEGER NOT NULL DEFAULT 0"
               ")", error)) {
       return error;
     }
@@ -232,6 +233,16 @@ Error SqliteStore::migrate() {
           !exec("ALTER TABLE jobs ADD COLUMN trim_end_us INTEGER NOT NULL "
                 "DEFAULT -1", error) ||
           !exec("UPDATE schema_version SET version = 2", error)) {
+        return error;
+      }
+    }
+    if (current < 3) {
+      // v3: stripMetadata on the request (spec advanced controls). Same
+      // append-only discipline: column 26, existing positional reads stay
+      // valid.
+      if (!exec("ALTER TABLE jobs ADD COLUMN strip_metadata INTEGER NOT NULL "
+                "DEFAULT 0", error) ||
+          !exec("UPDATE schema_version SET version = 3", error)) {
         return error;
       }
     }
@@ -359,6 +370,29 @@ std::string serializeAudioRequest(const AudioRequest &audio) {
   if (audio.pcmBitDepth.has_value()) {
     out += "depth=" + std::to_string(*audio.pcmBitDepth) + ";";
   }
+  // Multi-track / replace / cover-art controls (spec §9/§10). These MUST
+  // survive the job-store round trip: executeJob reloads the record from
+  // the store, so a field missing here silently reverts to its default
+  // mid-flight (the D-040 dead-validation bug class — observed as strip
+  // requests preserving metadata and cover-art/replace requests executing
+  // as plain transcodes once the tests that cover them actually ran).
+  if (audio.sourceTrackIndex >= 0) {
+    out += "srctrack=" + std::to_string(audio.sourceTrackIndex) + ";";
+  }
+  if (audio.allTracks) {
+    out += "alltracks=1;";
+  }
+  if (audio.replaceAudioUri.has_value()) {
+    // '=' and ';' cannot appear in practice (file paths); '=' would break
+    // key=value parsing and ';' would split the pair.
+    out += "replace=" + *audio.replaceAudioUri + ";";
+  }
+  if (audio.coverArtUri.has_value()) {
+    out += "cover=" + *audio.coverArtUri + ";";
+  }
+  if (!audio.preserveCoverArt) {
+    out += "keepcover=0;";
+  }
   return out;
 }
 
@@ -413,6 +447,11 @@ std::string serializeSourceInfo(const MediaInfo &info) {
     out += "asr=" + std::to_string(a.sampleRate) + ";";
     out += std::string("acodec=") + codecName(a.codec) + ";";
   }
+  if (info.attachedPictures > 0) {
+    // Cover art count: attached pictures are metadata, not a video lane;
+    // the count keeps the source summary faithful for resumed jobs.
+    out += "covers=" + std::to_string(info.attachedPictures) + ";";
+  }
   if (!info.subtitles.empty()) {
     // The planner's subtitle policies (burn-in/preserve/extract routing
     // and container compatibility) key off the track list; formats and
@@ -440,6 +479,8 @@ MediaInfo parseSourceInfo(const std::string &data) {
         info.durationSec = std::stod(value);
       } else if (key == "size") {
         info.sizeBytes = std::stoll(value);
+      } else if (key == "covers") {
+        info.attachedPictures = std::stoi(value);
       } else if (key == "vw") {
         if (info.video.empty()) {
           info.video.push_back(VideoStream{});
@@ -583,6 +624,16 @@ AudioRequest parseAudioRequest(const std::string &data) {
       audio.removeSilence = value == "1";
     } else if (key == "depth") {
       audio.pcmBitDepth = std::stoi(value);
+    } else if (key == "srctrack") {
+      audio.sourceTrackIndex = std::stoi(value);
+    } else if (key == "alltracks") {
+      audio.allTracks = value == "1";
+    } else if (key == "replace") {
+      audio.replaceAudioUri = value;
+    } else if (key == "cover") {
+      audio.coverArtUri = value;
+    } else if (key == "keepcover") {
+      audio.preserveCoverArt = value == "1";
     }
   });
   return audio;
@@ -612,8 +663,8 @@ Error JobStore::insertJob(const JobRecord &record) {
       "video_json, audio_json, subtitles_json, processing_mode, "
       "pipeline_json, source_info_json, progress, input_size, output_size, "
       "error, created_at, updated_at, started_at, finished_at, schema_version, "
-      "trim_start_us, trim_end_us) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      "trim_start_us, trim_end_us, strip_metadata) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
   sqlite3_stmt *stmt = db_.prepare(sql, error);
   if (stmt == nullptr) {
     return error;
@@ -650,6 +701,7 @@ Error JobStore::insertJob(const JobRecord &record) {
                     -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 25, record.request.trim.startUs);
   sqlite3_bind_int64(stmt, 26, record.request.trim.endUs);
+  sqlite3_bind_int(stmt, 27, record.request.stripMetadata ? 1 : 0);
   sqlite3_bind_text(stmt, 14, record.pipeline.summary.c_str(), -1,
                     SQLITE_TRANSIENT);
   sqlite3_bind_text(stmt, 15,
@@ -804,6 +856,12 @@ JobRecord JobStore::rowToRecord(sqlite3_stmt &stmt) {
       sqlite3_column_type(&stmt, 25) == SQLITE_INTEGER
           ? sqlite3_column_int64(&stmt, 25)
           : -1;
+  // 0-based column order: ... finished_at=22, schema_version=23,
+  // trim_start_us=24, trim_end_us=25, strip_metadata=26.
+  record.request.stripMetadata =
+      sqlite3_column_type(&stmt, 26) == SQLITE_INTEGER
+          ? sqlite3_column_int(&stmt, 26) != 0
+          : false;
   record.error = columnText(stmt, 18);
   record.createdAtMs = sqlite3_column_int64(&stmt, 19);
   record.updatedAtMs = sqlite3_column_int64(&stmt, 20);
