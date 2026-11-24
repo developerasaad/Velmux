@@ -28,6 +28,11 @@ set -euo pipefail
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPTS_DIR/lib/common.sh"
+# validate_api_level (and the ABI/policy helpers) live in the shared
+# target library — the missing source was the CI failure behind the
+# "validate_api_level: command not found" exit 127.
+# shellcheck source=lib/targets.sh
+. "$SCRIPTS_DIR/lib/targets.sh"
 
 API=""
 ABI="$VELMUX_ANDROID_EMULATOR_ABI"

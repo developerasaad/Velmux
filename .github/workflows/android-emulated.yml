@@ -21,6 +21,7 @@ on:
       - core/**
       - backends/**
       - bridge/**
+      - tools/ffmpeg-builder/**
       - .github/workflows/android-emulated.yml
   pull_request:
     paths:
@@ -28,6 +29,7 @@ on:
       - core/**
       - backends/**
       - bridge/**
+      - tools/ffmpeg-builder/**
       - .github/workflows/android-emulated.yml
   workflow_dispatch:
 
