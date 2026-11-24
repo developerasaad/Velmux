@@ -652,8 +652,15 @@ class HybridConversionTest {
       // intermediate is validated by the engine's own completed state, its
       // size, and the success of the step-2 hybrid run that decodes it.
 
-      // Step 2: FFV1 -> HEVC. No single-backend route exists, so hybrid
-      // F->N is the ONLY plan — the engine needs no mask.
+      // Step 2: FFV1 -> HEVC. The pinned FFmpeg build carries libx265, so
+      // a single-backend software route ALWAYS exists regardless of the
+      // Android side, and the planner legitimately prefers it when it wins
+      // the cost model (observed on the API 34 image: "Transcode hevc via
+      // ffmpeg (software) -> mp4" — a valid, completed conversion). This
+      // step therefore asserts the real cross-codec conversion COMPLETES
+      // with valid HEVC output — the route is the planner's choice. The
+      // hybrid F->N route itself is proven by the masked run below, where
+      // no single-backend route exists and hybrid is the only plan.
       if (hasEncoderFor("video/hevc")) {
         val hevcRequest = """
           {
@@ -667,13 +674,41 @@ class HybridConversionTest {
             "processingMode": "auto"
           }
         """.trimIndent()
-        val outcome = runMaskedEngine(hevcRequest, freshWorkDir("fton-natural"), "")
-        assertHybridRunCompleted(outcome, "natural F->N (FFV1 -> HEVC)")
-        val probed = probe(outcome.outputPath!!)
+        val natural = runMaskedEngine(hevcRequest, freshWorkDir("fton-natural"), "")
+        assertEquals("natural F->N (FFV1 -> HEVC) failed: ${natural.error}",
+            "completed", natural.state)
+        assertNotNull("natural F->N reported no output path", natural.outputPath)
+        val naturalOut = File(natural.outputPath!!)
+        assertTrue("natural F->N output missing or empty",
+            naturalOut.exists() && naturalOut.length() > 0)
+        val probed = probe(natural.outputPath!!)
         assertEquals("video/hevc", probed.videoMime)
         assertEquals("audio/mp4a-latm", probed.audioMime)
         assertDurationWithin(probed.durationUs, fixture.durationUs, "F->N")
-        return
+
+        // Masked F->N hybrid on the FFV1 intermediate: "ffmpeg-encoders"
+        // removes the libx265 software route and the Android encode side
+        // remains, so FFmpeg-decode -> Android-encode (HEVC) is the only
+        // plan. "android-whole-pipeline" removes the Android whole-pipeline
+        // candidate the same way; the frames still cross the real
+        // FFmpeg-decode -> Android-encode CPU-frame boundary. A CHOSEN
+        // hybrid that then failed execution stays a hard failure (same
+        // policy as the fallback below).
+        val maskedHevc = runMaskedEngine(hevcRequest, freshWorkDir("fton-masked-hevc"),
+            "ffmpeg-encoders,android-whole-pipeline")
+        val choseHybrid = maskedHevc.pipelineSummary
+                ?.contains("hybrid", ignoreCase = true) == true
+        if (choseHybrid) {
+          assertHybridRunCompleted(maskedHevc, "masked F->N hybrid (FFV1 -> HEVC)")
+          val maskedProbed = probe(maskedHevc.outputPath!!)
+          assertEquals("video/hevc", maskedProbed.videoMime)
+          assertDurationWithin(maskedProbed.durationUs, fixture.durationUs,
+              "masked F->N hybrid")
+          return
+        }
+        // The masked HEVC hybrid route could not be established on this
+        // image (unexpected capability combination); the H.264 masked
+        // fallback below still proves the F->N hybrid composition.
       }
 
       // No HEVC encoder on this emulator. The same F->N composition
