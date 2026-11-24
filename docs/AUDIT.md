@@ -16,8 +16,8 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Requirement | Status | Evidence / gap |
 |---|---|---|
 | H.264/HEVC/AV1/VP8/VP9/MPEG-4/MPEG-2/MPEG-1/H.263/VC-1/WMV/ProRes/DNxHD/FFV1/MJPEG decode+encode asymmetry | IMPLEMENTED + VERIFIED (FFmpeg path, host CI) | `core/src/feature_registry.cpp` catalog; real transcode tests `backends/ffmpeg/tests/ffmpeg_backend_tests.cpp`; remux/copy tests; planner rejects unsupported combos (`core/tests/planner_tests.cpp`) |
-| Native (MediaCodec/VideoToolbox) encode/decode where device supports | IMPLEMENTED — HARDWARE VALIDATION PENDING | Android `backends/android/cpp/media_transcoder.cpp` (real surface-path MediaCodec); Apple `backends/apple/objcpp/apple_pipeline.mm` (real VideoToolbox/AVFoundation). Instrumented tests written (`NativeConversionTest.kt`) but never executed — emulator CI being added this session; physical-device runs remain pending |
-| HEVC software encode via FFmpeg | MISSING / INCOMPLETE | `encoderNameFor()` pins no HEVC software encoder; HEVC encode is native-only today. Add libx265 or keep honest native-only routing |
+| Native (MediaCodec/VideoToolbox) encode/decode where device supports | IMPLEMENTED — HARDWARE VALIDATION PENDING | Android `backends/android/cpp/media_transcoder.cpp` (real surface-path MediaCodec); Apple `backends/apple/objcpp/apple_pipeline.mm` (real VideoToolbox/AVFoundation). Instrumented tests execute on KVM emulators in CI (`android-emulated.yml`, API 29 + 34); physical-device runs remain pending |
+| HEVC software encode via FFmpeg | IMPLEMENTED + VERIFIED | libx265 3.6 pinned in the builder (`tools/ffmpeg-builder/versions.json`; CMake-4 compat patch in `lib.sh`); real H.264→HEVC transcode test with engine validation + ffprobe cross-check in the host suite |
 
 ## 2. Audio codecs (matrix §8)
 
@@ -40,7 +40,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | External import, timing offset, text conversion (SRT/VTT/ASS/SSA/mov_text/TTML) | IMPLEMENTED + VERIFIED | `subtitle_tools.cpp`; extraction tests incl. mov_text→SRT decode |
 | Text burn-in via libass | IMPLEMENTED + VERIFIED | filter-graph burn-in, pixel-tested (embedded + external + offset) |
 | Bitmap burn-in (PGS/VobSub/DVB) | IMPLEMENTED + VERIFIED | overlay-filter compositing of pre-decoded cues; hand-crafted PGS bitstream fixtures; pixel cross-checks; DVB/VobSub share the identical decode->composite path |
-| CEA-608/708 | MISSING / INCOMPLETE (detect only) | SEI CCs are not detected at inspection; ride along on video copy implicitly. Detection + honest routing being added |
+| CEA-608/708 | DETECTION IMPLEMENTED + VERIFIED (negative path); POSITIVE DETECTION PENDING REAL SAMPLE | Inspection probes A53 CC side data over a bounded 64-packet window and reports `hasClosedCaptions` (serialized through the bridge); a clean source honestly reports none (host test). Captions ride along on video stream copy. A positive-detection fixture requires media with real broadcast CC data (the pinned ffmpeg CLI cannot author A53 SEI); text extraction is NOT V1 (OCR-class problem, documented non-goal) |
 
 ## 5. Video operations (spec §9)
 
@@ -51,13 +51,13 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Frame-rate conversion | IMPLEMENTED + VERIFIED | FFmpeg transcode re-times onto a constant output grid (duplication/dropping), composes with burn-in + segmented recovery |
 | Crop / rotation / flip | IMPLEMENTED + VERIFIED | CropRect/rotationDegrees/flip fields through the full stack; FFmpeg unified transform graph; honest out-of-frame refusal; pixel-verified flip test |
 | Trim | IMPLEMENTED + VERIFIED | FFmpeg frame-exact + segmented + keyframe-snap copy paths tested; Android/Apple/hybrid executors refuse trimmed requests via canExecute + planner timeTrim gating (tested: native-only registries refuse, hybrid shapes refuse) |
-| Remove/replace audio, audio extraction | Partial: remove+extract IMPLEMENTED + VERIFIED; replace audio MISSING / INCOMPLETE | extraction = audio-only transcode (tested) |
-| Multiple audio tracks / language tracks | MISSING / INCOMPLETE | only first audio stream processed |
+| Remove/replace audio, audio extraction | IMPLEMENTED + VERIFIED | remove+extract = tested; replace-audio: external lane paced onto the video timeline (host test: differently-long replacement, output follows video duration) |
+| Multiple audio tracks / language tracks | IMPLEMENTED + VERIFIED | allTracks carries every lane with language metadata (host test: eng+fra MKV) |
 | Fast remux / stream copy | IMPLEMENTED + VERIFIED | remux tests; planner prefers copy |
-| Batch processing | MISSING / INCOMPLETE (UI) | engine+scheduler support jobs; no multi-select UI |
-| Metadata preservation | MISSING / INCOMPLETE | only subtitle-stream metadata copied today |
-| HDR preservation where compatible | IMPLEMENTED + VERIFIED (copy path) | stream copy preserves bitstream+ signaling |
-| HDR → SDR where supported | MISSING / INCOMPLETE | transcode forces 8-bit YUV420P with no tone mapping |
+| Batch processing | IMPLEMENTED + VERIFIED | engine+scheduler per-job isolation; Home multi-select batch conversion wired to real job submission (`jobsStore`, host tests for scheduler) |
+| Metadata preservation | IMPLEMENTED + VERIFIED | container+stream tags through transcode and remux (D-047); stripMetadata; hardening test with ~600 KB of container tags |
+| HDR preservation where compatible | IMPLEMENTED + VERIFIED (copy path) | stream copy preserves bitstream+signaling (host test asserts bt2020/PQ tags survive remux) |
+| HDR → SDR where supported | IMPLEMENTED + VERIFIED | ToneMapToSdr decision + `colorspace=all=bt709` filter + SDR BT.709 output tagging; host test: bt2020/PQ source transcodes to tagged bt709 SDR |
 | Output validation | IMPLEMENTED + VERIFIED | `core/src/validation.cpp` + independent ffprobe cross-checks in tests |
 
 ## 6. Audio operations (spec §10)
@@ -69,8 +69,9 @@ Evidence cites files/functions. Last full revision: see Git history.
 | PCM bit depth | IMPLEMENTED + VERIFIED | 16/24/32-bit selects pcm_s16le/s24le/s32le (probed) |
 | Gain / fade / speed (pitch-preserving) / loudness normalization / silence removal | IMPLEMENTED + VERIFIED | abuffer graph chain; gain via volumedetect delta, speed via duration ratio + honest combined-with-video refusal |
 | Trim (audio) | IMPLEMENTED + VERIFIED | trim applies to audio in FFmpeg path |
-| Metadata | IMPLEMENTED + VERIFIED (container + stream tags through transcode and remux) | cover art not implemented |
-| Batch | MISSING / INCOMPLETE (UI) | |
+| Metadata | IMPLEMENTED + VERIFIED | container + stream tags through transcode and remux |
+| Cover art | IMPLEMENTED + VERIFIED | external image attaches with the attached_pic disposition; source pictures preserve on request (host test) |
+| Batch | IMPLEMENTED + VERIFIED (shared batch UI) | Home multi-select drives per-job scheduling |
 
 ## 7. Compression intelligence (spec §17)
 
@@ -80,7 +81,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Budget math + feasibility + unrealistic-target detection | IMPLEMENTED + VERIFIED | `computeBitrateBudget` + planner advisories (tested) |
 | Fit Under Size: budget DRIVES encoding | IMPLEMENTED + VERIFIED | budget-derived bitrate parameterizes the real encode (deterministic on retry; samples preview it) |
 | Second attempt when first exceeds target | IMPLEMENTED + VERIFIED | one corrective re-encode at 0.9x(target/actual); honest summary note on a still-missed target |
-| Sample compression preview | IMPLEMENTED + VERIFIED (engine+bridge) — MISSING UI | engine op + tests + TurboModule method exist; no screen calls it |
+| Sample compression preview | IMPLEMENTED + VERIFIED | engine op + tests + TurboModule method + Convert-screen SamplePreviewCard (generates the exact request's 8 s densest-window preview, invalidates on draft change, share on iOS) |
 
 ## 8. Capability system & planner (spec §15/§16)
 
@@ -88,7 +89,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Feature registry (product-controlled) | IMPLEMENTED + VERIFIED | static catalog + tests |
 | Capability registry, normalized snapshots | IMPLEMENTED + VERIFIED | registered once at engine creation; invalidate on re-registration |
-| Runtime failure feedback into planning | MISSING / INCOMPLETE | `recordFailure` exists, never called from production paths |
+| Runtime failure feedback into planning | IMPLEMENTED + VERIFIED | job manager records execution-attributable failures (narrow config key, cooldown, thread-safe registry); planner avoids live-failed routes single-backend and hybrid; engine test proves record → reroute → narrowness |
 | Whole-pipeline cost model | IMPLEMENTED (deterministic scoring) — measured-throughput learning MISSING / INCOMPLETE | telemetry records PerfRecords; planner does not consult them |
 | Hybrid planning | IMPLEMENTED + VERIFIED | planner hybrid candidates only when no single-backend route (tested) |
 
@@ -97,8 +98,8 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Category | Status | Evidence |
 |---|---|---|
 | F→F | IMPLEMENTED + VERIFIED | real composition test + ffprobe cross-check in CI |
-| Native stage workers (Android ImageReader decode, MediaCodec encode; Apple reader/writer stages) | MISSING / INCOMPLETE | only FFmpeg exposes stage workers today |
-| N→N / F→N / N→F | MISSING / INCOMPLETE | blocked on native stage workers + device/emulator execution |
+| Native stage workers (Android ImageReader decode, MediaCodec encode; Apple reader/writer stages) | IMPLEMENTED — HARDWARE VALIDATION PENDING | real workers: `backends/android/cpp/android_stages.cpp`, `backends/apple/objcpp/apple_stages.mm`; Android backend exposes `stages()`; JNI masked-engine test scaffolding executes stage pipelines on-device (emulator CI) |
+| N→N / F→N / N→F | IMPLEMENTED — HARDWARE VALIDATION PENDING | stage contracts + HybridExecutor compose the routes; capability-masked engine tests select real workers; execution on emulator/device hardware in CI, physical devices pending |
 
 ## 10. Background & notifications (spec §22/§23)
 
@@ -106,15 +107,15 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Android foreground service + notifications + Cancel action | IMPLEMENTED + VERIFIED (build) — HARDWARE VALIDATION PENDING | `ConversionService.kt`; behavior on device untested (emulator CI being added) |
 | iOS BGProcessingTask + notifications | IMPLEMENTED + VERIFIED (build) — HARDWARE VALIDATION PENDING | `VelmuxEngineHost.mm` |
-| Resource updates from platform (thermal/battery/memory) | MISSING / INCOMPLETE | `updateResources` plumbed end-to-end, never called by hosts |
+| Resource updates from platform (thermal/battery/memory) | IMPLEMENTED — HARDWARE VALIDATION PENDING | ConversionService (Android thermal/battery listeners + memory) and VelmuxEngineHost (iOS thermal state + os_proc_available_memory) push debounced resource updates to the scheduler while work runs; behavior on real hardware pending |
 
 ## 11. Scheduler (spec §21)
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| Resource-aware concurrency | PARTIALLY IMPLEMENTED — **slot leak bug**: natural completion never frees slots; hardware-job cap never enforced | `core/src/scheduler.cpp`, `engine.cpp` (finish only on cancel) |
+| Resource-aware concurrency | IMPLEMENTED + VERIFIED | slots free on every terminal path (`Scheduler::finish` → `eraseRunningLocked`, hardware count included); scheduler tests |
 | Batch failure isolation | IMPLEMENTED + VERIFIED (per-job) | jobs run on independent worker threads |
-| Batch UI | MISSING / INCOMPLETE | |
+| Batch UI | IMPLEMENTED + VERIFIED | Home multi-select + queue screen actions (pause/resume/cancel/retry per job) |
 
 ## 12. Recovery (spec §22)
 
@@ -122,7 +123,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 |---|---|---|
 | Segmented transcode + checkpoints + durable resume | IMPLEMENTED + VERIFIED | fault-injection test: cancel ≥50%, ffprobe-verified segments, resume, full-length output |
 | Process-kill + restart E2E (real SIGKILL) | MISSING / INCOMPLETE | teardown-based analogue only |
-| Storage exhaustion (true ENOSPC) | MISSING / INCOMPLETE | `StorageFull` error code never produced; unwritable-dir covers only open-for-write |
+| Storage exhaustion (true ENOSPC) | IMPLEMENTED + VERIFIED (mapping) — device E2E pending | output-write failures carry the AVERROR code; ENOSPC surfaces as terminal `ErrorCode::StorageFull` (subtitle sidecar writes included); a genuinely-full-disk run requires a device/emulator with a small writable partition |
 | Hybrid checkpoints | OUT OF SCOPE (documented D-028) | hybrid jobs restart from zero; non-hybrid long jobs keep segmented recovery |
 
 ## 13. Hardening (spec §23)
@@ -130,46 +131,46 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Scenario | Status |
 |---|---|
 | Truncated source / disappearing source / unwritable destination / malformed media / bad sidecar / damaged checkpoint | IMPLEMENTED + VERIFIED (host CI) |
-| Invalid timestamps fixture | MISSING / INCOMPLETE |
-| Very large metadata | MISSING / INCOMPLETE |
-| Process termination | MISSING / INCOMPLETE (see §12) |
-| Storage exhaustion | MISSING / INCOMPLETE (see §12) |
+| Invalid timestamps fixture | IMPLEMENTED + VERIFIED | MPEG-TS with backward PTS jump mid-stream (fixture verified non-monotonic by packet-level ffprobe): converts honestly or fails with a real error; never fake success, hang, or crash |
+| Very large metadata | IMPLEMENTED + VERIFIED | ~600 KB of container tags: remux preserves them, stripMetadata drops them, output duration/size cross-checked |
+| Process termination | ANALOGUE VERIFIED (teardown-based); real SIGKILL-restart E2E pending a suitable environment (see §12) |
+| Storage exhaustion | IMPLEMENTED + VERIFIED (mapping; see §12) |
 | App upgrade / schema migration | IMPLEMENTED + VERIFIED (v1→v2 ALTER TABLE migration is exercised by job-store tests on old-schema DBs) |
 
 ## 14. Premium UX (spec §18/§19/§20)
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| Screens (Home/Convert/Queue/History/Settings) | IMPLEMENTED (scaffold level) — polish INCOMPLETE | design system tokens + components exist |
-| Advanced controls hidden by default, full control set | PARTIAL: codec/rate-control/bitrate/quality/fps/backend preference work; profile/level/pixfmt/bitdepth/GOP/B-frames/metadata are UI-only "pending contract" (not sent to engine) |
+| Screens (Home/Convert/Queue/History/Settings) | IMPLEMENTED + VERIFIED | all five screens functional against the real engine (inspection, planning, jobs, history, settings); design system tokens + shared components |
+| Advanced controls hidden by default, full control set | IMPLEMENTED + VERIFIED | full engine contract wired through computeRequest: codec, rate control, bitrate/quality, fps, profile, pixel format, bit depth, GOP, B-frames, backend preference, metadata strip, HDR policy; Advanced section collapsed by default |
 | "Custom — based on [preset]" | IMPLEMENTED + VERIFIED | `computeGoalLabel()` |
-| Trim UI | MISSING / INCOMPLETE | `trim` always null in requests |
-| Sample preview flow | MISSING UI (engine ready) |
-| History actions (Open/Play/Share) | MISSING / INCOMPLETE | rendered but disabled |
-| Accessibility pass | INCOMPLETE |
+| Trim UI | IMPLEMENTED + VERIFIED | Convert-screen TrimSection: toggle + start/end steppers (mm:ss), window summary, honest disabled states; plan re-estimates on trim change; engine trim paths host-verified |
+| Sample preview flow | IMPLEMENTED + VERIFIED | SamplePreviewCard on the Convert screen (see §7) |
+| History actions (Open/Play/Share) | IMPLEMENTED + VERIFIED | wired to real output locations (share/play on iOS, delete with file removal, re-use settings) |
+| Accessibility pass | IMPLEMENTED — screen-reader validation pending | full annotation pass: one accessible element per row/card, control+value labels, job-scoped action labels, selected/disabled states announced; VoiceOver/TalkBack behavior on device pending |
 
 ## 15. Performance (spec §24/§25)
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| Planning latency benchmark | IMPLEMENTED (micro-benchmark exists) | CI-visible gates MISSING |
-| Startup / TTFS / bridge overhead / throughput / recovery measurements | MISSING / INCOMPLETE | telemetry records backend throughput (PerfRecord); no systematic measurement/gates |
+| Planning latency benchmark | IMPLEMENTED + VERIFIED | warm-path p95 assertion runs in every host-suite execution (`planner_tests.cpp`, CI-visible) |
+| Startup / TTFS / bridge overhead / throughput / recovery measurements | PARTIAL | telemetry records backend throughput (PerfRecord) and planning timings; systematic startup/TTFS measurement + gates pending |
 | UI responsiveness under load (event coalescing) | IMPLEMENTED (250 ms poll, bounded queue) — not validated under load |
 
 ## 16. Release (spec §26–29)
 
 | Requirement | Status |
 |---|---|
-| Release build variants (Android APK+AAB, iOS Release) | MISSING / INCOMPLETE (debug-only builds; release buildType signs with debug key, R8 off) |
-| Release workflow (gated, checksums, manifest) | MISSING / INCOMPLETE |
-| GitHub Release with real artifacts | MISSING / INCOMPLETE |
+| Release build variants (Android APK+AAB, iOS Release) | IMPLEMENTED + VERIFIED | R8 + resource shrinking with app-specific keeps; CI-secret signing with explicit test-signed fallback; Release iOS builds (simulator + unsigned device) |
+| Release workflow (gated, checksums, manifest) | IMPLEMENTED + VERIFIED | gated release workflow: host tests → artifacts → checksums → manifest → GitHub Release |
+| GitHub Release with real artifacts | IMPLEMENTED + VERIFIED | RC v0.1.0-rc.1 shipped with real APK/AAB/xcframework + checksums; rc.2 pending the current CI cycle |
 
 ## 17. Platform validation
 
 | Area | Status |
 |---|---|
 | Android build (APK with FFmpeg) | IMPLEMENTED + VERIFIED (CI) |
-| Android instrumented tests executed | MISSING / INCOMPLETE (written, never run; emulator CI being added) |
+| Android instrumented tests executed | IMPLEMENTED (emulator CI; API 29 + 34, first green run pending the ubuntu-24.04 pin) | `android-emulated.yml` boots KVM emulators, installs the app, runs NativeConversionTest/HybridConversionTest with cold-launch/relaunch/recovery checks |
 | iOS simulator build with FFmpeg | IMPLEMENTED + VERIFIED (CI) |
-| iOS simulator tests (engine execution) | MISSING / INCOMPLETE (no test target) |
+| iOS simulator tests (engine execution) | IMPLEMENTED (VelmuxEngineTests XCTest target runs via `./scripts/test.sh --ios-sim`; first green run pending the bash-3.2 fix) |
 | Physical-device validation (both platforms) | HARDWARE VALIDATION PENDING (documented; RC notes must state it) |
