@@ -125,10 +125,6 @@ function AdvancedLabel({children}: {children: string}) {
 /**
  * Advanced technical controls. Hidden by default; closing the section
  * never discards changes — all values live in the convert store.
- *
- * Fields marked "pending contract" are part of the product surface but not
- * yet part of the `ConversionRequest` bridge contract; they are kept in
- * the draft until the engine contract is extended.
  */
 export function AdvancedSection() {
   const [open, setOpen] = useState(false);
@@ -236,28 +232,28 @@ export function AdvancedSection() {
             />
           </View>
 
-          <AdvancedLabel>Profile (pending contract)</AdvancedLabel>
+          <AdvancedLabel>Profile</AdvancedLabel>
           <OptionChips
             options={PROFILE_OPTIONS}
             selected={draft.extras.profile}
             onSelect={profile => setExtras({profile})}
           />
 
-          <AdvancedLabel>Level (pending contract)</AdvancedLabel>
+          <AdvancedLabel>Level</AdvancedLabel>
           <OptionChips
             options={LEVEL_OPTIONS}
             selected={draft.extras.level}
             onSelect={level => setExtras({level})}
           />
 
-          <AdvancedLabel>Pixel format (pending contract)</AdvancedLabel>
+          <AdvancedLabel>Pixel format</AdvancedLabel>
           <OptionChips
             options={PIXEL_FORMAT_OPTIONS}
             selected={draft.extras.pixelFormat}
             onSelect={pixelFormat => setExtras({pixelFormat})}
           />
 
-          <AdvancedLabel>Bit depth (pending contract)</AdvancedLabel>
+          <AdvancedLabel>Bit depth</AdvancedLabel>
           <OptionChips
             options={BIT_DEPTH_OPTIONS}
             selected={draft.extras.bitDepth}
@@ -265,7 +261,7 @@ export function AdvancedSection() {
           />
 
           <View style={styles.field}>
-            <AdvancedLabel>GOP size (pending contract)</AdvancedLabel>
+            <AdvancedLabel>GOP size</AdvancedLabel>
             <Stepper
               value={draft.extras.gopSize}
               onChange={gopSize => setExtras({gopSize})}
@@ -278,7 +274,7 @@ export function AdvancedSection() {
           </View>
 
           <View style={styles.field}>
-            <AdvancedLabel>B-frames (pending contract)</AdvancedLabel>
+            <AdvancedLabel>B-frames</AdvancedLabel>
             <Stepper
               value={draft.extras.bFrames}
               onChange={bFrames => setExtras({bFrames})}
@@ -342,7 +338,7 @@ export function AdvancedSection() {
             />
           </View>
 
-          <AdvancedLabel>Metadata behavior (pending contract)</AdvancedLabel>
+          <AdvancedLabel>Metadata behavior</AdvancedLabel>
           <OptionChips
             options={METADATA_OPTIONS}
             selected={draft.extras.metadata}
@@ -357,11 +353,6 @@ export function AdvancedSection() {
               disabled={!draft.advancedDirty}
             />
           </View>
-
-          <AppText variant="micro" tone="muted" style={styles.footnote}>
-            Fields marked "pending contract" are kept with your settings and
-            will be sent to the engine once the bridge contract exposes them.
-          </AppText>
         </View>
       )}
       {!open && draft.advancedDirty && (
@@ -385,9 +376,6 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   resetRow: {
-    marginTop: 4,
-  },
-  footnote: {
     marginTop: 4,
   },
   pressed: {

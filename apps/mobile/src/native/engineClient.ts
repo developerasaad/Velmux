@@ -6,8 +6,13 @@ import type {
   MediaInfo,
   MediaSource,
   ResourceUpdate,
+  SampleResult,
   Spec,
 } from './NativeVelmux';
+
+// Re-exported so UI code can type sample previews without importing
+// from `./NativeVelmux` directly.
+export type {SampleResult} from './NativeVelmux';
 
 /**
  * Typed client for the Velmux native engine (TurboModule `VelmuxEngine`).
@@ -76,6 +81,19 @@ export function plan(request: ConversionRequest): Promise<{
   message: string | null;
 }> {
   return requireModule().plan(request);
+}
+
+/**
+ * Generates a short preview sample of the requested settings over the
+ * densest section of the source (spec §20). Runs on the engine's
+ * background worker; the resolved result carries the sample file path
+ * and its window on the source timeline.
+ */
+export function generateSample(
+  request: ConversionRequest,
+  sampleSeconds: number,
+): Promise<SampleResult> {
+  return requireModule().generateSample(request, sampleSeconds);
 }
 
 export function startJob(request: ConversionRequest): Promise<string> {

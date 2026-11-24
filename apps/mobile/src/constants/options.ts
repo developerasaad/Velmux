@@ -151,3 +151,29 @@ export const PIXEL_FORMATS: readonly string[] = [
 ];
 
 export const BIT_DEPTHS: readonly number[] = [8, 10];
+
+// Geometry and HDR option lists. The literal unions mirror the request
+// contract (`ConversionRequest`: quarter-turn `rotationDegrees`, `hdrPolicy`).
+
+export interface RotationOption {
+  label: string;
+  value: 0 | 90 | 180 | 270;
+}
+
+export const ROTATIONS: readonly RotationOption[] = [
+  {label: 'Original', value: 0},
+  {label: '90°', value: 90},
+  {label: '180°', value: 180},
+  {label: '270°', value: 270},
+];
+
+export interface HdrPolicyOption {
+  label: string;
+  value: 'auto' | 'toneMapToSdr';
+}
+
+/** HDR handling: auto preserves HDR where the output can carry it. */
+export const HDR_POLICIES: readonly HdrPolicyOption[] = [
+  {label: 'Auto', value: 'auto'},
+  {label: 'Tone map to SDR', value: 'toneMapToSdr'},
+];
