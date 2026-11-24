@@ -1,5 +1,5 @@
 import React, {useCallback} from 'react';
-import {Alert, FlatList, RefreshControl, StyleSheet, View} from 'react-native';
+import {FlatList, Platform, RefreshControl, StyleSheet, View} from 'react-native';
 import type {ListRenderItemInfo} from 'react-native';
 import {
   useNavigation,
@@ -11,6 +11,7 @@ import type {NativeStackScreenProps} from '@react-navigation/native-stack';
 import {AppText} from '../components/AppText';
 import {Button} from '../components/Button';
 import {EmptyState} from '../components/EmptyState';
+import {OutputActions} from '../components/OutputActions';
 import {Screen} from '../components/Screen';
 import {formatBytes, formatSavedPercent} from '../format/format';
 import type {JobSnapshot} from '../native/NativeVelmux';
@@ -27,10 +28,10 @@ type HistoryScreenProps = CompositeScreenProps<
 >;
 
 /**
- * Output file actions (Open, Play, Share, Delete) require the output file
- * location, which the current engine contract does not expose in
- * `JobSnapshot`. They are rendered but disabled until the contract is
- * extended; Reuse settings works for jobs started in this JS session.
+ * Completed conversions. Output actions read the engine-reported output
+ * location (`outputPath` in the job snapshot); see OutputActions for the
+ * per-platform story. "Reuse settings" works for jobs started in this JS
+ * session (their request is kept in memory).
  */
 export function HistoryScreen() {
   const theme = useTheme();
@@ -38,25 +39,9 @@ export function HistoryScreen() {
 
   const completedJobs = useJobsStore(selectCompletedJobs);
   const requests = useJobsStore(state => state.requests);
+  const clearBatch = useJobsStore(state => state.clearBatch);
   const refreshing = useJobsStore(state => state.refreshing);
   const refresh = useJobsStore(state => state.refresh);
-
-  const confirmDelete = useCallback((job: JobSnapshot) => {
-    Alert.alert(
-      'Delete output',
-      `Delete the converted output of "${job.sourceName}"? The original file is never touched.`,
-      [
-        {text: 'Keep output', style: 'cancel'},
-        {
-          text: 'Delete output',
-          style: 'destructive',
-          onPress: () => {
-            // Requires the output file location from the engine contract.
-          },
-        },
-      ],
-    );
-  }, []);
 
   const renderItem = useCallback(
     ({item}: ListRenderItemInfo<JobSnapshot>) => {
@@ -83,9 +68,7 @@ export function HistoryScreen() {
             </AppText>
           )}
           <View style={styles.actions}>
-            <Button label="Open" variant="secondary" disabled onPress={() => {}} />
-            <Button label="Play" variant="secondary" disabled onPress={() => {}} />
-            <Button label="Share" variant="secondary" disabled onPress={() => {}} />
+            <OutputActions job={item} />
             <Button
               label="Reuse settings"
               variant="secondary"
@@ -94,6 +77,9 @@ export function HistoryScreen() {
                 if (!request) {
                   return;
                 }
+                // Entering the workspace from History is a single-file
+                // intent — never piggyback on a staged Home batch.
+                clearBatch();
                 navigation.navigate('Convert', {
                   source: request.source,
                   intent: 'reuse',
@@ -101,17 +87,11 @@ export function HistoryScreen() {
                 });
               }}
             />
-            <Button
-              label="Delete"
-              variant="dangerGhost"
-              disabled
-              onPress={() => confirmDelete(item)}
-            />
           </View>
         </View>
       );
     },
-    [confirmDelete, navigation, requests, theme.colors.surface],
+    [clearBatch, navigation, requests, theme.colors.surface],
   );
 
   const empty = completedJobs.length === 0;
@@ -149,9 +129,9 @@ export function HistoryScreen() {
           completedJobs.length > 0 ? (
             <View style={styles.footerNote}>
               <AppText variant="micro" tone="muted">
-                Open, Play, Share and Delete need the output file location,
-                which the engine does not expose yet. Reuse settings is
-                available for jobs started in this session.
+                {Platform.OS === 'ios'
+                  ? 'Share opens the system share sheet with the converted file. Remove clears the history record — the output file itself is kept.'
+                  : 'Android requires a content provider before other apps can receive the output file, which this build does not wire up yet — Share arrives with it. Remove clears the history record; the output file is kept.'}
               </AppText>
             </View>
           ) : undefined

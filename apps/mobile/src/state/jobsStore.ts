@@ -1,9 +1,13 @@
 import {create} from 'zustand';
 
-import {isJobState} from '../constants/jobStates';
+import {isJobState, isTerminalJob} from '../constants/jobStates';
 import * as engineClient from '../native/engineClient';
 import {EngineBridgeUnavailable} from '../native/engineClient';
-import type {ConversionRequest, JobSnapshot} from '../native/NativeVelmux';
+import type {
+  ConversionRequest,
+  JobSnapshot,
+  MediaSource,
+} from '../native/NativeVelmux';
 
 /**
  * Job state as observed from the engine. React Native is never the source
@@ -17,6 +21,28 @@ export const BRIDGE_UNAVAILABLE_MESSAGE =
 
 const EVENT_FLUSH_INTERVAL_MS = 250;
 
+/**
+ * A multi-file batch staged by Home's multi-select flow. The workspace
+ * opens with the primary file; when Start is pressed, one job is created
+ * per picked file with the same settings (source swapped per file).
+ */
+export interface PendingBatch {
+  /** URI of the file the conversion workspace opens with (first pick). */
+  primaryUri: string;
+  /** Remaining picks; each becomes its own job with identical settings. */
+  extraSources: MediaSource[];
+}
+
+/** Per-file outcome of the most recent batch start, for Home feedback. */
+export interface BatchStartOutcome {
+  /** Number of picked files in the batch. */
+  total: number;
+  /** Number of jobs successfully handed to the engine. */
+  started: number;
+  /** Files that could not start, with the engine's reason. */
+  failures: {name: string; reason: string}[];
+}
+
 export interface JobsState {
   /** Whether the native engine module is present in this build. */
   bridgeAvailable: boolean;
@@ -26,6 +52,10 @@ export interface JobsState {
   jobs: JobSnapshot[];
   /** Requests for jobs started from this JS session, keyed by job id. */
   requests: Record<string, ConversionRequest>;
+  /** Batch staged by Home multi-select, consumed by the next `startJob`. */
+  pendingBatch: PendingBatch | null;
+  /** Outcome of the most recent batch start; Home consumes it once. */
+  lastBatchStart: BatchStartOutcome | null;
   /** Backend registry summary from `describeBackends()`. */
   backends: string[] | null;
   backendsError: string | null;
@@ -35,6 +65,16 @@ export interface JobsState {
   init: () => Promise<void>;
   refresh: () => Promise<void>;
   discoverBackends: () => Promise<void>;
+  /**
+   * Stages a multi-file batch (Home "Convert N files"). The conversion
+   * workspace still opens with a single primary source; the extras are
+   * started as their own jobs by the next `startJob` from that workspace.
+   */
+  beginBatch: (primary: MediaSource, extras: MediaSource[]) => void;
+  /** Drops any staged batch (single-file flow taking over, or reuse). */
+  clearBatch: () => void;
+  /** Returns (and clears) the last batch outcome, for one-shot feedback. */
+  consumeBatchStart: () => BatchStartOutcome | null;
   startJob: (request: ConversionRequest) => Promise<string>;
   cancelJob: (jobId: string) => Promise<boolean>;
   pauseJob: (jobId: string) => Promise<boolean>;
@@ -108,11 +148,29 @@ function scheduleRefresh() {
 
 let initStarted = false;
 
+/**
+ * Clones a computed request for another source of the same batch: every
+ * setting carries over unchanged, only the source (and the engine-derived
+ * output name) differs per file. Requests are JSON-shaped by the bridge
+ * contract, so a JSON round-trip is a faithful deep copy and keeps the
+ * per-file records independent for retry/reuse.
+ */
+function withSource(
+  request: ConversionRequest,
+  source: MediaSource,
+): ConversionRequest {
+  const clone = JSON.parse(JSON.stringify(request)) as ConversionRequest;
+  clone.source = source;
+  return clone;
+}
+
 export const useJobsStore = create<JobsState>()((set, get) => ({
   bridgeAvailable: false,
   engineError: null,
   jobs: [],
   requests: {},
+  pendingBatch: null,
+  lastBatchStart: null,
   backends: null,
   backendsError: null,
   initialized: false,
@@ -194,11 +252,87 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
     }
   },
 
+  beginBatch: (primary, extras) => {
+    set({
+      pendingBatch:
+        extras.length > 0
+          ? {primaryUri: primary.uri, extraSources: extras}
+          : null,
+    });
+  },
+
+  clearBatch: () => {
+    set({pendingBatch: null});
+  },
+
+  consumeBatchStart: () => {
+    const outcome = get().lastBatchStart;
+    if (outcome !== null) {
+      set({lastBatchStart: null});
+    }
+    return outcome;
+  },
+
   startJob: async request => {
-    const jobId = await engineClient.startJob(request);
-    set(state => ({requests: {...state.requests, [jobId]: request}}));
+    const batch = get().pendingBatch;
+    const batchApplies =
+      batch !== null &&
+      batch.primaryUri === request.source.uri &&
+      batch.extraSources.length > 0;
+    if (batch !== null && !batchApplies) {
+      // Stale batch: the user re-picked or entered the workspace another
+      // way. It must not leak into an unrelated conversion.
+      set({pendingBatch: null});
+    }
+    if (!batchApplies) {
+      const jobId = await engineClient.startJob(request);
+      set(state => ({requests: {...state.requests, [jobId]: request}}));
+      await get().refresh();
+      return jobId;
+    }
+
+    // Batch start: one job per picked file, same settings, source swapped
+    // per file. Sequential awaits are fine — the engine's scheduler owns
+    // real concurrency and resource caps. A file that fails to start (for
+    // example an unreadable source) never aborts the rest; failures are
+    // collected and surfaced by Home once the workspace closes.
+    const sources = [request.source, ...batch.extraSources];
+    const startedIds: string[] = [];
+    const failures: {name: string; reason: string}[] = [];
+    for (const source of sources) {
+      const perFile: ConversionRequest =
+        source === request.source ? request : withSource(request, source);
+      try {
+        const jobId = await engineClient.startJob(perFile);
+        set(state => ({requests: {...state.requests, [jobId]: perFile}}));
+        startedIds.push(jobId);
+      } catch (error) {
+        failures.push({
+          name: source.displayName,
+          reason: engineClient.describeEngineError(error),
+        });
+      }
+    }
+    if (startedIds.length === 0) {
+      // Total failure: rethrow so the workspace shows the engine errors and
+      // the user can retry. The batch stays staged so a retry resubmits all
+      // files, not just the primary one.
+      throw new Error(
+        failures.map(f => `${f.name}: ${f.reason}`).join('\n'),
+      );
+    }
+    set({
+      pendingBatch: null,
+      lastBatchStart: {
+        total: sources.length,
+        started: startedIds.length,
+        failures,
+      },
+    });
     await get().refresh();
-    return jobId;
+    // The workspace treats the promise as "the flow started"; the primary
+    // file's job id keeps that contract.
+    return startedIds[0];
   },
 
   cancelJob: async jobId => {
@@ -230,6 +364,9 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
       if (!request) {
         return null;
       }
+      // A retry is a single-file intent; it must never piggyback on a
+      // staged Home batch that happens to share the primary source URI.
+      get().clearBatch();
       return get().startJob(request);
     }
     await get().refresh();
@@ -271,6 +408,16 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
     }));
     if (unknownIds.size > 0) {
       scheduleRefresh();
+      return;
+    }
+    // Terminal transitions need a full snapshot refresh: job events carry
+    // state/progress/output size but not the output location, which
+    // History's share/delete actions read from the snapshot.
+    for (const event of events.values()) {
+      if (isJobState(event.state) && isTerminalJob(event.state)) {
+        scheduleRefresh();
+        return;
+      }
     }
   },
 }));
