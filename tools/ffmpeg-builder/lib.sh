@@ -279,7 +279,16 @@ compute_identity() {
   done
   case "$target" in
     host)
-      inputs+=("toolchain=cc:$(cc -dumpversion 2>/dev/null || gcc -dumpversion 2>/dev/null || echo unknown)")
+      # Host artifacts are development/test-only (spec §7) and must stay
+      # reusable across machines of the same platform family: FFmpeg is
+      # pure C, so its static libraries are ABI-compatible across compiler
+      # versions on the same OS/arch (and a newer consumer glibc always
+      # runs binaries linked against an older one). The exact compiler
+      # version is recorded in BUILD-IDENTITY provenance, NOT in the
+      # matching identity, so a CI-built host prefix can be downloaded and
+      # reused locally. Android/iOS keep their strict cross-toolchain
+      # identity below — those artifacts ship inside apps.
+      inputs+=("toolchain=host:$(uname -s)-$(uname -m)")
       ;;
     android)
       local ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"

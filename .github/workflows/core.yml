@@ -99,6 +99,21 @@ jobs:
             tools/ffmpeg-builder/downloads
           key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
 
+      - name: Upload host FFmpeg artifact
+        # The host prefix is a development/test artifact (spec §7). CI is
+        # the canonical builder; uploading it lets local development
+        # environments download and reuse the exact pinned prefix instead
+        # of rebuilding it (the identity is platform-level, so the same
+        # artifact validates on any Linux x86_64 host). Kept small by
+        # excluding the downloaded tarball cache.
+        if: steps.host-suite.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-host-${{ steps.ffid.outputs.identity }}
+          path: tools/ffmpeg-builder/out/host
+          retention-days: 14
+          if-no-files-found: error
+
       # Runs only when a .clang-format file exists at the repository root;
       # hashFiles returns an empty string otherwise and the step is skipped
       # silently. (A lint, not build logic — it stays in CI.)
