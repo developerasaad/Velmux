@@ -72,25 +72,28 @@ fi
 
 # ---------------------------------------------------------------------------
 # Xcode build. Raw output (no xcpretty): it hides compile diagnostics.
+# Deterministic -derivedDataPath so test/package scripts can locate the
+# products: simulator -> build/, device -> build-device/ (both gitignored).
 # ---------------------------------------------------------------------------
 case "$SDK_KIND" in
   device)
     XCODE_SDK="iphoneos"
-    DEST=""
+    DERIVED="build-device"
     SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='')
     ;;
   simulator)
     XCODE_SDK="iphonesimulator"
-    DEST=""
+    DERIVED="build"
     SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO)
     ;;
 esac
 
 vlog "building iOS app ($BUILD_TYPE, $SDK_KIND)"
 run_in "$IOS_DIR" xcodebuild -workspace Velmux.xcworkspace -scheme Velmux \
-  -configuration "$BUILD_TYPE" -sdk "$XCODE_SDK" $DEST \
+  -configuration "$BUILD_TYPE" -sdk "$XCODE_SDK" \
+  -derivedDataPath "$DERIVED" \
   MARKETING_VERSION="${VELMUX_VERSION_NAME%%-*}" \
   CURRENT_PROJECT_VERSION="$VELMUX_VERSION_CODE" \
   build "${SIGN_ARGS[@]}"
 
-vlog "iOS build complete ($BUILD_TYPE, $SDK_KIND)"
+vlog "iOS build complete ($BUILD_TYPE, $SDK_KIND; products in $IOS_DIR/$DERIVED/Build/Products)"

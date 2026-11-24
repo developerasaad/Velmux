@@ -18,8 +18,9 @@ STAGING="$1"
 mkdir -p "$STAGING"
 
 IOS_DIR="$VELMUX_ROOT/$VELMUX_APP_IOS_DIR"
-SIM_APP="$IOS_DIR/build-release/Build/Products/Release-iphonesimulator/Velmux.app"
-DEV_APP="$IOS_DIR/build-release-device/Build/Products/Release-iphoneos/Velmux.app"
+# Deterministic derived-data locations written by scripts/ios/build.sh.
+SIM_APP="$IOS_DIR/build/Build/Products/Release-iphonesimulator/Velmux.app"
+DEV_APP="$IOS_DIR/build-device/Build/Products/Release-iphoneos/Velmux.app"
 [ -d "$SIM_APP" ] || vdie "simulator Release .app not found; run scripts/ios/build.sh --release --sdk simulator first"
 [ -d "$DEV_APP" ] || vdie "device Release .app not found; run scripts/ios/build.sh --release --sdk device first"
 

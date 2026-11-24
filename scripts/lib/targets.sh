@@ -44,46 +44,52 @@ validate_api_level() {
 # build.sh argument parsing
 # ---------------------------------------------------------------------------
 # Outputs (echo, one per line — callers read with mapfile):
-#   android | ios | ffmpeg-host | ffmpeg-android | ffmpeg-ios
+#   targets:<comma-separated>   (android, ios, ffmpeg-host, ffmpeg-android,
+#                                ffmpeg-ios)
 #   release | debug
 #   abis:<space-separated>
 #   jobs:<n>
 parse_build_args() {
-  local target="" build_type="debug" abis="$VELMUX_ANDROID_DEFAULT_ABI" \
+  local targets="" build_type="debug" abis="$VELMUX_ANDROID_DEFAULT_ABI" \
         all_abis="no" jobs="${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+  local has_android=0 has_ios=0
+  add_target() {
+    case " $targets " in
+      *" $1 "*) ;;
+      *) targets="$targets $1" ;;
+    esac
+  }
   while [ $# -gt 0 ]; do
     case "$1" in
-      --android|--ios|--ffmpeg|--ffmpeg-host|--ffmpeg-android|--ffmpeg-ios)
-        [ -z "$target" ] || vdie "only one target may be given"
-        case "$1" in
-          --android) target="android" ;;
-          --ios) target="ios" ;;
-          --ffmpeg|--ffmpeg-host) target="ffmpeg-host" ;;
-          --ffmpeg-android) target="ffmpeg-android" ;;
-          --ffmpeg-ios) target="ffmpeg-ios" ;;
-        esac
-        ;;
+      --android) add_target android; has_android=1 ;;
+      --ios) add_target ios; has_ios=1 ;;
+      --ffmpeg|--ffmpeg-host) add_target ffmpeg-host ;;
+      --ffmpeg-android) add_target ffmpeg-android; has_android=1 ;;
+      --ffmpeg-ios) add_target ffmpeg-ios ;;
       --release) build_type="release" ;;
       --debug) build_type="debug" ;;
       --abi) shift; [ $# -gt 0 ] || vdie "--abi requires a value"; abis="$1" ;;
       --abi=*) abis="${1#--abi=}" ;;
+      # Bare ABI/arch flags from the documented examples
+      # (./scripts/build.sh --android --arm64-v8a --release).
+      --arm64-v8a|--armeabi-v7a|--x86_64) abis="${1#--}" ;;
+      --arm64) ;; # iOS device arch: fixed by policy; accepted for symmetry
       --all-abis) all_abis="yes" ;;
       --jobs) shift; [ $# -gt 0 ] || vdie "--jobs requires a value"; jobs="$1" ;;
       --jobs=*) jobs="${1#--jobs=}" ;;
-      -h|--help) build_sh_usage; exit 0 ;;
+      -h|--help) build_sh_usage >&2; exit 0 ;;
       *) vdie "unknown build.sh option: $1" ;;
     esac
     shift
   done
-  [ -n "$target" ] || { build_sh_usage >&2; vdie "no target given"; }
+  [ -n "${targets# }" ] || { build_sh_usage >&2; vdie "no target given"; }
   if [ "$all_abis" = "yes" ]; then
-    [ "$target" = "ffmpeg-android" ] || [ "$target" = "android" ] \
-      || vdie "--all-abis applies to Android targets only"
+    [ "$has_android" = "1" ] || vdie "--all-abis applies to Android targets only"
     abis="$VELMUX_ANDROID_ALL_ABIS"
   fi
   abis="$(normalize_abi_list "$abis")"
   case "$jobs" in ''|*[!0-9]*) vdie "--jobs must be a positive integer" ;; esac
-  echo "$target"
+  echo "targets:${targets# }"
   echo "$build_type"
   echo "abis:$abis"
   echo "jobs:$jobs"
@@ -93,7 +99,7 @@ build_sh_usage() {
   cat <<'EOF'
 Usage: ./scripts/build.sh <target> [options]
 
-Targets (exactly one):
+Targets (one or more):
   --android          Android app (APK; AAB with --release)
   --ios              iOS app (device arm64; the simulator is a test target
                      only — use ./scripts/test.sh --ios-sim)
@@ -135,7 +141,7 @@ parse_test_args() {
       --api=*) api="${1#--api=}" ;;
       --abi) shift; [ $# -gt 0 ] || vdie "--abi requires a value"; abi="$1" ;;
       --abi=*) abi="${1#--abi=}" ;;
-      -h|--help) test_sh_usage; exit 0 ;;
+      -h|--help) test_sh_usage >&2; exit 0 ;;
       *) vdie "unknown test.sh option: $1" ;;
     esac
     shift

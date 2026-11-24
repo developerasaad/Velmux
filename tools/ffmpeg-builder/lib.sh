@@ -124,7 +124,9 @@ fetch_tarball() {
   for u in "${urls[@]}"; do
     log "downloading $name $version from $u"
     if curl -fsL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
-        --retry 3 --connect-timeout 30 -o "$dest" "$u"; then ok=1; break; fi
+        --retry 3 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 60 --max-time 900 \
+        -o "$dest" "$u"; then ok=1; break; fi
     rm -f "$dest"
   done
   [ "$ok" = "1" ] || die "failed to download $name from any listed URL"
@@ -157,7 +159,11 @@ fetch_ffmpeg() {
   local ok=0
   for u in "${urls[@]}"; do
     log "downloading ffmpeg $version from $u"
-    if curl -fL --retry 3 --connect-timeout 30 -o "$dest" "$u"; then ok=1; break; fi
+    # Stall protection: some mirrors accept the connection then stall the
+    # body forever (nasm.us did exactly that from CI networks).
+    if curl -fL --retry 3 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 60 --max-time 900 \
+        -o "$dest" "$u"; then ok=1; break; fi
     rm -f "$dest"
   done
   [ "$ok" = "1" ] || die "failed to download ffmpeg from any listed URL"

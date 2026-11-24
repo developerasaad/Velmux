@@ -21,8 +21,11 @@ VELMUX_HOST_BUILD_DIR="build/host"
 # ---------------------------------------------------------------------------
 # Android
 # ---------------------------------------------------------------------------
-# Product floor (docs/DECISIONS.md D-003).
+# Product floor (docs/DECISIONS.md D-003). Exported so the FFmpeg builder
+# child process computes the SAME identity knob (api=...) as fetch.sh —
+# the centralized policy is the single source for both.
 VELMUX_ANDROID_MIN_API="29"
+export VELMUX_ANDROID_API="${VELMUX_ANDROID_API:-$VELMUX_ANDROID_MIN_API}"
 # The default ABI for product and release builds (spec: Android ARM64 by
 # default). The other ABIs remain supported through --abi.
 VELMUX_ANDROID_DEFAULT_ABI="arm64-v8a"

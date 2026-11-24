@@ -126,6 +126,10 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
     initStarted = true;
 
     if (!engineClient.isEngineAvailable()) {
+      // Permanent startup marker: proves the JS runtime reached app init and
+      // reports the bridge state. Appears in logcat / the unified log, so
+      // automated runs (and field diagnostics) can verify RN initialization.
+      console.info('[Velmux] app init: native bridge unavailable');
       set({
         bridgeAvailable: false,
         engineError: BRIDGE_UNAVAILABLE_MESSAGE,
@@ -134,6 +138,7 @@ export const useJobsStore = create<JobsState>()((set, get) => ({
       return;
     }
 
+    console.info('[Velmux] app init: native bridge available');
     set({bridgeAvailable: true, engineError: null});
     // The subscription intentionally lives for the whole JS session; job
     // events must flow regardless of which screen is mounted.
