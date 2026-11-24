@@ -316,6 +316,7 @@ ZPC
       >/dev/null
     cmake --build "$x265_build" >/dev/null
     cmake --install "$x265_build" >/dev/null
+    sanitize_x265_pc "$SLICE_PREFIX"
     log "[$slice] x265 installed"
   fi
 

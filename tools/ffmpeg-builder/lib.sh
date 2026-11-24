@@ -117,6 +117,21 @@ patch_x265_cmake4_compat() {
   fi
 }
 
+# sanitize_x265_pc <prefix> — clean the generated x265.pc after install.
+# x265's CMakeLists turns CMAKE_CXX_IMPLICIT_LINK_LIBRARIES into
+# Libs.private by prepending -l to every entry; cross toolchains that
+# supply an already-prefixed driver ("-l:libunwind.a", as the Android
+# NDK does for its unwinder) produce a malformed doubled entry
+# ("-l-l:libunwind.a") that no linker can resolve — FFmpeg's configure
+# then reports "x265 not found using pkg-config". The cross linker adds
+# its unwinder implicitly anyway, so the entry is simply dropped.
+sanitize_x265_pc() {
+  local pc="$1/lib/pkgconfig/x265.pc"
+  [ -f "$pc" ] || return 0
+  sed -i -E 's/[[:space:]]-l-l:[^[:space:]]+//g; s/[[:space:]]-l:libunwind\.a//g' "$pc"
+  log "sanitized x265.pc implicit-lib entries"
+}
+
 # ua_for_url <url> — print the User-Agent to use for a host, if any.
 # Some hosts (code.videolan.org) reject plain curl/wget requests and need
 # a browser-like UA; others (gitlab.com) run bot protection that REJECTS

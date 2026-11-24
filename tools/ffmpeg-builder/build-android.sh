@@ -259,6 +259,7 @@ ZPC
       >/dev/null
     cmake --build "$x265_build" >/dev/null
     cmake --install "$x265_build" >/dev/null
+    sanitize_x265_pc "$prefix"
     log "[$abi] x265 installed"
   fi
 
