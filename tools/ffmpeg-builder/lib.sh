@@ -329,6 +329,13 @@ _hash_input_line() {
 #   host  -> cc -dumpversion
 #   android -> NDK Pkg.Revision from ANDROID_NDK_HOME/ROOT source.properties
 #   ios   -> xcodebuild -version (first line)
+#
+# VELMUX_IDENTITY_DEBUG=1 prints every input line to stderr before hashing:
+# an identity mismatch between two computations of the same tree was once
+# observed on CI with no way to tell WHICH input diverged (observed
+# 2026-11-24: fetch.sh expected f74b3f31..., the builder recorded
+# a6e23b0c... seconds later, same checkout); with the dump the diverging
+# line (file hash, knob, or toolchain string) is visible in the log.
 compute_identity() {
   local target="$1"; shift
   local inputs=()
@@ -365,9 +372,20 @@ compute_identity() {
       inputs+=("toolchain=ndk:$rev")
       ;;
     ios)
-      inputs+=("toolchain=xcode:$(xcodebuild -version 2>/dev/null | head -1 | tr -d '\n' || echo unknown)")
+      # NB: the obvious `$(xcodebuild ... ) || echo unknown` does NOT do
+      # what it looks like: || binds to the last pipeline element (tr),
+      # which exits 0 on empty input, so an xcodebuild hiccup silently
+      # produced an EMPTY toolchain string instead of 'unknown'. Capture
+      # explicitly and substitute when empty.
+      local xcode_line=""
+      xcode_line="$(xcodebuild -version 2>/dev/null | head -1 | tr -d '\n' || true)"
+      [ -n "$xcode_line" ] || xcode_line="unknown"
+      inputs+=("toolchain=xcode:$xcode_line")
       ;;
   esac
+  if [ "${VELMUX_IDENTITY_DEBUG:-0}" = "1" ]; then
+    printf 'identity-input: %s\n' "${inputs[@]}" >&2
+  fi
   printf '%s\n' "${inputs[@]}" | sha256sum | cut -d' ' -f1
 }
 

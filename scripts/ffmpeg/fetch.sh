@@ -68,6 +68,11 @@ artifact_ok() {
     vwarn "artifact check: identity mismatch for $dir"
     vwarn "  expected identity: $identity"
     vwarn "  recorded identity: $(identity_recorded "$dir")"
+    # The recorded provenance (built-date, description with the build-time
+    # knobs) narrows down WHEN and WITH WHAT KNOBS the artifact was made.
+    while IFS= read -r line; do
+      [ -n "$line" ] && vwarn "  recorded provenance: $line"
+    done < <(sed -n '2,4p' "$dir/BUILD-IDENTITY" 2>/dev/null)
     return 1
   fi
   return 0
@@ -151,6 +156,13 @@ case "$TARGET" in
       refresh_prefixes "$OUT_DIR/ios/iphoneos" "$OUT_DIR/ios/iphonesimulator"
     else
       vlog "building FFmpeg iOS artifacts (missing or stale)"
+      # The expected identities are passed to the builder: it records
+      # exactly what this gate verifies (single source of truth) and
+      # cross-asserts them against its own computation, failing fast with
+      # a full input dump if the environment diverges between the two
+      # computations (observed once on CI; see build_one_slice).
+      VELMUX_IOS_EXPECTED_DEVICE_IDENTITY="$DEVICE_IDENTITY" \
+      VELMUX_IOS_EXPECTED_SIM_ARM64_IDENTITY="$SIM_IDENTITY" \
       VELMUX_IOS_DEPLOYMENT_TARGET="$VELMUX_IOS_DEPLOYMENT_TARGET" \
         bash "$BUILDER/build-ios.sh"
       artifact_ok "$OUT_DIR/ios/iphoneos" "$DEVICE_IDENTITY" \

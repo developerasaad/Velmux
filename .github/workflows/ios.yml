@@ -98,6 +98,35 @@ jobs:
         id: device-build
         run: ./scripts/build.sh --ios --release
 
+      # Diagnostics on failure: the BUILD-IDENTITY files (recorded hash +
+      # provenance of every FFmpeg layout/slice) and the simulator test
+      # diagnostics. Without these, an identity-gate failure leaves nothing
+      # to diagnose from (the 2026-11-24 mismatch was undiagnosable from
+      # the log alone).
+      - name: Collect FFmpeg identity diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/ffdiag
+          for f in \
+              tools/ffmpeg-builder/out/ios/iphoneos/BUILD-IDENTITY \
+              tools/ffmpeg-builder/out/ios/iphonesimulator/BUILD-IDENTITY \
+              tools/ffmpeg-builder/out/ios/slices/*/BUILD-IDENTITY \
+              tools/ffmpeg-builder/out/ios/manifest.json; do
+            if [ -f "$f" ]; then
+              cp "$f" "/tmp/ffdiag/$(printf '%s' "$f" | tr '/' '_')"
+            fi
+          done
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-ios-diag
+          path: |
+            /tmp/ffdiag
+            apps/mobile/ios/sim-test-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Save FFmpeg artifacts
         # Save only after the builds succeeded and only when this run
         # actually built something (no exact cache hit), so a partial

@@ -220,12 +220,48 @@ c = '/usr/bin/clang'
 EOF
 }
 
+# expected_identity_for_slice <slice> — the identity fetch.sh computed and
+# will verify after the build (empty when the builder runs standalone, in
+# which case the local computation is the only one).
+expected_identity_for_slice() {
+  case "$1" in
+    device-arm64) printf '%s' "${VELMUX_IOS_EXPECTED_DEVICE_IDENTITY:-}" ;;
+    sim-arm64) printf '%s' "${VELMUX_IOS_EXPECTED_SIM_ARM64_IDENTITY:-}" ;;
+    sim-x86_64) printf '%s' "${VELMUX_IOS_EXPECTED_SIM_X86_64_IDENTITY:-}" ;;
+    *) printf '' ;;
+  esac
+}
+
 build_one_slice() {
   local slice="$1"
   slice_settings "$slice"
   local manifest="$SLICE_PREFIX/share/velmux/ffmpeg-capabilities.json"
   local identity
   identity="$(compute_identity ios "slice=$slice" "deployment=$DEPLOYMENT_TARGET" "svt=$SLICE_WANT_SVT")"
+  # fetch.sh (the only caller in CI and app builds) passes the identity it
+  # will verify afterwards — single source of truth: the artifact records
+  # exactly the identity the gate expects, so the gate can never disagree
+  # with what the builder wrote. Cross-assert against the local
+  # computation: a divergence means the environment changed between the
+  # two computations (observed once on CI, 2026-11-24: same checkout,
+  # seconds apart, different hashes, cause invisible because the inputs
+  # were not logged). Failing HERE — before a 14-minute build — with the
+  # full local input list makes the diverging line visible in the log.
+  local expected
+  expected="$(expected_identity_for_slice "$slice")"
+  if [ -n "$expected" ]; then
+    if [ "$expected" != "$identity" ]; then
+      log "[$slice] identity divergence between fetch.sh and the builder:"
+      log "  expected (fetch.sh):    $expected"
+      log "  local computation:      $identity"
+      log "  local identity inputs:"
+      VELMUX_IDENTITY_DEBUG=1 \
+        compute_identity ios "slice=$slice" "deployment=$DEPLOYMENT_TARGET" \
+        "svt=$SLICE_WANT_SVT" > /dev/null
+      die "[$slice] the builder computed a different build identity than "
+          "its caller; refusing to record a mismatching identity"
+    fi
+  fi
   if [ -f "$SLICE_PREFIX/lib/pkgconfig/libavcodec.pc" ] && [ -f "$manifest" ] \
      && identity_matches "$SLICE_PREFIX" "$identity"; then
     log "[$slice] build up to date (identity verified)"
