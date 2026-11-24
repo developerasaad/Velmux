@@ -32,7 +32,9 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API=""
 ABI="$VELMUX_ANDROID_EMULATOR_ABI"
 AVD_NAME="velmux-api${API}"
-DIAG_DIR=""
+# Diagnostics land in a fixed, CI-uploadable location (overridable for
+# local runs). collect_diagnostics is EXIT-trapped: bounded copies only.
+DIAG_DIR="${VELMUX_EMULATOR_DIAG_DIR:-/tmp/diag}"
 EMU_LOG=""
 
 usage() {
@@ -62,6 +64,9 @@ esac
 
 collect_diagnostics() {
   local rc=$?
+  # Collect only on failure: a green run must not pay the bugreport tax
+  # (up to 90s) or litter CI with diagnostic artifacts.
+  [ "$rc" -eq 0 ] && return 0
   [ -n "$DIAG_DIR" ] || return 0
   mkdir -p "$DIAG_DIR"
   vlog "collecting diagnostics into $DIAG_DIR"
@@ -268,3 +273,9 @@ sleep 3
 verify_launch "relaunch"
 
 vlog "emulator test run complete (API $API)"
+
+# Graceful shutdown so local runs do not leave an emulator burning CPU
+# (CI runners are ephemeral; this is a no-op cost there).
+adb_t emu kill
+sleep 3
+pgrep -x emulator > /dev/null 2>&1 && pkill -x emulator 2>/dev/null || true
