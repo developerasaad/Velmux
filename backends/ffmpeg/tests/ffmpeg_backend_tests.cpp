@@ -311,6 +311,39 @@ std::string subtitleCodecName(const std::string &path) {
   return name;
 }
 
+// Runs ffprobe and returns the first csv value of a stream field for the
+// given stream selector (e.g. "a:0" language, "v:0" color_trc). Empty when
+// the field is absent.
+std::string streamFieldOf(const std::string &path,
+                          const std::string &streamSelector,
+                          const std::string &field) {
+  const std::string cmd =
+      ffprobeBin() + " -v error -select_streams " + streamSelector +
+      " -show_entries " + field + " -of csv=p=0 \"" + path + "\" 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  std::string value;
+  char line[256];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    std::string entry = line;
+    while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
+      entry.pop_back();
+    }
+    if (!entry.empty()) {
+      value = entry;
+    }
+  }
+  ::pclose(pipe);
+  return value;
+}
+
+// True when the file carries a video stream flagged attached_pic (the
+// cover-art / attached-picture disposition).
+bool hasAttachedPic(const std::string &path) {
+  return streamFieldOf(path, "v", "stream_disposition.attached_pic") ==
+         "1";
+}
+
 } // namespace
 
 TEST_CASE("capability report derives from the real compiled build") {
@@ -2273,4 +2306,214 @@ TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") 
   } else {
     CHECK(plan.error().message.size() > 0);
   }
+}
+
+TEST_CASE("REAL multi-track audio: allTracks carries every lane with language") {
+  TestEnv env;
+  // A two-audio-lane MKV (eng + fra), the shape real multi-language media
+  // has. Built directly with the ffmpeg binary: three lavfi inputs, one
+  // video + two distinct audio lanes, each tagged with its language.
+  const std::string multi = (env.dir / "multi.mkv").string();
+  REQUIRE(std::system(
+              (ffmpegBin() + " -y -hide_banner -loglevel error "
+               "-filter_complex \"testsrc2=size=320x240:rate=12[v];"
+               "sine=frequency=440:sample_rate=44100[a1];"
+               "sine=frequency=880:sample_rate=44100[a2]\" "
+               "-map \"[v]\" -map \"[a1]\" -map \"[a2]\" "
+               "-c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 64k "
+               "-metadata:s:a:0 language=eng -metadata:s:a:1 language=fra "
+               "-pix_fmt yuv420p -t 2 \"" + multi + "\"")
+                  .c_str()) == 0);
+  REQUIRE(countStreams(multi, "a") == 2);
+
+  ConversionRequest request =
+      transcodeRequest(multi, Container::Mkv, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.audio.allTracks = true;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto snap = env.engine->getJob(jobId.value());
+  REQUIRE(snap.has_value());
+  // Every source lane survives the transcode, with its language metadata.
+  CHECK(countStreams(snap->outputPath, "a") == 2);
+  CHECK(streamFieldOf(snap->outputPath, "a:0", "stream_tags.language") ==
+        "eng");
+  CHECK(streamFieldOf(snap->outputPath, "a:1", "stream_tags.language") ==
+        "fra");
+  const ProbeResult probe = probeWith(snap->outputPath);
+  CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+}
+
+TEST_CASE("REAL replace audio: external audio rides the video timeline") {
+  TestEnv env;
+  // A normal video+audio fixture; the product case replaces the EXISTING
+  // audio lane with an external file.
+  const std::string video = generateFixture(
+      env.dir / "v.mp4", "testsrc2=size=320x240:rate=12",
+      "sine=frequency=440:sample_rate=44100", 3.0);
+  // A distinct replacement lane (different tone, DIFFERENT length — the
+  // honest outcome must follow the video timeline, not the audio file).
+  const std::string replacement = (env.dir / "replacement.m4a").string();
+  REQUIRE(std::system(
+              (ffmpegBin() + " -y -hide_banner -loglevel error "
+               "-filter_complex \"sine=frequency=880:sample_rate=44100[a]\" "
+               "-map \"[a]\" -c:a aac -b:a 96k -t 2 \"" + replacement +
+               "\"")
+                  .c_str()) == 0);
+
+  ConversionRequest request =
+      transcodeRequest(video, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.audio.replaceAudioUri = replacement;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto snap = env.engine->getJob(jobId.value());
+  REQUIRE(snap.has_value());
+  // Exactly one audio lane (the replacement), and the output duration
+  // follows the VIDEO stream (3 s source), not the 2 s replacement.
+  CHECK(countStreams(snap->outputPath, "a") == 1);
+  const ProbeResult probe = probeWith(snap->outputPath);
+  CHECK(probe.audioCodec == "aac");
+  INFO("duration: " << probe.durationSec << " (video 3.0, replacement 2.0)");
+  CHECK(probe.durationSec == doctest::Approx(3.0).epsilon(0.2));
+}
+
+TEST_CASE("REAL cover art: external image attaches to audio-only output") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const std::string cover = (env.dir / "cover.png").string();
+  REQUIRE(std::system(
+              (ffmpegBin() + " -y -hide_banner -loglevel error "
+               "-f lavfi -i testsrc2=size=320x240:rate=1 "
+               "-frames:v 1 \"" + cover + "\"")
+                  .c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(cover) > 1024);
+
+  ConversionRequest request =
+      transcodeRequest(fixture, Container::M4a, VideoCodec::H264,
+                       AudioCodec::Aac);
+  request.video.enabled = false;
+  request.audio.coverArtUri = cover;
+
+  EventWaiter waiter;
+  env.engine->events().subscribe(&waiter);
+  const Result<std::string> jobId = env.engine->startJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal.has_value());
+  INFO("failure error: " << terminal->error);
+  REQUIRE(terminal->state == JobState::Completed);
+
+  const auto snap = env.engine->getJob(jobId.value());
+  REQUIRE(snap.has_value());
+  // The attached picture rides along as a video stream with the
+  // attached_pic disposition (the standard cover-art shape).
+  CHECK(hasAttachedPic(snap->outputPath));
+  const ProbeResult probe = probeWith(snap->outputPath);
+  CHECK(probe.audioCodec == "aac");
+  CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+}
+
+TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
+  TestEnv env;
+  // An HDR-SIGNALED fixture: 8-bit x264 tagged bt2020/smpte2084. The
+  // detection path reads the decoded color metadata, exactly what real
+  // PQ media exercises; the pinned software encoders are 8-bit, so a
+  // transcode must tone-map (colorspace -> bt709) and tag SDR.
+  const std::string hdr = (env.dir / "hdr.mp4").string();
+  REQUIRE(std::system(
+              (ffmpegBin() + " -y -hide_banner -loglevel error "
+               "-filter_complex \"testsrc2=size=320x240:rate=12[v];"
+               "sine=frequency=440:sample_rate=44100[a]\" "
+               "-map \"[v]\" -map \"[a]\" "
+               "-c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 96k "
+               "-color_primaries bt2020 -color_trc smpte2084 "
+               "-colorspace bt2020nc -pix_fmt yuv420p -t 2 \"" + hdr +
+               "\"")
+                  .c_str()) == 0);
+  REQUIRE(streamFieldOf(hdr, "v:0", "stream=color_trc") == "smpte2084");
+
+  // Transcode: the 8-bit software encoder cannot carry HDR, so the
+  // engine tone-maps and tags SDR BT.709.
+  {
+    ConversionRequest request =
+        transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
+                         AudioCodec::Aac);
+    EventWaiter waiter;
+    env.engine->events().subscribe(&waiter);
+    const Result<std::string> jobId = env.engine->startJob(request);
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal.has_value());
+    INFO("failure error: " << terminal->error);
+    REQUIRE(terminal->state == JobState::Completed);
+    const auto snap = env.engine->getJob(jobId.value());
+    REQUIRE(snap.has_value());
+    CHECK(streamFieldOf(snap->outputPath, "v:0", "stream=color_trc") ==
+          "bt709");
+    CHECK(streamFieldOf(snap->outputPath, "v:0",
+                        "stream=color_primaries") == "bt709");
+    const ProbeResult probe = probeWith(snap->outputPath);
+    CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+  }
+
+  // Stream copy (remux to MKV, no re-encode): HDR signaling is preserved
+  // untouched — the copy path must not invent a conversion.
+  {
+    ConversionRequest remux =
+        transcodeRequest(hdr, Container::Mkv, VideoCodec::H264,
+                         AudioCodec::Aac);
+    remux.audio.codec = AudioCodec::Aac; // audio re-encode keeps it a
+                                         // single-backend FFmpeg job
+    // Planner prefers stream copy for matching codecs; no transform asked.
+    EventWaiter waiter2;
+    env.engine->events().subscribe(&waiter2);
+    const Result<std::string> jobId2 = env.engine->startJob(remux);
+    REQUIRE(jobId2.ok());
+    const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal2.has_value());
+    INFO("failure error: " << terminal2->error);
+    REQUIRE(terminal2->state == JobState::Completed);
+    const auto snap2 = env.engine->getJob(jobId2.value());
+    REQUIRE(snap2.has_value());
+    CHECK(streamFieldOf(snap2->outputPath, "v:0", "stream=color_trc") ==
+          "smpte2084");
+    CHECK(streamFieldOf(snap2->outputPath, "v:0",
+                        "stream=color_primaries") == "bt2020");
+  }
+}
+
+TEST_CASE("CEA probe: sources without closed captions report none") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const Result<MediaInfo> info =
+      env.engine->inspect(MediaSource{fixture, "in.mp4"});
+  REQUIRE(info.ok());
+  REQUIRE_FALSE(info.value().video.empty());
+  // A clean lavfi fixture carries no A53 CC side data; the probe must
+  // report the absence honestly (the field feeds the planner's
+  // "transcoding drops captions" advisory).
+  CHECK_FALSE(info.value().video.front().hasClosedCaptions);
 }
