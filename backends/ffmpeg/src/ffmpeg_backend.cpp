@@ -83,12 +83,6 @@ void initFfmpegLabel() {
 // Shared helpers (avErrorString, makeAvError, qualityToCrf,
 // encoderNameFor) live in ffmpeg_util.h.
 
-// Forward declaration: the attached-picture helper is defined further
-// down (near the other cover-art helpers) but used by the transcode and
-// remux setup paths that appear earlier in this file.
-AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
-                            std::string &err);
-
 // Maps a request-model pixel format (spec §18 advanced controls) to the
 // libavutil pixel format. AV_PIX_FMT_NONE means "unknown" (refused).
 AVPixelFormat avPixFmtFor(core::PixelFormat format) {
@@ -834,6 +828,15 @@ bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
 }
 
 } // namespace
+
+// Forward declaration: the attached-picture helper is defined further
+// down (near the other cover-art helpers) but used by the transcode and
+// remux setup paths. Declared at velmux::ffmpeg scope, NOT inside the
+// anonymous namespace above: a declaration inside it would bind callers
+// to a different (anonymous-namespace) symbol that never gets defined —
+// the definition further down is at this scope, and the two must match.
+AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
+                            std::string &err);
 
 // ---------------------------------------------------------------------------
 // FfmpegInspector
