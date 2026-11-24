@@ -37,8 +37,10 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
   external files), metadata preservation, segmented recovery with durable
   resume, sample generation, fit-under-size with a corrective retry.
   Also: metadata strip, multi-track audio with language tags, replace-audio
-  on the video timeline, cover art (attach/preserve), HDR tone-map to SDR
-  + signaling preservation on copy, CEA detection, H.264→HEVC (libx265).
+  on the video timeline, cover art (attach/preserve), CEA detection,
+  H.264→HEVC (libx265). HDR PRESERVATION works (stream copy + tagged
+  containers); HDR→SDR tone mapping is honestly NOT offered in the software
+  path (needs libzimg — D-056; the planner refuses with a reason).
 - Hybrid execution: stage contracts, FFmpeg + Android + Apple stage
   workers, core HybridExecutor; REAL F→F proof with ffprobe
   cross-validation; N→N/F→N/N→F composed through the same executor
@@ -66,6 +68,12 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
   analogues are green).
 - CEA-608/708 positive detection has no automated fixture (the pinned
   ffmpeg CLI cannot author A53 SEI); extraction is not V1 (OCR-class).
+- HDR→SDR tone mapping is not offered: the pinned filter set has no
+  PQ/HLG-capable converter (needs libzimg — D-056). The planner refuses
+  with a reason; HDR preservation via copy works.
+- 10-bit pixel formats are not yet wired through the feature registry
+  (the backend's HDR-preserving transcode path exists but is not
+  reachable from requests yet).
 - The planner's cost model is deterministic scoring; measured-throughput
   learning (PerfRecords → planner) is not wired.
 - Screen-reader behavior (VoiceOver/TalkBack) on device is pending; the

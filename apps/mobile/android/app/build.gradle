@@ -121,7 +121,10 @@ android {
         // default runner (android.test.InstrumentationTestRunner) cannot
         // discover them and connectedDebugAndroidTest would report an empty
         // test run, so point it at the androidx runner explicitly.
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnit4Runner"
+        // NOTE: the class is AndroidJUnitRunner (the first emulator run
+        // failed with ClassNotFoundException on the misspelled
+        // AndroidJUnit4Runner).
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake {
                 arguments "-DVELMUX_FFMPEG_ANDROID_PREFIX=${project.findProperty('velmuxFFmpegPrefix') ?: ''}"

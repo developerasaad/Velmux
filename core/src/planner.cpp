@@ -517,6 +517,22 @@ PlanResult Planner::plan(const MediaInfo &source,
         !caps->hdrToneMapping) {
       return;
     }
+    // Any transcode of HDR content on a tone-map-less backend must either
+    // preserve HDR (an explicitly requested 10-bit pixel format carries
+    // PQ/HLG honestly) or refuse — encoding PQ pixels through the default
+    // 8-bit SDR pipeline silently produces washed-out output. Stream copy
+    // keeps the bitstream intact and is never gated here.
+    if (wantsVideo && !streamCopy && source.hasVideo() &&
+        source.video.front().hdr && !caps->hdrToneMapping) {
+      const bool explicitTenBit =
+          request.video.pixelFormat.has_value() &&
+          (*request.video.pixelFormat == PixelFormat::Yuv420P10Le ||
+           *request.video.pixelFormat == PixelFormat::Yuv422P10Le ||
+           *request.video.pixelFormat == PixelFormat::Yuv444P10Le);
+      if (!explicitTenBit) {
+        return;
+      }
+    }
     // Multi-track audio and explicit track selection (spec §9).
     if (wantsAudio &&
         ((request.audio.allTracks && source.audio.size() > 1) ||

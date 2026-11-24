@@ -57,7 +57,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Batch processing | IMPLEMENTED + VERIFIED | engine+scheduler per-job isolation; Home multi-select batch conversion wired to real job submission (`jobsStore`, host tests for scheduler) |
 | Metadata preservation | IMPLEMENTED + VERIFIED | container+stream tags through transcode and remux (D-047); stripMetadata; hardening test with ~600 KB of container tags |
 | HDR preservation where compatible | IMPLEMENTED + VERIFIED (copy path) | stream copy preserves bitstream+signaling (host test asserts bt2020/PQ tags survive remux) |
-| HDR → SDR where supported | IMPLEMENTED + VERIFIED | ToneMapToSdr decision + `colorspace=all=bt709` filter + SDR BT.709 output tagging; host test: bt2020/PQ source transcodes to tagged bt709 SDR |
+| HDR → SDR where supported | NOT OFFERED in this build (honest gating) | the pinned filter set has no PQ/HLG-capable converter: colorspace handles SDR gamma curves only, and tonemap needs float pixels that only zscale produces (libzimg is not wired — D-056). The planner refuses HDR→SDR routes with a reason instead of producing a broken or washed-out result; HDR PRESERVATION works (stream copy + 10-bit tagging, verified) |
 | Output validation | IMPLEMENTED + VERIFIED | `core/src/validation.cpp` + independent ffprobe cross-checks in tests |
 
 ## 6. Audio operations (spec §10)

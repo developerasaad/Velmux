@@ -836,7 +836,7 @@ bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
 // to a different (anonymous-namespace) symbol that never gets defined —
 // the definition further down is at this scope, and the two must match.
 AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
-                            std::string &err);
+                            AVPacket *coverPacket, std::string &err);
 
 // ---------------------------------------------------------------------------
 // FfmpegInspector
@@ -1241,6 +1241,10 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   std::vector<int> inIndexOfOut;
   std::vector<int> outIndexOfSub; // output indices of subtitle streams
   std::vector<AVBSFContext *> bitstreamFilters;
+  // External cover art (spec §10): the stream is created before the
+  // header, its encoded packet written right after it.
+  AVPacket *coverPkt = nullptr;
+  int coverOutIndex = -1;
   // Explicit track selection (spec §9): keep only the selected audio
   // stream; allTracks (and the default) keep every audio stream.
   int audioOrdinal = 0;
@@ -1328,12 +1332,18 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
       return result;
     }
     std::string coverErr;
-    if (addCoverArtStream(cleanup.out, *coverPath, coverErr) == nullptr) {
+    AVPacket *coverPacket = av_packet_alloc();
+    AVStream *coverStream =
+        addCoverArtStream(cleanup.out, *coverPath, coverPacket, coverErr);
+    if (coverStream == nullptr) {
+      av_packet_free(&coverPacket);
       result.error =
           Error::make(ErrorCode::InvalidArgument,
                       "cannot embed cover art: " + coverErr, "ffmpeg");
       return result;
     }
+    coverOutIndex = coverStream->index;
+    coverPkt = coverPacket; // written right after the header below
   }
   if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
@@ -1347,6 +1357,17 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   if (rc < 0) {
     result.error = outputWriteError(rc, "write header", params.outputPath);
     return result;
+  }
+  if (coverPkt != nullptr && coverPkt->size > 0 && coverOutIndex >= 0) {
+    coverPkt->stream_index = coverOutIndex;
+    rc = av_write_frame(cleanup.out, coverPkt);
+    av_packet_free(&coverPkt);
+    coverPkt = nullptr;
+    if (rc < 0) {
+      result.error =
+          Error::make(ErrorCode::ExecutionFailed, "write cover art", "ffmpeg");
+      return result;
+    }
   }
 
   cleanup.packet = av_packet_alloc();
@@ -1975,25 +1996,29 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         cleanup.videoDec->color_trc == AVCOL_TRC_SMPTE2084 ||
         cleanup.videoDec->color_trc == AVCOL_TRC_ARIB_STD_B67 ||
         cleanup.videoDec->color_primaries == AVCOL_PRI_BT2020;
-    // Tone map when explicitly requested, or automatically when the
-    // source is HDR but the output cannot carry it (the pinned software
-    // encoders are 8-bit 4:2:0). Preserving HDR signaling through a
-    // compatible path keeps it untouched.
+    // Tone-map decision: the pinned build has NO PQ/HLG-capable converter
+    // (the colorspace filter only handles SDR gamma curves and the tonemap
+    // filter needs float pixels that only zscale produces — libzimg is not
+    // wired yet), so a tone-map would always fail the filter graph at
+    // config time. The capability is reported false (planner refuses
+    // explicit ToneMapToSdr) and this path refuses the AUTO case honestly
+    // instead of encoding PQ pixels unconverted (washed-out output).
     const bool outputCanCarryHdr =
         cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV420P10LE ||
         cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV422P10LE ||
         cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV444P10LE;
-    toneMap = sourceHdr && !pipeline.videoStreamCopy &&
-              (request.video.hdrPolicy == HdrPolicy::ToneMapToSdr ||
-               !outputCanCarryHdr);
-    if (toneMap) {
-      // SDR BT.709 output tags (the colorspace filter produces them).
-      cleanup.videoEnc->color_primaries = AVCOL_PRI_BT709;
-      cleanup.videoEnc->color_trc = AVCOL_TRC_BT709;
-      cleanup.videoEnc->colorspace = AVCOL_SPC_BT709;
-      cleanup.videoEnc->color_range = AVCOL_RANGE_MPEG;
-    } else if (sourceHdr) {
-      // Preserve the source HDR signaling on the output stream.
+    if (sourceHdr && !pipeline.videoStreamCopy && !outputCanCarryHdr) {
+      result.error = Error::make(
+          ErrorCode::UnsupportedFeature,
+          "HDR to SDR tone mapping is not available in this build; keep an "
+          "HDR-capable output (10-bit / stream copy) or preserve HDR in a "
+          "compatible container",
+          "ffmpeg");
+      return result;
+    }
+    if (sourceHdr) {
+      // Preserve the source HDR signaling on the output stream (10-bit
+      // outputs carry PQ/HLG honestly).
       cleanup.videoEnc->color_primaries = cleanup.videoDec->color_primaries;
       cleanup.videoEnc->color_trc = cleanup.videoDec->color_trc;
       cleanup.videoEnc->colorspace = cleanup.videoDec->colorspace;
@@ -2363,14 +2388,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       // source-frame coordinates; rotation swaps dimensions; the scale
       // lands on the encoder's (transform-aware) target geometry.
       std::string graphDesc;
-      // HDR -> SDR (spec §9): the native colorspace filter converts the
-      // source's gamut AND transfer function (e.g. BT.2020/PQ) to SDR
-      // BT.709 with proper transfer math; specular highlights clip at SDR
-      // white. It runs FIRST so it always sees the decoder's tagged
-      // frames (later filters may not preserve color metadata).
-      if (toneMap) {
-        graphDesc += "colorspace=all=bt709:range=tv,";
-      }
+      // (HDR -> SDR tone mapping is not offered in this build — see the
+      // encoder-setup refusal above; HDR preservation via copy/10-bit is
+      // handled without a filter.)
       if (wantsCrop) {
         const CropRect &crop = *request.video.crop;
         graphDesc += "crop=w=" + std::to_string(baseW) +
@@ -2929,6 +2949,10 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       }
     }
   }
+  // External cover art (spec §10): the stream is created before the
+  // header, its encoded packet written right after it.
+  AVPacket *coverPkt = nullptr;
+  int coverOutIndex = -1;
   if (request.audio.coverArtUri.has_value() && picsIncluded) {
     const std::optional<std::string> coverPath =
         localPathForUri(*request.audio.coverArtUri);
@@ -2940,13 +2964,19 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       return result;
     }
     std::string coverErr;
-    if (addCoverArtStream(cleanup.out, *coverPath, coverErr) == nullptr) {
+    AVPacket *coverPacket = av_packet_alloc();
+    AVStream *coverStream =
+        addCoverArtStream(cleanup.out, *coverPath, coverPacket, coverErr);
+    if (coverStream == nullptr) {
+      av_packet_free(&coverPacket);
       result.error =
           Error::make(ErrorCode::InvalidArgument,
                       "cannot embed cover art: " + coverErr, "ffmpeg");
       av_frame_free(&videoFrame);
       return result;
     }
+    coverOutIndex = coverStream->index;
+    coverPkt = coverPacket; // written right after the header below
   }
 
   // Metadata preservation (spec video ops: "metadata preservation where
@@ -2985,6 +3015,18 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     result.error = outputWriteError(rc, "write header", params.outputPath);
     av_frame_free(&videoFrame);
     return result;
+  }
+  if (coverPkt != nullptr && coverPkt->size > 0 && coverOutIndex >= 0) {
+    coverPkt->stream_index = coverOutIndex;
+    rc = av_write_frame(cleanup.out, coverPkt);
+    av_packet_free(&coverPkt);
+    coverPkt = nullptr;
+    if (rc < 0) {
+      result.error =
+          Error::make(ErrorCode::ExecutionFailed, "write cover art", "ffmpeg");
+      av_frame_free(&videoFrame);
+      return result;
+    }
   }
 
   // ---- Central loop ------------------------------------------------------------
@@ -4044,9 +4086,13 @@ bool assembleSegments(const std::vector<std::string> &segments,
 // Adds an attached-picture stream for external cover art (spec §10).
 // Decodes the image (mjpeg/png/bmp/...), converts to yuvj420p and encodes
 // a single JPEG packet. Stream creation must happen before write_header;
-// the packet write happens right after (writeCoverArtPacket).
+// the encoded packet is returned through coverPacket and the CALLER must
+// write it with av_write_frame right after avformat_write_header — the
+// mov/ipod muxer only materializes the pict track from a real sample
+// (the earlier extradata-only convention produced a zero-sample track
+// that no demuxer reports as attached art).
 AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
-                            std::string &err) {
+                            AVPacket *coverPacket, std::string &err) {
   AVFormatContext *img = nullptr;
   if (avformat_open_input(&img, path.c_str(), nullptr, nullptr) != 0 ||
       avformat_find_stream_info(img, nullptr) < 0) {
@@ -4146,12 +4192,13 @@ AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
         added->codecpar->bit_rate = 0;
         added->time_base = AVRational{1, 25};
         added->disposition |= AV_DISPOSITION_ATTACHED_PIC;
-        // The single packet rides IN the codecpar extradata (the
-        // convention for attached pictures): muxers write it at header
-        // time, no separate packet write needed.
-        added->codecpar->extradata_size = pkt->size;
-        added->codecpar->extradata = static_cast<uint8_t *>(
-            av_memdup(pkt->data, std::size_t(pkt->size)));
+        // Hand the encoded JPEG to the caller: it must be written as a
+        // real sample AFTER avformat_write_header (see the function
+        // comment) — the mov muxer builds the pict track from it.
+        if (av_packet_ref(coverPacket, pkt) != 0) {
+          err = "cannot stage the encoded cover art packet";
+          added = nullptr;
+        }
       }
     } else {
       err = "cannot encode the cover art";
@@ -4451,10 +4498,10 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   // Cover art: attached pictures carry through; external images embed as
   // attached-picture streams.
   caps.coverArt = true;
-  // HDR -> SDR tone mapping during transcode (gamut conversion + peak
-  // compression through the native filter set; no zimg in the pinned
-  // build, so linear-light precision is limited and documented).
-  caps.hdrToneMapping = true;
+  // HDR -> SDR tone mapping: NOT offered (the pinned filter set has no
+  // PQ/HLG-capable converter — needs libzimg; documented in D-056). HDR
+  // PRESERVATION works via stream copy and 10-bit transcodes.
+  caps.hdrToneMapping = false;
 
   const auto &features = FeatureRegistry::instance();
 

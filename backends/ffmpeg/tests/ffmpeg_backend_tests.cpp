@@ -2143,7 +2143,8 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
   const std::string tagged = (env.dir / "huge-meta.mp4").string();
   REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
                        plain + "\" -f ffmetadata -i \"" + metaFile +
-                       "\" -map 0 -map_metadata 1 -c copy \"" + tagged + "\"")
+                       "\" -map 0 -map_metadata 1 -movflags +use_metadata_tags "
+                       "-c copy \"" + tagged + "\"")
                           .c_str()) == 0);
   // The fixture really carries the payload (~600 KB of tags).
   REQUIRE(std::filesystem::file_size(tagged) >
@@ -2524,41 +2525,45 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
   // PQ media exercises; the pinned software encoders are 8-bit, so a
   // transcode must tone-map (colorspace -> bt709) and tag SDR.
   const std::string hdr = (env.dir / "hdr.mp4").string();
+  // The color metadata rides the x264 VUI (x264-params): the CLI's
+  // -color_* options do NOT reach the MP4 colr atom in ffmpeg 7.1 —
+  // verified empirically before wiring this fixture.
   REQUIRE(std::system(
               (ffmpegBin() + " -y -hide_banner -loglevel error "
                "-filter_complex \"testsrc2=size=320x240:rate=12[v];"
                "sine=frequency=440:sample_rate=44100[a]\" "
                "-map \"[v]\" -map \"[a]\" "
                "-c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 96k "
-               "-color_primaries bt2020 -color_trc smpte2084 "
-               "-colorspace bt2020nc -pix_fmt yuv420p -t 2 \"" + hdr +
-               "\"")
+               "-x264-params colorprim=bt2020:transfer=smpte2084:"
+               "colormatrix=bt2020nc -pix_fmt yuv420p -t 2 \"" + hdr + "\"")
                   .c_str()) == 0);
   REQUIRE(streamFieldOf(hdr, "v:0", "stream=color_transfer") ==
       "smpte2084");
 
-  // Transcode: the 8-bit software encoder cannot carry HDR, so the
-  // engine tone-maps and tags SDR BT.709.
+  // Transcode (default 8-bit H.264): the pinned build offers no PQ/HLG
+  // tone-map, so the PLANNER refuses the route honestly instead of
+  // producing washed-out output — infeasible with a reason. (An explicit
+  // ToneMapToSdr request is refused by the same gate.)
   {
     ConversionRequest request =
         transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
                          AudioCodec::Aac);
-    EventWaiter waiter;
-    env.engine->events().subscribe(&waiter);
-    const Result<std::string> jobId = env.engine->startJob(request);
-    REQUIRE(jobId.ok());
-    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
-    REQUIRE(terminal.has_value());
-    INFO("failure error: " << terminal->error);
-    REQUIRE(terminal->state == JobState::Completed);
-    const auto snap = env.engine->getJob(jobId.value());
-    REQUIRE(snap.has_value());
-    CHECK(streamFieldOf(snap->outputPath, "v:0", "stream=color_transfer") ==
-          "bt709");
-    CHECK(streamFieldOf(snap->outputPath, "v:0",
-                        "stream=color_primaries") == "bt709");
-    const ProbeResult probe = probeWith(snap->outputPath);
-    CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
+    const Result<PlanResult> plan =
+        env.engine->plan(MediaSource{hdr, "hdr.mp4"}, request);
+    REQUIRE(plan.ok());
+    INFO("plan message: " << plan.value().message);
+    CHECK_FALSE(plan.value().feasible);
+    CHECK(plan.value().message.size() > 0);
+    // Explicit ToneMapToSdr is refused by the same planner gate.
+    ConversionRequest tm =
+        transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
+                         AudioCodec::Aac);
+    tm.video.hdrPolicy = HdrPolicy::ToneMapToSdr;
+    const Result<PlanResult> planTm =
+        env.engine->plan(MediaSource{hdr, "hdr.mp4"}, tm);
+    REQUIRE(planTm.ok());
+    CHECK_FALSE(planTm.value().feasible);
+    CHECK(planTm.value().message.size() > 0);
   }
 
   // Stream copy (remux to MKV, no re-encode): HDR signaling is preserved
