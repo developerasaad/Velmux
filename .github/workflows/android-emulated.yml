@@ -78,6 +78,11 @@ jobs:
           # the transitional name for libasound2t64 there.
           sudo apt-get install -y libx11-6 libxcb1 libpulse0 libnss3
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+          # FFmpeg build tools: the mandatory-FFmpeg policy makes the
+          # suite resolve (and on a cache miss BUILD) the x86_64 FFmpeg
+          # inline — dav1d needs meson, x265 needs cmake + ninja, and
+          # nasm enables the x86 asm paths (dav1d/x264/x265).
+          sudo apt-get install -y ninja-build meson pkg-config nasm
 
       - name: Set up Node.js
         uses: actions/setup-node@v5

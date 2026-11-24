@@ -42,6 +42,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Install FFmpeg build tools
+        # The mandatory-FFmpeg policy makes every app build resolve (and,
+        # on a cache miss, BUILD) the pinned FFmpeg inline: dav1d needs
+        # meson, x265 needs cmake + ninja. CMake itself is preinstalled
+        # on GitHub-hosted runners.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config
+
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
