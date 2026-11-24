@@ -1,4 +1,5 @@
 import React, {useCallback} from 'react';
+import {useShallow} from 'zustand/react/shallow';
 import {FlatList, Platform, RefreshControl, StyleSheet, View} from 'react-native';
 import type {ListRenderItemInfo} from 'react-native';
 import {
@@ -37,7 +38,9 @@ export function HistoryScreen() {
   const theme = useTheme();
   const navigation = useNavigation<HistoryScreenProps['navigation']>();
 
-  const completedJobs = useJobsStore(selectCompletedJobs);
+  // useShallow for the array-returning selector (fresh .filter/.reverse
+  // references would loop useSyncExternalStore — see HomeScreen).
+  const completedJobs = useJobsStore(useShallow(selectCompletedJobs));
   const requests = useJobsStore(state => state.requests);
   const clearBatch = useJobsStore(state => state.clearBatch);
   const refreshing = useJobsStore(state => state.refreshing);

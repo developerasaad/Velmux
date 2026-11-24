@@ -1,4 +1,5 @@
 import React, {useCallback, useEffect, useState} from 'react';
+import {useShallow} from 'zustand/react/shallow';
 import {
   Alert,
   Pressable,
@@ -97,8 +98,13 @@ export function HomeScreen() {
   const theme = useTheme();
   const navigation = useNavigation<HomeScreenProps['navigation']>();
 
-  const activeJobs = useJobsStore(selectActiveJobs);
-  const recentResults = useJobsStore(selectCompletedJobs);
+  // useShallow: the selectors return fresh arrays (.filter/.reverse) on
+  // every call, and an unstable snapshot reference loops React's
+  // useSyncExternalStore (zustand v5) — observed as 'Maximum update depth
+  // exceeded' killing the app on the iOS simulator. useShallow returns the
+  // previous reference when the items are shallowly equal.
+  const activeJobs = useJobsStore(useShallow(selectActiveJobs));
+  const recentResults = useJobsStore(useShallow(selectCompletedJobs));
   const refreshing = useJobsStore(state => state.refreshing);
   const refreshError = useJobsStore(state => state.refreshError);
   const refresh = useJobsStore(state => state.refresh);
