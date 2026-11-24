@@ -1,0 +1,634 @@
+     1→// Velmux instrumented tests: REAL hybrid (stage-composed) conversions on a
+     2→// device/emulator (Milestone 4 validation, spec §10/§31).
+     3→//
+     4→// Three execution categories are proven with REAL media:
+     5→//   - N->N: Android stage decode -> Android stage encode (the core
+     6→//     HybridExecutor composing MediaCodec stage workers on both sides);
+     7→//   - F->N: FFmpeg stage decode -> Android (MediaCodec) stage encode;
+     8→//   - N->F: Android stage decode -> FFmpeg (libx264) stage encode.
+     9→//
+    10→// Fixtures are REAL media generated on-device by hardware/software
+    11→// MediaCodec encoders (H.264 + AAC into MP4) — the proven generation
+    12→// helpers from NativeConversionTest are duplicated here (that class is a
+    13→// self-contained suite; coupling the two would couple their failures).
+    14→// Outputs are validated with an INDEPENDENT MediaExtractor probe, never
+    15→// with the code that produced them (spec §50).
+    16→//
+    17→// Honesty notes:
+    18→//   - The native test scaffolding (see the TEST SCAFFOLDING section in
+    19→//     velmux_jni.cpp) never fakes media work. It only SELECTS routes:
+    20→//     the forced-hybrid tests narrow the capability reports the PLANNER
+    21→//     reads so no single-backend route exists and the hybrid pipeline is
+    22→//     the only plan. Every frame still crosses the real CPU-frame
+    23→//     interchange between the real FFmpeg and Android stage workers.
+    24→//   - The "pipelineSummary contains Hybrid" assertions prove the PLANNER
+    25→//     chose a hybrid composition — not merely that a conversion succeeded.
+    26→//   - FFmpeg-dependent tests skip honestly (Assume) when the app was
+    27→//     built without the FFmpeg backend (CI runs without the pinned
+    28→//     artifacts) or when the emulator lacks the capability under test.
+    29→package com.velmux.mobile
+    30→
+    31→import android.content.Context
+    32→import android.media.MediaCodec
+    33→import android.media.MediaCodecInfo
+    34→import android.media.MediaExtractor
+    35→import android.media.MediaFormat
+    36→import android.media.MediaMuxer
+    37→import androidx.test.core.app.ApplicationProvider
+    38→import androidx.test.ext.junit.runners.AndroidJUnit4
+    39→import java.io.File
+    40→import java.nio.ByteBuffer
+    41→import org.junit.Assert.assertEquals
+    42→import org.junit.Assert.assertNotNull
+    43→import org.junit.Assert.assertTrue
+    44→import org.junit.Assume
+    45→import org.junit.Test
+    46→import org.junit.runner.RunWith
+    47→
+    48→@RunWith(AndroidJUnit4::class)
+    49→class HybridConversionTest {
+    50→
+    51→  private val context: Context
+    52→    get() = ApplicationProvider.getApplicationContext()
+    53→
+    54→  // ---- Fixture generation (real encoders, real muxer; duplicated from
+    55→  // NativeConversionTest, which stays an independent suite) ---------------------
+    56→
+    57→  private class GeneratedMedia(val path: String, val durationUs: Long,
+    58→                               val width: Int, val height: Int)
+    59→
+    60→  /**
+    61→   * Encodes synthetic frames (moving color gradient) with a real H.264
+    62→   * encoder and a real AAC encoder into an MP4.
+    63→   */
+    64→  private fun generateMp4(seconds: Int): GeneratedMedia {
+    65→    val width = 320
+    66→    val height = 240
+    67→    val frameRate = 24
+    68→    val totalFrames = seconds * frameRate
+    69→    val out = File(context.cacheDir, "velmux-fixture-${System.nanoTime()}.mp4")
+    70→    val muxer = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    71→
+    72→    val videoFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+    73→      setInteger(MediaFormat.KEY_COLOR_FORMAT,
+    74→          MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+    75→      setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
+    76→      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+    77→      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+    78→    }
+    79→    val videoEncoder = MediaCodec.createEncoderByType("video/avc")
+    80→    videoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    81→    videoEncoder.start()
+    82→
+    83→    val sampleRate = 44100
+    84→    val channels = 2
+    85→    val audioFormat = MediaFormat.createAudioFormat("audio/mp4a-latm", sampleRate, channels).apply {
+    86→      setInteger(MediaFormat.KEY_BIT_RATE, 96_000)
+    87→    }
+    88→    val audioEncoder = MediaCodec.createEncoderByType("audio/mp4a-latm")
+    89→    audioEncoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    90→    audioEncoder.start()
+    91→
+    92→    var muxerStarted = false
+    93→    var videoTrack = -1
+    94→    var audioTrack = -1
+    95→
+    96→    val yuv = ByteArray(width * height * 3 / 2)
+    97→    var frameIndex = 0
+    98→    val bytesPerAudioFrame = 2 * channels
+    99→    var audioBytesFed = 0L
+   100→    val audioChunk = ByteArray(sampleRate * bytesPerAudioFrame / 2) // ~500ms
+   101→
+   102→    fun ensureMuxerStarted() {
+   103→      if (!muxerStarted && videoTrack >= 0 && audioTrack >= 0) {
+   104→        muxer.start()
+   105→        muxerStarted = true
+   106→      }
+   107→    }
+   108→
+   109→    fun writeSample(track: Int, buffer: ByteBuffer, info: MediaCodec.BufferInfo) {
+   110→      if (track < 0 || info.size <= 0) {
+   111→        return
+   112→      }
+   113→      val data = ByteArray(info.size)
+   114→      buffer.position(info.offset)
+   115→      buffer.limit(info.offset + info.size)
+   116→      buffer.get(data)
+   117→      val muxInfo = MediaCodec.BufferInfo()
+   118→      muxInfo.set(0, info.size, info.presentationTimeUs, info.flags)
+   119→      muxer.writeSampleData(track, ByteBuffer.wrap(data), muxInfo)
+   120→    }
+   121→
+   122→    fun drainVideo(): Boolean {
+   123→      val info = MediaCodec.BufferInfo()
+   124→      while (true) {
+   125→        val id = videoEncoder.dequeueOutputBuffer(info, 0)
+   126→        if (id >= 0) {
+   127→          val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+   128→          if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+   129→            if (!muxerStarted) {
+   130→              if (videoTrack < 0) {
+   131→                videoTrack = muxer.addTrack(videoEncoder.outputFormat)
+   132→                ensureMuxerStarted()
+   133→              }
+   134→            }
+   135→            if (muxerStarted) {
+   136→              writeSample(videoTrack, videoEncoder.getOutputBuffer(id)!!, info)
+   137→            }
+   138→          }
+   139→          videoEncoder.releaseOutputBuffer(id, false)
+   140→          if (eos) return false
+   141→        } else if (id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+   142→          if (videoTrack < 0) {
+   143→            videoTrack = muxer.addTrack(videoEncoder.outputFormat)
+   144→            ensureMuxerStarted()
+   145→          }
+   146→        } else {
+   147→          return true
+   148→        }
+   149→      }
+   150→    }
+   151→
+   152→    fun drainAudio(): Boolean {
+   153→      val info = MediaCodec.BufferInfo()
+   154→      while (true) {
+   155→        val id = audioEncoder.dequeueOutputBuffer(info, 0)
+   156→        if (id >= 0) {
+   157→          val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+   158→          if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+   159→            if (!muxerStarted) {
+   160→              if (audioTrack < 0) {
+   161→                audioTrack = muxer.addTrack(audioEncoder.outputFormat)
+   162→                ensureMuxerStarted()
+   163→              }
+   164→            }
+   165→            if (muxerStarted) {
+   166→              writeSample(audioTrack, audioEncoder.getOutputBuffer(id)!!, info)
+   167→            }
+   168→          }
+   169→          audioEncoder.releaseOutputBuffer(id, false)
+   170→          if (eos) return false
+   171→        } else if (id == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+   172→          if (audioTrack < 0) {
+   173→            audioTrack = muxer.addTrack(audioEncoder.outputFormat)
+   174→            ensureMuxerStarted()
+   175→          }
+   176→        } else {
+   177→          return true
+   178→        }
+   179→      }
+   180→    }
+   181→
+   182→    fun feedVideoFrame() {
+   183→      val index = videoEncoder.dequeueInputBuffer(10_000)
+   184→      if (index < 0) {
+   185→        return
+   186→      }
+   187→      val input = videoEncoder.getInputBuffer(index)!!
+   188→      input.clear()
+   189→      val stripe = (frameIndex * 4) % 256
+   190→      var p = 0
+   191→      for (i in 0 until width * height) {
+   192→        yuv[p++] = ((i / width + stripe) and 0xFF).toByte()
+   193→      }
+   194→      for (i in 0 until width * height / 4) {
+   195→        yuv[p++] = 128.toByte()
+   196→      }
+   197→      for (i in 0 until width * height / 4) {
+   198→        yuv[p++] = 128.toByte()
+   199→      }
+   200→      input.put(yuv)
+   201→      val ptsUs = frameIndex * 1_000_000L / frameRate
+   202→      videoEncoder.queueInputBuffer(index, 0, yuv.size, ptsUs, 0)
+   203→      frameIndex++
+   204→    }
+   205→
+   206→    fun feedAudioChunk() {
+   207→      val index = audioEncoder.dequeueInputBuffer(10_000)
+   208→      if (index < 0) {
+   209→        return
+   210→      }
+   211→      val input = audioEncoder.getInputBuffer(index)!!
+   212→      input.clear()
+   213→      for (i in audioChunk.indices step bytesPerAudioFrame) {
+   214→        val v = (Math.sin((audioBytesFed + i) / 32.0) * 12000).toInt()
+   215→        audioChunk[i] = (v and 0xFF).toByte()
+   216→        audioChunk[i + 1] = (v shr 8).toByte()
+   217→        audioChunk[i + 2] = (v and 0xFF).toByte()
+   218→        audioChunk[i + 3] = (v shr 8).toByte()
+   219→      }
+   220→      val chunk = minOf(audioChunk.size, input.remaining())
+   221→      input.put(audioChunk, 0, chunk)
+   222→      audioEncoder.queueInputBuffer(index, 0, chunk,
+   223→          audioBytesFed * 1_000_000L / (sampleRate * bytesPerAudioFrame), 0)
+   224→      audioBytesFed += chunk
+   225→    }
+   226→
+   227→    while (frameIndex < totalFrames) {
+   228→      feedVideoFrame()
+   229→      feedAudioChunk()
+   230→      drainVideo()
+   231→      drainAudio()
+   232→    }
+   233→    // End of stream for both encoders, then drain to completion.
+   234→    while (true) {
+   235→      val index = videoEncoder.dequeueInputBuffer(50_000)
+   236→      if (index >= 0) {
+   237→        videoEncoder.queueInputBuffer(index, 0, 0,
+   238→            totalFrames * 1_000_000L / frameRate,
+   239→            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+   240→        break
+   241→      }
+   242→      drainVideo()
+   243→    }
+   244→    while (true) {
+   245→      val index = audioEncoder.dequeueInputBuffer(50_000)
+   246→      if (index >= 0) {
+   247→        audioEncoder.queueInputBuffer(index, 0, 0,
+   248→            audioBytesFed * 1_000_000L / (sampleRate * bytesPerAudioFrame),
+   249→            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+   250→        break
+   251→      }
+   252→      drainAudio()
+   253→    }
+   254→    var videoAlive = true
+   255→    var audioAlive = true
+   256→    while (videoAlive || audioAlive) {
+   257→      if (videoAlive) videoAlive = drainVideo()
+   258→      if (audioAlive) audioAlive = drainAudio()
+   259→    }
+   260→    videoEncoder.stop(); videoEncoder.release()
+   261→    audioEncoder.stop(); audioEncoder.release()
+   262→    muxer.stop(); muxer.release()
+   263→    assertTrue(out.length() > 1024)
+   264→    return GeneratedMedia(out.absolutePath,
+   265→        totalFrames * 1_000_000L / frameRate, width, height)
+   266→  }
+   267→
+   268→  // ---- Independent validation (MediaExtractor, never the producer) -----------
+   269→
+   270→  private class Probe(val videoMime: String?, val audioMime: String?,
+   271→                      val durationUs: Long, val width: Int, val height: Int)
+   272→
+   273→  private fun probe(path: String): Probe {
+   274→    val extractor = MediaExtractor()
+   275→    extractor.setDataSource(path)
+   276→    var videoMime: String? = null
+   277→    var audioMime: String? = null
+   278→    var durationUs = 0L
+   279→    var width = 0
+   280→    var height = 0
+   281→    for (i in 0 until extractor.trackCount) {
+   282→      val format = extractor.getTrackFormat(i)
+   283→      val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+   284→      if (mime.startsWith("video/") && videoMime == null) {
+   285→        videoMime = mime
+   286→        if (format.containsKey(MediaFormat.KEY_WIDTH)) {
+   287→          width = format.getInteger(MediaFormat.KEY_WIDTH)
+   288→        }
+   289→        if (format.containsKey(MediaFormat.KEY_HEIGHT)) {
+   290→          height = format.getInteger(MediaFormat.KEY_HEIGHT)
+   291→        }
+   292→      } else if (mime.startsWith("audio/") && audioMime == null) {
+   293→        audioMime = mime
+   294→      }
+   295→      if (format.containsKey(MediaFormat.KEY_DURATION)) {
+   296→        durationUs = maxOf(durationUs, format.getLong(MediaFormat.KEY_DURATION))
+   297→      }
+   298→    }
+   299→    extractor.release()
+   300→    return Probe(videoMime, audioMime, durationUs, width, height)
+   301→  }
+   302→
+   303→  // ---- Small JSON helpers (the engine's payloads; no parser dependency) ------
+   304→
+   305→  private fun jsonStringField(json: String, field: String): String? {
+   306→    val key = "\"$field\":"
+   307→    val at = json.indexOf(key)
+   308→    if (at < 0) return null
+   309→    var pos = at + key.length
+   310→    while (pos < json.length && json[pos] == ' ') pos++
+   311→    return if (pos < json.length && json[pos] == '"') {
+   312→      val end = json.indexOf('"', pos + 1)
+   313→      json.substring(pos + 1, end)
+   314→    } else {
+   315→      val end = json.indexOfAny(charArrayOf(',', '}'), pos)
+   316→      json.substring(pos, if (end < 0) json.length else end)
+   317→    }
+   318→  }
+   319→
+   320→  private fun jsonLongField(json: String, field: String): Long? {
+   321→    val key = "\"$field\":"
+   322→    val at = json.indexOf(key)
+   323→    if (at < 0) return null
+   324→    var pos = at + key.length
+   325→    while (pos < json.length && json[pos] == ' ') pos++
+   326→    val end = json.indexOfAny(charArrayOf(',', '}'), pos)
+   327→    val text = json.substring(pos, if (end < 0) json.length else end).trim()
+   328→    return text.toLongOrNull()
+   329→  }
+   330→
+   331→  // ---- Engine facade (the NORMAL path the app uses) ---------------------------
+   332→
+   333→  private fun engineHandle(): Long {
+   334→    val dir = File(context.filesDir, "velmux-hybrid-test-engine")
+   335→    dir.mkdirs()
+   336→    return VelmuxJni.nativeCreateEngine(dir.absolutePath)
+   337→  }
+   338→
+   339→  private class JobResult(val state: String, val outputPath: String?, val error: String?)
+   340→
+   341→  private fun runJob(handle: Long, requestJson: String): JobResult {
+   342→    val started = String(VelmuxJni.nativeStartJob(handle, requestJson), Charsets.UTF_8)
+   343→    assertTrue("startJob returned: $started", started.contains("\"jobId\""))
+   344→    val jobId = jsonStringField(started, "jobId")!!
+   345→    var lastState = "queued"
+   346→    var outputPath: String? = null
+   347→    var error: String? = null
+   348→    for (i in 0 until 600) {
+   349→      val snapshotJson = String(VelmuxJni.nativeGetJob(handle, jobId), Charsets.UTF_8)
+   350→      val state = jsonStringField(snapshotJson, "state") ?: continue
+   351→      lastState = state
+   352→      val pathField = jsonStringField(snapshotJson, "outputPath")
+   353→      if (pathField != null && pathField.isNotEmpty()) {
+   354→        outputPath = pathField
+   355→      }
+   356→      error = jsonStringField(snapshotJson, "error")?.takeIf { it.isNotEmpty() && it != "null" }
+   357→      if (state == "completed" || state == "failed" || state == "canceled") {
+   358→        break
+   359→      }
+   360→      Thread.sleep(100)
+   361→    }
+   362→    return JobResult(lastState, outputPath, error)
+   363→  }
+   364→
+   365→  /** True when the engine (built like the app's) registered the FFmpeg backend. */
+   366→  private fun ffmpegBackendPresent(handle: Long): Boolean {
+   367→    val described = String(VelmuxJni.nativeDescribeBackends(handle), Charsets.UTF_8)
+   368→    return described.contains("FFmpeg")
+   369→  }
+   370→
+   371→  /** Real platform probe: can a MediaCodec encoder be created for this mime? */
+   372→  private fun hasEncoderFor(mime: String): Boolean {
+   373→    return try {
+   374→      MediaCodec.createEncoderByType(mime).release()
+   375→      true
+   376→    } catch (e: Exception) {
+   377→      false
+   378→    }
+   379→  }
+   380→
+   381→  // ---- Masked test engine (see nativeTestStartJobMaskedEngine) ----------------
+   382→
+   383→  private class MaskedOutcome(val ok: Boolean, val state: String?,
+   384→                              val outputPath: String?, val error: String?,
+   385→                              val pipelineSummary: String?)
+   386→
+   387→  private fun runMaskedEngine(requestJson: String, workDir: File,
+   388→                              mask: String): MaskedOutcome {
+   389→    val json = String(VelmuxJni.nativeTestStartJobMaskedEngine(
+   390→        requestJson, workDir.absolutePath, mask), Charsets.UTF_8)
+   391→    return MaskedOutcome(
+   392→        json.contains("\"ok\":true"),
+   393→        jsonStringField(json, "state"),
+   394→        jsonStringField(json, "outputPath")?.takeIf { it.isNotEmpty() && it != "null" },
+   395→        jsonStringField(json, "error")?.takeIf { it.isNotEmpty() && it != "null" },
+   396→        jsonStringField(json, "pipelineSummary")?.takeIf { it.isNotEmpty() && it != "null" })
+   397→  }
+   398→
+   399→  private fun freshWorkDir(label: String): File {
+   400→    val dir = File(context.cacheDir, "velmux-hybrid-$label-${System.nanoTime()}")
+   401→    assertTrue("cannot create engine working dir ${dir.absolutePath}",
+   402→        dir.mkdirs() || dir.isDirectory)
+   403→    return dir
+   404→  }
+   405→
+   406→  /** The PLANNER must have chosen a hybrid composition — not just any run. */
+   407→  private fun assertHybridChosen(outcome: MaskedOutcome, label: String) {
+   408→    val summary = outcome.pipelineSummary
+   409→    assertNotNull("no pipeline summary reported for $label " +
+   410→        "(state=${outcome.state}, error=${outcome.error})", summary)
+   411→    assertTrue("the planner did not choose a hybrid pipeline for $label: \"$summary\"",
+   412→        summary!!.contains("hybrid", ignoreCase = true))
+   413→  }
+   414→
+   415→  private fun assertHybridRunCompleted(outcome: MaskedOutcome, label: String) {
+   416→    assertEquals("$label failed: ${outcome.error}", "completed", outcome.state)
+   417→    assertHybridChosen(outcome, label)
+   418→    assertNotNull("$label reported no output path", outcome.outputPath)
+   419→    val out = File(outcome.outputPath!!)
+   420→    assertTrue("$label output missing or empty", out.exists() && out.length() > 0)
+   421→  }
+   422→
+   423→  private fun assertDurationWithin(probedUs: Long, expectedUs: Long, label: String) {
+   424→    assertTrue(
+   425→        "$label duration ${probedUs / 1000.0}ms vs expected ${expectedUs / 1000.0}ms",
+   426→        Math.abs(probedUs - expectedUs) <= 500_000)
+   427→  }
+   428→
+   429→  // ---- Tests --------------------------------------------------------------------
+   430→
+   431→  /**
+   432→   * N->N: the real core HybridExecutor composes the Android stage workers on
+   433→   * both sides — MediaExtractor/MediaCodec stage decode into CPU frames,
+   434→   * MediaCodec stage encode, AMediaMuxer mux with stream-copied AAC audio.
+   435→   */
+   436→  @Test
+   437→  fun testNToN_stageComposed_realWorkers() {
+   438→    val fixture = generateMp4(2)
+   439→    val out = File(context.cacheDir, "hybrid-nton-${System.nanoTime()}.mp4")
+   440→    val request = """
+   441→      {
+   442→        "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
+   443→        "outputContainer": "mp4",
+   444→        "goal": {"kind": "custom"},
+   445→        "video": {"codec": "h264", "enabled": true,
+   446→                  "rateControl": "bitrate", "bitRate": 800000},
+   447→        "audio": {"codec": "aac", "enabled": true},
+   448→        "subtitles": {"policy": "remove"},
+   449→        "processingMode": "auto"
+   450→      }
+   451→    """.trimIndent()
+   452→
+   453→    val resultJson = String(
+   454→        VelmuxJni.nativeTestRunAndroidStagePipeline(request, out.absolutePath),
+   455→        Charsets.UTF_8)
+   456→    assertTrue("android stage pipeline returned: $resultJson",
+   457→        resultJson.contains("\"ok\":true"))
+   458→    val frames = jsonLongField(resultJson, "frames")
+   459→    assertTrue("no real frames processed: $resultJson", frames != null && frames > 0)
+   460→
+   461→    // INDEPENDENT validation: MediaExtractor probe of the produced file.
+   462→    assertTrue("output missing: ${out.absolutePath}", out.exists() && out.length() > 0)
+   463→    val probed = probe(out.absolutePath)
+   464→    assertEquals("video/avc", probed.videoMime)
+   465→    assertEquals("audio/mp4a-latm", probed.audioMime)
+   466→    assertEquals(fixture.width, probed.width)
+   467→    assertEquals(fixture.height, probed.height)
+   468→    assertDurationWithin(probed.durationUs, fixture.durationUs, "N->N")
+   469→  }
+   470→
+   471→  /**
+   472→   * F->N: an FFV1-in-MKV source has no single-backend route to HEVC —
+   473→   * Android's MediaCodec cannot decode FFV1 and the pinned FFmpeg build has
+   474→   * no HEVC encoder — so the planner's ONLY plan is the hybrid pipeline
+   475→   * (FFmpeg stage decode -> Android MediaCodec stage encode).
+   476→   *
+   477→   * Step 1 produces the FFV1 intermediate through the NORMAL facade
+   478→   * start-conversion path the app uses (FFmpeg is the only backend that
+   479→   * encodes FFV1). Step 2 requests FFV1 -> HEVC through an UNMASKED engine
+   480→   * and asserts the planner chose the hybrid route. On emulators without
+   481→   * an HEVC encoder the same F->N composition is forced on the original
+   482→   * fixture by masking (comments below); if even that route cannot be
+   483→   * established, the test skips honestly.
+   484→   */
+   485→  @Test
+   486→  fun testFToN_ffv1SourceForcesHybrid() {
+   487→    val fixture = generateMp4(3)
+   488→    val handle = engineHandle()
+   489→    try {
+   490→      // Without the FFmpeg backend no FFV1 intermediate can be produced and
+   491→      // nothing on the device can decode FFV1. Honest skip (the CI matrix
+   492→      // runs both with and without the pinned FFmpeg artifacts).
+   493→      Assume.assumeTrue(
+   494→          "the engine build has no FFmpeg backend (F->N hybrid needs it)",
+   495→          ffmpegBackendPresent(handle))
+   496→
+   497→      // Step 1: fixture -> FFV1 in MKV through the normal engine path.
+   498→      val ffv1Request = """
+   499→        {
+   500→          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
+   501→          "outputContainer": "mkv",
+   502→          "goal": {"kind": "custom"},
+   503→          "video": {"codec": "ffv1", "enabled": true},
+   504→          "audio": {"codec": "aac", "enabled": true},
+   505→          "subtitles": {"policy": "remove"},
+   506→          "processingMode": "auto"
+   507→        }
+   508→      """.trimIndent()
+   509→      val ffv1Job = runJob(handle, ffv1Request)
+   510→      assertEquals("FFV1 intermediate failed: ${ffv1Job.error}",
+   511→          "completed", ffv1Job.state)
+   512→      val ffv1Path = ffv1Job.outputPath!!
+   513→      val ffv1File = File(ffv1Path)
+   514→      assertTrue("FFV1 intermediate missing or empty: $ffv1Path",
+   515→          ffv1File.exists() && ffv1File.length() > 1024)
+   516→      // MediaExtractor cannot parse FFV1 (not a framework codec), so the
+   517→      // intermediate is validated by the engine's own completed state, its
+   518→      // size, and the success of the step-2 hybrid run that decodes it.
+   519→
+   520→      // Step 2: FFV1 -> HEVC. No single-backend route exists, so hybrid
+   521→      // F->N is the ONLY plan — the engine needs no mask.
+   522→      if (hasEncoderFor("video/hevc")) {
+   523→        val hevcRequest = """
+   524→          {
+   525→            "source": {"uri": "$ffv1Path", "displayName": "intermediate.mkv"},
+   526→            "outputContainer": "mp4",
+   527→            "goal": {"kind": "custom"},
+   528→            "video": {"codec": "hevc", "enabled": true,
+   529→                      "rateControl": "bitrate", "bitRate": 800000},
+   530→            "audio": {"codec": "aac", "enabled": true},
+   531→            "subtitles": {"policy": "remove"},
+   532→            "processingMode": "auto"
+   533→          }
+   534→        """.trimIndent()
+   535→        val outcome = runMaskedEngine(hevcRequest, freshWorkDir("fton-natural"), "")
+   536→        assertHybridRunCompleted(outcome, "natural F->N (FFV1 -> HEVC)")
+   537→        val probed = probe(outcome.outputPath!!)
+   538→        assertEquals("video/hevc", probed.videoMime)
+   539→        assertEquals("audio/mp4a-latm", probed.audioMime)
+   540→        assertDurationWithin(probed.durationUs, fixture.durationUs, "F->N")
+   541→        return
+   542→      }
+   543→
+   544→      // No HEVC encoder on this emulator. The same F->N composition
+   545→      // (FFmpeg decode stage -> Android encode stage) is forced on the
+   546→      // ORIGINAL fixture by masking. WHY THE MASK IS HONEST SCAFFOLDING:
+   547→      // "ffmpeg-encoders" hides FFmpeg's video encoders from its capability
+   548→      // report (no FFmpeg whole-pipeline transcode, no FFmpeg encode side)
+   549→      // and "android-whole-pipeline" removes the Android DECODE side of its
+   550→      // report (no Android whole-pipeline candidate; Android remains the
+   551→      // encode/mux stage side). The planner then has no single-backend
+   552→      // route and must compose the hybrid pipeline; the frames still cross
+   553→      // the real FFmpeg-decode -> Android-encode CPU-frame boundary.
+   554→      //
+   555→      // Audio is disabled: with identical in/out codecs, container and
+   556→      // audio, STREAM COPY would be the cheapest (and correct) plan —
+   557→      // disabling audio removes that route, making the request a genuine
+   558→      // transcode only the hybrid route can serve.
+   559→      val h264Request = """
+   560→        {
+   561→          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
+   562→          "outputContainer": "mp4",
+   563→          "goal": {"kind": "custom"},
+   564→          "video": {"codec": "h264", "enabled": true,
+   565→                    "rateControl": "bitrate", "bitRate": 800000},
+   566→          "audio": {"enabled": false},
+   567→          "subtitles": {"policy": "remove"},
+   568→          "processingMode": "auto"
+   569→        }
+   570→      """.trimIndent()
+   571→      val outcome = runMaskedEngine(h264Request, freshWorkDir("fton-masked"),
+   572→          "ffmpeg-encoders,android-whole-pipeline")
+   573→      if (!outcome.ok && outcome.pipelineSummary
+   574→              ?.contains("hybrid", ignoreCase = true) != true) {
+   575→        // The forced route could not even be established on this image
+   576→        // (unexpected capability combination). Honest skip; a CHOSEN hybrid
+   577→        // that then failed execution stays a hard failure below.
+   578→        Assume.assumeTrue(
+   579→            "cannot establish the forced F->N hybrid route on this device: " +
+   580→            "${outcome.error} (state=${outcome.state})",
+   581→            false)
+   582→      }
+   583→      assertHybridRunCompleted(outcome, "masked F->N fallback (H.264 -> H.264)")
+   584→      val probed = probe(outcome.outputPath!!)
+   585→      assertEquals("video/avc", probed.videoMime)
+   586→      assertDurationWithin(probed.durationUs, fixture.durationUs, "masked F->N")
+   587→    } finally {
+   588→      VelmuxJni.nativeDestroyEngine(handle)
+   589→    }
+   590→  }
+   591→
+   592→  /**
+   593→   * N->F: "ffmpeg-decoders" hides FFmpeg's video decoders (no FFmpeg
+   594→   * whole-pipeline transcode, no FFmpeg decode side) and
+   595→   * "android-whole-pipeline" removes the Android ENCODE side of its report
+   596→   * (no Android whole-pipeline candidate; Android remains the decode stage
+   597→   * side). The ONLY plan left is Android stage decode -> FFmpeg (libx264)
+   598→   * stage encode. Route selection only — all media work is real.
+   599→   */
+   600→  @Test
+   601→  fun testNToF_maskedDecodersForceHybrid() {
+   602→    val fixture = generateMp4(2)
+   603→    // Audio disabled for the same stream-copy reason as the F->N fallback
+   604→    // (identical in/out codecs+container would otherwise remux, which is
+   605→    // correct behavior but not the hybrid path under test).
+   606→    val request = """
+   607→      {
+   608→        "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
+   609→        "outputContainer": "mp4",
+   610→        "goal": {"kind": "custom"},
+   611→        "video": {"codec": "h264", "enabled": true,
+   612→                  "rateControl": "bitrate", "bitRate": 800000},
+   613→        "audio": {"enabled": false},
+   614→        "subtitles": {"policy": "remove"},
+   615→        "processingMode": "auto"
+   616→      }
+   617→    """.trimIndent()
+   618→
+   619→    val outcome = runMaskedEngine(request, freshWorkDir("ntof"),
+   620→        "ffmpeg-decoders,android-whole-pipeline")
+   621→    if (outcome.error == "ffmpeg-absent") {
+   622→      // The app was built without the FFmpeg backend (CI without the pinned
+   623→      // artifacts): the cross-backend route cannot exist. Honest skip.
+   624→      Assume.assumeTrue(
+   625→          "the app was built without the FFmpeg backend (N->F hybrid needs it)",
+   626→          false)
+   627→    }
+   628→    assertHybridRunCompleted(outcome, "masked N->F (H.264 -> H.264)")
+   629→    val probed = probe(outcome.outputPath!!)
+   630→    assertEquals("video/avc", probed.videoMime)
+   631→    assertDurationWithin(probed.durationUs, fixture.durationUs, "N->F")
+   632→  }
+   633→}
+   634→
