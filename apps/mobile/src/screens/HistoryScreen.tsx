@@ -47,32 +47,48 @@ export function HistoryScreen() {
     ({item}: ListRenderItemInfo<JobSnapshot>) => {
       const request = requests[item.id];
       const canReuse = request !== undefined;
+      // One screen-reader element per completed conversion: name, sizes,
+      // saved space and the pipeline summary read as a single row.
+      const rowLabel = [
+        item.sourceName,
+        `${formatBytes(item.inputSizeBytes)} to ${formatBytes(
+          item.outputSizeBytes,
+        )}`,
+        `Saved ${formatSavedPercent(item.inputSizeBytes, item.outputSizeBytes)}`,
+        item.pipelineSummary ?? undefined,
+      ]
+        .filter(part => part !== undefined)
+        .join(', ');
       return (
         <View
           style={[styles.row, {backgroundColor: theme.colors.surface}]}>
-          <AppText variant="bodyStrong" numberOfLines={1}>
-            {item.sourceName}
-          </AppText>
-          <View style={styles.sizeRow}>
-            <AppText variant="caption" tone="secondary" numeric>
-              {formatBytes(item.inputSizeBytes)} →{' '}
-              {formatBytes(item.outputSizeBytes)}
+          <View accessible accessibilityLabel={rowLabel} style={styles.infoGroup}>
+            <AppText variant="bodyStrong" numberOfLines={1}>
+              {item.sourceName}
             </AppText>
-            <AppText variant="caption" tone="success" numeric>
-              Saved {formatSavedPercent(item.inputSizeBytes, item.outputSizeBytes)}
-            </AppText>
+            <View style={styles.sizeRow}>
+              <AppText variant="caption" tone="secondary" numeric>
+                {formatBytes(item.inputSizeBytes)} →{' '}
+                {formatBytes(item.outputSizeBytes)}
+              </AppText>
+              <AppText variant="caption" tone="success" numeric>
+                Saved{' '}
+                {formatSavedPercent(item.inputSizeBytes, item.outputSizeBytes)}
+              </AppText>
+            </View>
+            {item.pipelineSummary !== null && (
+              <AppText variant="caption" tone="muted" numberOfLines={2}>
+                {item.pipelineSummary}
+              </AppText>
+            )}
           </View>
-          {item.pipelineSummary !== null && (
-            <AppText variant="caption" tone="muted" numberOfLines={2}>
-              {item.pipelineSummary}
-            </AppText>
-          )}
           <View style={styles.actions}>
             <OutputActions job={item} />
             <Button
               label="Reuse settings"
               variant="secondary"
               disabled={!canReuse}
+              accessibilityLabel={`Reuse settings for ${item.sourceName}`}
               onPress={() => {
                 if (!request) {
                   return;
@@ -146,6 +162,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,
     padding: 12,
+    gap: 8,
+  },
+  infoGroup: {
     gap: 8,
   },
   sizeRow: {

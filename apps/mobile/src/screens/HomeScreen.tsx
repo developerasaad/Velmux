@@ -426,7 +426,18 @@ export function HomeScreen() {
                 style={[
                   styles.resultRow,
                   {backgroundColor: theme.colors.surface},
-                ]}>
+                ]}
+                accessible
+                accessibilityLabel={[
+                  job.sourceName,
+                  `${formatBytes(job.inputSizeBytes)} to ${formatBytes(
+                    job.outputSizeBytes,
+                  )}`,
+                  `Saved ${formatSavedPercent(
+                    job.inputSizeBytes,
+                    job.outputSizeBytes,
+                  )}`,
+                ].join(', ')}>
                 <AppText
                   variant="captionStrong"
                   numberOfLines={1}

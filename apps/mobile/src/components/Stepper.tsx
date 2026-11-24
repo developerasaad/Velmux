@@ -17,6 +17,9 @@ export interface StepperProps {
   initialWhenNull?: number;
   format?: (value: number) => string;
   testID?: string;
+  /** Control name for screen readers, e.g. "frame rate" — announces
+   * "Increase frame rate, 30 fps" / "Decrease frame rate, 30 fps". */
+  accessibilityLabel?: string;
 }
 
 /**
@@ -33,6 +36,7 @@ export function Stepper({
   initialWhenNull,
   format,
   testID,
+  accessibilityLabel,
 }: StepperProps) {
   const theme = useTheme();
   const display =
@@ -41,6 +45,13 @@ export function Stepper({
       : format
         ? format(value)
         : String(Math.round(value * 100) / 100);
+
+  const decreaseLabel = accessibilityLabel
+    ? `Decrease ${accessibilityLabel}, ${display}`
+    : 'Decrease value';
+  const increaseLabel = accessibilityLabel
+    ? `Increase ${accessibilityLabel}, ${display}`
+    : 'Increase value';
 
   const stepValue = (direction: 1 | -1) => {
     if (value === null) {
@@ -63,6 +74,7 @@ export function Stepper({
   };
 
   const minusDisabled = value !== null && min !== undefined && value <= min;
+  const plusDisabled = value !== null && max !== undefined && value >= max;
 
   return (
     <View
@@ -70,7 +82,8 @@ export function Stepper({
       testID={testID}>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel="Decrease value"
+        accessibilityLabel={decreaseLabel}
+        accessibilityState={{disabled: minusDisabled}}
         disabled={minusDisabled}
         onPress={() => stepValue(-1)}
         style={({pressed}) => [
@@ -94,14 +107,15 @@ export function Stepper({
       </AppText>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel="Increase value"
-        disabled={value !== null && max !== undefined && value >= max}
+        accessibilityLabel={increaseLabel}
+        accessibilityState={{disabled: plusDisabled}}
+        disabled={plusDisabled}
         onPress={() => stepValue(1)}
         style={({pressed}) => [
           styles.button,
           styles.buttonPlus,
           {borderColor: theme.colors.border},
-          value !== null && max !== undefined && value >= max && styles.disabled,
+          plusDisabled && styles.disabled,
           pressed && styles.pressed,
         ]}>
         <AppText variant="bodyStrong" tone="primary">

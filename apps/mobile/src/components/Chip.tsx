@@ -12,6 +12,9 @@ export interface ChipProps {
   onPress: () => void;
   disabled?: boolean;
   testID?: string;
+  /** Screen-reader label; defaults to the visible label. OptionChips uses it
+   * to prefix the group name (e.g. "Video codec, H.264"). */
+  accessibilityLabel?: string;
 }
 
 /** Selectable option chip. Touch target is at least 44 pt. */
@@ -21,13 +24,14 @@ export function Chip({
   onPress,
   disabled = false,
   testID,
+  accessibilityLabel,
 }: ChipProps) {
   const theme = useTheme();
   return (
     <Pressable
       testID={testID}
       accessibilityRole="button"
-      accessibilityLabel={label}
+      accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{selected, disabled}}
       disabled={disabled}
       onPress={onPress}

@@ -14,6 +14,9 @@ export interface OptionChipsProps<T> {
   onSelect: (value: T) => void;
   disabled?: boolean;
   testID?: string;
+  /** Composed into each chip's screen-reader label so options are heard
+   * with their group context (e.g. "Video codec, H.264"). */
+  accessibilityLabelPrefix?: string;
 }
 
 /**
@@ -26,6 +29,7 @@ export function OptionChips<T>({
   onSelect,
   disabled = false,
   testID,
+  accessibilityLabelPrefix,
 }: OptionChipsProps<T>) {
   return (
     <View style={styles.wrap} testID={testID}>
@@ -36,6 +40,11 @@ export function OptionChips<T>({
           selected={option.value === selected}
           disabled={disabled}
           onPress={() => onSelect(option.value)}
+          accessibilityLabel={
+            accessibilityLabelPrefix !== undefined
+              ? `${accessibilityLabelPrefix}, ${option.label}`
+              : undefined
+          }
         />
       ))}
     </View>

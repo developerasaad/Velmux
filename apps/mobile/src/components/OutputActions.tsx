@@ -116,6 +116,7 @@ export function OutputActions({job}: OutputActionsProps) {
         label="Remove"
         variant="dangerGhost"
         loading={removing}
+        accessibilityLabel={`Remove ${job.sourceName} from history`}
         onPress={confirmRemove}
       />
     );
@@ -127,6 +128,7 @@ export function OutputActions({job}: OutputActionsProps) {
         label="Share"
         variant="secondary"
         disabled={outputPath === null}
+        accessibilityLabel={`Share ${job.outputName ?? job.sourceName}`}
         onPress={() => {
           shareOutput();
         }}
@@ -135,6 +137,7 @@ export function OutputActions({job}: OutputActionsProps) {
         label="Remove"
         variant="dangerGhost"
         loading={removing}
+        accessibilityLabel={`Remove ${job.sourceName} from history`}
         onPress={confirmRemove}
       />
     </>

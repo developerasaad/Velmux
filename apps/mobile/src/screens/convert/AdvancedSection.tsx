@@ -173,6 +173,7 @@ export function AdvancedSection() {
             options={VIDEO_CODEC_OPTIONS}
             selected={draft.video.codec}
             onSelect={setVideoCodec}
+            accessibilityLabelPrefix="Video codec"
           />
 
           <AdvancedLabel>Encoder / backend preference</AdvancedLabel>
@@ -180,6 +181,7 @@ export function AdvancedSection() {
             options={PROCESSING_OPTIONS}
             selected={draft.processingMode}
             onSelect={setProcessingMode}
+            accessibilityLabelPrefix="Encoder preference"
           />
 
           <AdvancedLabel>Rate control</AdvancedLabel>
@@ -187,6 +189,7 @@ export function AdvancedSection() {
             options={RATE_CONTROL_OPTIONS}
             selected={draft.video.rateControl}
             onSelect={setRateControl}
+            accessibilityLabelPrefix="Rate control"
           />
 
           {draft.video.rateControl === 'bitrate' && (
@@ -200,6 +203,7 @@ export function AdvancedSection() {
                 max={200_000_000}
                 initialWhenNull={4_000_000}
                 format={value => `${(value / 1_000_000).toFixed(1)} Mb/s`}
+                accessibilityLabel="video bitrate"
               />
             </View>
           )}
@@ -214,6 +218,7 @@ export function AdvancedSection() {
                 min={0}
                 max={100}
                 initialWhenNull={60}
+                accessibilityLabel="quality"
               />
             </View>
           )}
@@ -229,6 +234,7 @@ export function AdvancedSection() {
               initialWhenNull={30}
               nullLabel="Original"
               format={value => `${Math.round(value)} fps`}
+              accessibilityLabel="frame rate"
             />
           </View>
 
@@ -237,6 +243,7 @@ export function AdvancedSection() {
             options={PROFILE_OPTIONS}
             selected={draft.extras.profile}
             onSelect={profile => setExtras({profile})}
+            accessibilityLabelPrefix="Video profile"
           />
 
           <AdvancedLabel>Level</AdvancedLabel>
@@ -244,6 +251,7 @@ export function AdvancedSection() {
             options={LEVEL_OPTIONS}
             selected={draft.extras.level}
             onSelect={level => setExtras({level})}
+            accessibilityLabelPrefix="Video level"
           />
 
           <AdvancedLabel>Pixel format</AdvancedLabel>
@@ -251,6 +259,7 @@ export function AdvancedSection() {
             options={PIXEL_FORMAT_OPTIONS}
             selected={draft.extras.pixelFormat}
             onSelect={pixelFormat => setExtras({pixelFormat})}
+            accessibilityLabelPrefix="Pixel format"
           />
 
           <AdvancedLabel>Bit depth</AdvancedLabel>
@@ -258,6 +267,7 @@ export function AdvancedSection() {
             options={BIT_DEPTH_OPTIONS}
             selected={draft.extras.bitDepth}
             onSelect={bitDepth => setExtras({bitDepth})}
+            accessibilityLabelPrefix="Bit depth"
           />
 
           <View style={styles.field}>
@@ -270,6 +280,7 @@ export function AdvancedSection() {
               max={600}
               initialWhenNull={48}
               format={value => `${Math.round(value)} frames`}
+              accessibilityLabel="GOP size"
             />
           </View>
 
@@ -282,6 +293,7 @@ export function AdvancedSection() {
               min={0}
               max={8}
               initialWhenNull={2}
+              accessibilityLabel="B-frames"
             />
           </View>
 
@@ -290,6 +302,7 @@ export function AdvancedSection() {
             options={AUDIO_CODEC_OPTIONS}
             selected={draft.audio.codec}
             onSelect={setAudioCodec}
+            accessibilityLabelPrefix="Audio codec"
           />
 
           <View style={styles.field}>
@@ -302,6 +315,7 @@ export function AdvancedSection() {
               max={320_000}
               initialWhenNull={128_000}
               format={value => `${Math.round(value / 1000)} kb/s`}
+              accessibilityLabel="audio bitrate"
             />
           </View>
 
@@ -310,6 +324,7 @@ export function AdvancedSection() {
             options={SAMPLE_RATE_OPTIONS}
             selected={draft.audio.sampleRate}
             onSelect={setAudioSampleRate}
+            accessibilityLabelPrefix="Audio sample rate"
           />
 
           <AdvancedLabel>Channel layout</AdvancedLabel>
@@ -317,6 +332,7 @@ export function AdvancedSection() {
             options={CHANNEL_LAYOUT_OPTIONS}
             selected={draft.audio.channels}
             onSelect={setAudioChannels}
+            accessibilityLabelPrefix="Audio channel layout"
           />
 
           <AdvancedLabel>Subtitle behavior</AdvancedLabel>
@@ -324,6 +340,7 @@ export function AdvancedSection() {
             options={SUBTITLE_BEHAVIOR_OPTIONS}
             selected={draft.subtitles.policy}
             onSelect={setSubtitlePolicy}
+            accessibilityLabelPrefix="Subtitle behavior"
           />
 
           <View style={styles.field}>
@@ -335,6 +352,7 @@ export function AdvancedSection() {
               min={-10_000}
               max={10_000}
               format={value => `${value > 0 ? '+' : ''}${Math.round(value)} ms`}
+              accessibilityLabel="subtitle timing offset"
             />
           </View>
 
@@ -343,6 +361,7 @@ export function AdvancedSection() {
             options={METADATA_OPTIONS}
             selected={draft.extras.metadata}
             onSelect={metadata => setExtras({metadata})}
+            accessibilityLabelPrefix="Metadata behavior"
           />
 
           <View style={styles.resetRow}>

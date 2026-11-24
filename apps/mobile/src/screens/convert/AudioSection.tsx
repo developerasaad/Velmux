@@ -79,6 +79,7 @@ export function AudioSection() {
             options={CODEC_OPTIONS}
             selected={draft.audio.codec}
             onSelect={setAudioCodec}
+            accessibilityLabelPrefix="Audio codec"
           />
 
           <AppText variant="caption" tone="secondary">
@@ -88,6 +89,7 @@ export function AudioSection() {
             options={BITRATE_OPTIONS}
             selected={draft.audio.bitRate}
             onSelect={setAudioBitRate}
+            accessibilityLabelPrefix="Audio bitrate"
           />
 
           <AppText variant="caption" tone="secondary">
@@ -97,6 +99,7 @@ export function AudioSection() {
             options={SAMPLE_RATE_OPTIONS}
             selected={draft.audio.sampleRate}
             onSelect={setAudioSampleRate}
+            accessibilityLabelPrefix="Audio sample rate"
           />
 
           <AppText variant="caption" tone="secondary">
@@ -106,6 +109,7 @@ export function AudioSection() {
             options={CHANNEL_LAYOUT_OPTIONS}
             selected={draft.audio.channels}
             onSelect={setAudioChannels}
+            accessibilityLabelPrefix="Audio channels"
           />
         </View>
       )}

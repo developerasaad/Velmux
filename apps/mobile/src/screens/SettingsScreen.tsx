@@ -103,6 +103,7 @@ export function SettingsScreen() {
           options={THEME_OPTIONS}
           selected={themeMode}
           onSelect={setThemeMode}
+          accessibilityLabelPrefix="Theme"
         />
       </Section>
 
@@ -114,6 +115,7 @@ export function SettingsScreen() {
           options={GOAL_OPTIONS}
           selected={defaultGoal}
           onSelect={setDefaultGoal}
+          accessibilityLabelPrefix="Default goal"
         />
         <AppText variant="caption" tone="secondary">
           Default output container
@@ -122,6 +124,7 @@ export function SettingsScreen() {
           options={CONTAINER_OPTIONS}
           selected={defaultOutputContainer}
           onSelect={setDefaultOutputContainer}
+          accessibilityLabelPrefix="Default output container"
         />
       </Section>
 
@@ -132,6 +135,7 @@ export function SettingsScreen() {
           options={PROCESSING_OPTIONS}
           selected={processingPreference}
           onSelect={setProcessingPreference}
+          accessibilityLabelPrefix="Processing preference"
         />
       </Section>
 
@@ -180,7 +184,12 @@ export function SettingsScreen() {
         title="Diagnostics"
         hint="Engine bridge and backend registry for this build.">
         <View style={styles.diagnosticsCard}>
-          <View style={styles.diagnosticRow}>
+          <View
+            style={styles.diagnosticRow}
+            accessible
+            accessibilityLabel={`Engine bridge, ${
+              bridgeAvailable ? 'Connected' : 'Not linked'
+            }`}>
             <AppText variant="caption" tone="secondary">
               Engine bridge
             </AppText>

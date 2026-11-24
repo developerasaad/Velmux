@@ -24,6 +24,11 @@ import {EstimateCard} from './convert/EstimateCard';
 import type {PlanState} from './convert/EstimateCard';
 import {GoalSection} from './convert/GoalSection';
 import {OutputSection} from './convert/OutputSection';
+import {
+  SAMPLE_PREVIEW_SECONDS,
+  SamplePreviewCard,
+} from './convert/SamplePreviewCard';
+import type {SampleState} from './convert/SamplePreviewCard';
 import {SourceInfoCard} from './convert/SourceInfoCard';
 import type {InspectState} from './convert/SourceInfoCard';
 import {SubtitlesSection} from './convert/SubtitlesSection';
@@ -45,10 +50,14 @@ export function ConvertScreen({route}: ConvertScreenProps) {
     status: 'idle',
   });
   const [planState, setPlanState] = useState<PlanState>({status: 'idle'});
+  const [sampleState, setSampleState] = useState<SampleState>({
+    status: 'idle',
+  });
   const [starting, setStarting] = useState(false);
 
   const inspectRun = useRef(0);
   const planRun = useRef(0);
+  const sampleRun = useRef(0);
 
   // Initialize the draft when entering the workspace with a new source.
   useEffect(() => {
@@ -178,6 +187,56 @@ export function ConvertScreen({route}: ConvertScreenProps) {
     };
   }, [draft]);
 
+  // Sample preview (spec §20): generates a short sample over the densest
+  // section of the source with the exact request the Convert action sends.
+  const runSample = useCallback(async () => {
+    const computed = computeRequest(useConvertStore.getState().draft);
+    if (computed === null) {
+      return;
+    }
+    if (!engineClient.isEngineAvailable()) {
+      setSampleState({
+        status: 'unavailable',
+        message: BRIDGE_UNAVAILABLE_MESSAGE,
+      });
+      return;
+    }
+    const run = sampleRun.current + 1;
+    sampleRun.current = run;
+    setSampleState({status: 'generating'});
+    try {
+      const sample = await engineClient.generateSample(
+        computed,
+        SAMPLE_PREVIEW_SECONDS,
+      );
+      if (sampleRun.current === run) {
+        setSampleState({status: 'ready', sample});
+      }
+    } catch (error) {
+      if (sampleRun.current !== run) {
+        return;
+      }
+      if (error instanceof EngineBridgeUnavailable) {
+        setSampleState({status: 'unavailable', message: error.message});
+        return;
+      }
+      setSampleState({
+        status: 'error',
+        message: engineClient.describeEngineError(error),
+      });
+    }
+  }, []);
+
+  // A sample reflects the current settings: any draft change invalidates
+  // it (the same rule the estimate follows) and discards an in-flight
+  // generation, so a preview is never shown next to changed settings.
+  useEffect(() => {
+    sampleRun.current += 1;
+    setSampleState(previous =>
+      previous.status === 'idle' ? previous : {status: 'idle'},
+    );
+  }, [draft]);
+
   const planInfeasible =
     planState.status === 'ready' && planState.feasible === false;
   const canStart = bridgeAvailable && draft.source !== null && !planInfeasible;
@@ -245,6 +304,13 @@ export function ConvertScreen({route}: ConvertScreenProps) {
       <EstimateCard planState={planState} onRetry={() => {
         runPlan();
       }} />
+      {planState.status === 'ready' && (
+        <SamplePreviewCard
+          sourceName={source.displayName}
+          sampleState={sampleState}
+          onGenerate={runSample}
+        />
+      )}
       <AdvancedSection />
     </Screen>
   );

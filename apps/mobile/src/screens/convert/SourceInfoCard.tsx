@@ -66,7 +66,14 @@ export function SourceInfoCard({
         </AppText>
       ) : (
         <View style={styles.infoStack}>
-          <View style={styles.summaryRow}>
+          <View
+            style={styles.summaryRow}
+            accessible
+            accessibilityLabel={[
+              inspectState.info.container,
+              formatBytes(inspectState.info.sizeBytes),
+              formatDuration(inspectState.info.durationSec),
+            ].join(', ')}>
             <AppText variant="caption" tone="secondary">
               {inspectState.info.container}
             </AppText>

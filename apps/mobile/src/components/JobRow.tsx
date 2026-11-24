@@ -20,12 +20,38 @@ export interface JobRowProps {
 /**
  * Job row with real state only: progress comes from the engine snapshot,
  * unknown progress renders "—", and no ETAs are ever invented.
+ *
+ * The informational content is exposed to screen readers as a single
+ * element (name, state, progress, pipeline, error); per-job action buttons
+ * stay individually focusable below it.
  */
 export function JobRow({job, compact = false, actions}: JobRowProps) {
   const theme = useTheme();
   const completed = job.state === 'completed';
   const knownProgress =
     Number.isFinite(job.progress) && job.progress >= 0 && job.progress <= 1;
+
+  const progressLabel = completed
+    ? job.outputSizeBytes !== null
+      ? `Output ${formatBytes(job.outputSizeBytes)}`
+      : 'Output size unknown'
+    : knownProgress
+      ? `Progress ${formatPercent(job.progress)}`
+      : 'Progress unknown';
+
+  const rowLabel = [
+    job.sourceName,
+    jobStateLabel(job.state),
+    progressLabel,
+    !compact && job.pipelineSummary !== null
+      ? job.pipelineSummary
+      : undefined,
+    !compact && job.state === 'failed' && job.error !== null
+      ? job.error
+      : undefined,
+  ]
+    .filter(part => part !== undefined)
+    .join(', ');
 
   return (
     <View
@@ -34,42 +60,54 @@ export function JobRow({job, compact = false, actions}: JobRowProps) {
         compact && styles.compact,
         {backgroundColor: theme.colors.surface},
       ]}>
-      <View style={styles.titleRow}>
-        <AppText
-          variant={compact ? 'captionStrong' : 'bodyStrong'}
-          style={styles.name}
-          numberOfLines={1}>
-          {job.sourceName}
-        </AppText>
-        <StateChip label={jobStateLabel(job.state)} tone={jobStateTone(job.state)} />
-      </View>
-
-      {completed ? (
-        <AppText variant="caption" tone="secondary" numeric>
-          {job.outputSizeBytes !== null
-            ? `Output ${formatBytes(job.outputSizeBytes)}`
-            : 'Output size unknown'}
-        </AppText>
-      ) : (
-        <View style={styles.progressRow}>
-          <ProgressBar progress={job.progress} />
-          <AppText variant="caption" tone="secondary" numeric style={styles.percent}>
-            {formatPercent(knownProgress ? job.progress : null)}
+      <View
+        accessible
+        accessibilityLabel={rowLabel}
+        style={compact ? styles.infoGroupCompact : styles.infoGroup}>
+        <View style={styles.titleRow}>
+          <AppText
+            variant={compact ? 'captionStrong' : 'bodyStrong'}
+            style={styles.name}
+            numberOfLines={1}>
+            {job.sourceName}
           </AppText>
+          <StateChip
+            label={jobStateLabel(job.state)}
+            tone={jobStateTone(job.state)}
+          />
         </View>
-      )}
 
-      {!compact && job.pipelineSummary !== null && (
-        <AppText variant="caption" tone="muted" numberOfLines={2}>
-          {job.pipelineSummary}
-        </AppText>
-      )}
+        {completed ? (
+          <AppText variant="caption" tone="secondary" numeric>
+            {job.outputSizeBytes !== null
+              ? `Output ${formatBytes(job.outputSizeBytes)}`
+              : 'Output size unknown'}
+          </AppText>
+        ) : (
+          <View style={styles.progressRow}>
+            <ProgressBar progress={job.progress} />
+            <AppText
+              variant="caption"
+              tone="secondary"
+              numeric
+              style={styles.percent}>
+              {formatPercent(knownProgress ? job.progress : null)}
+            </AppText>
+          </View>
+        )}
 
-      {!compact && job.state === 'failed' && job.error !== null && (
-        <AppText variant="caption" tone="danger" style={styles.error}>
-          {job.error}
-        </AppText>
-      )}
+        {!compact && job.pipelineSummary !== null && (
+          <AppText variant="caption" tone="muted" numberOfLines={2}>
+            {job.pipelineSummary}
+          </AppText>
+        )}
+
+        {!compact && job.state === 'failed' && job.error !== null && (
+          <AppText variant="caption" tone="danger" style={styles.error}>
+            {job.error}
+          </AppText>
+        )}
+      </View>
 
       {actions !== undefined && <View style={styles.actions}>{actions}</View>}
     </View>
@@ -85,6 +123,12 @@ const styles = StyleSheet.create({
   },
   compact: {
     padding: 10,
+    gap: 6,
+  },
+  infoGroup: {
+    gap: 8,
+  },
+  infoGroupCompact: {
     gap: 6,
   },
   titleRow: {

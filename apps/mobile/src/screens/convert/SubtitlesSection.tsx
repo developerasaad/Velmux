@@ -63,6 +63,7 @@ export function SubtitlesSection() {
         options={POLICY_OPTIONS}
         selected={draft.subtitles.policy}
         onSelect={setSubtitlePolicy}
+        accessibilityLabelPrefix="Subtitle behavior"
       />
 
       <View style={styles.block}>
@@ -76,6 +77,7 @@ export function SubtitlesSection() {
           min={-10_000}
           max={10_000}
           format={value => `${value > 0 ? '+' : ''}${Math.round(value)} ms`}
+          accessibilityLabel="subtitle timing offset"
         />
       </View>
 
@@ -103,6 +105,7 @@ export function SubtitlesSection() {
             <Button
               label="Remove"
               variant="ghost"
+              accessibilityLabel="Remove subtitle file"
               onPress={() => setExternalSubtitle(null)}
             />
           </View>

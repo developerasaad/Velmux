@@ -15,6 +15,9 @@ export interface ButtonProps {
   loading?: boolean;
   size?: 'regular' | 'large';
   testID?: string;
+  /** Screen-reader label; defaults to the visible label. Used to add context
+   * the visible text cannot carry (e.g. "Cancel conversion of beach.mp4"). */
+  accessibilityLabel?: string;
 }
 
 export function Button({
@@ -25,6 +28,7 @@ export function Button({
   loading = false,
   size = 'regular',
   testID,
+  accessibilityLabel,
 }: ButtonProps) {
   const theme = useTheme();
   const isPrimary = variant === 'primary';
@@ -74,7 +78,7 @@ export function Button({
     <Pressable
       testID={testID}
       accessibilityRole="button"
-      accessibilityLabel={label}
+      accessibilityLabel={accessibilityLabel ?? label}
       accessibilityState={{disabled: inactive}}
       disabled={inactive}
       onPress={onPress}

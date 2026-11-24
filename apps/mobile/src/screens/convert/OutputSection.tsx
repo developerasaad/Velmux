@@ -48,6 +48,7 @@ export function OutputSection() {
           options={CONTAINER_OPTIONS}
           selected={draft.outputContainer ?? ''}
           onSelect={setOutputContainer}
+          accessibilityLabelPrefix="Output format"
         />
         <View style={styles.videoToggle}>
           <ToggleRow
@@ -72,6 +73,7 @@ export function OutputSection() {
             setResolutionChoice(value as ResolutionOption['id'])
           }
           disabled={!draft.video.enabled}
+          accessibilityLabelPrefix="Resolution"
         />
         {draft.resolutionChoice === 'custom' && (
           <View style={styles.customResolution}>

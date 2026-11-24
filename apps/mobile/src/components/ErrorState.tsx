@@ -23,12 +23,17 @@ export function ErrorState({
   return (
     <View
       style={[styles.container, {borderColor: theme.colors.danger}]}>
-      <AppText variant="bodyStrong" tone="danger">
-        {title}
-      </AppText>
-      <AppText variant="caption" tone="secondary" style={styles.message}>
-        {message}
-      </AppText>
+      <View
+        accessible
+        accessibilityLabel={`${title}, ${message}`}
+        style={styles.textGroup}>
+        <AppText variant="bodyStrong" tone="danger">
+          {title}
+        </AppText>
+        <AppText variant="caption" tone="secondary" style={styles.message}>
+          {message}
+        </AppText>
+      </View>
       {onRetry !== undefined && retryLabel !== undefined && (
         <View style={styles.retry}>
           <Button label={retryLabel} variant="secondary" onPress={onRetry} />
@@ -43,6 +48,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     padding: 16,
+    gap: 4,
+  },
+  textGroup: {
     gap: 4,
   },
   message: {

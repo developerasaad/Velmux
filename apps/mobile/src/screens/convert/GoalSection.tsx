@@ -41,6 +41,7 @@ export function GoalSection() {
         options={GOAL_OPTIONS}
         selected={basePreset}
         onSelect={setBasePreset}
+        accessibilityLabelPrefix="Goal"
       />
 
       {showTargetSize && (
@@ -61,11 +62,15 @@ export function GoalSection() {
             options={UNIT_OPTIONS}
             selected={targetSizeUnit}
             onSelect={setTargetSizeUnit}
+            accessibilityLabelPrefix="Target size unit"
           />
         </View>
       )}
 
-      <View style={styles.goalLabelRow}>
+      <View
+        style={styles.goalLabelRow}
+        accessible
+        accessibilityLabel={`Current goal, ${computeGoalLabel(draft)}`}>
         <AppText variant="caption" tone="secondary">
           Current goal
         </AppText>

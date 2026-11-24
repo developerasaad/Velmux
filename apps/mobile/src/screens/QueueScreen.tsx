@@ -64,6 +64,7 @@ export function QueueScreen() {
                 <Button
                   label="Cancel"
                   variant="secondary"
+                  accessibilityLabel={`Cancel conversion of ${item.sourceName}`}
                   onPress={() => confirmCancel(item)}
                 />
               )}
@@ -71,6 +72,7 @@ export function QueueScreen() {
                 <Button
                   label="Pause"
                   variant="secondary"
+                  accessibilityLabel={`Pause ${item.sourceName}`}
                   onPress={() => {
                     pauseJob(item.id);
                   }}
@@ -80,6 +82,7 @@ export function QueueScreen() {
                 <Button
                   label="Resume"
                   variant="secondary"
+                  accessibilityLabel={`Resume ${item.sourceName}`}
                   onPress={() => {
                     resumeJob(item.id);
                   }}
@@ -91,6 +94,7 @@ export function QueueScreen() {
                     label="Retry"
                     variant="secondary"
                     disabled={!hasRequest}
+                    accessibilityLabel={`Retry ${item.sourceName}`}
                     onPress={() => {
                       retryJob(item.id);
                     }}

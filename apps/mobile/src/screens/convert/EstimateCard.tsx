@@ -60,7 +60,14 @@ export function EstimateCard({planState, onRetry}: EstimateCardProps) {
   } else {
     content = (
       <View style={styles.stack}>
-        <View style={styles.sizeRow}>
+        <View
+          style={styles.sizeRow}
+          accessible
+          accessibilityLabel={`Estimated output, ${
+            planState.estimatedOutputBytes === null
+              ? 'not enough information yet'
+              : `about ${formatBytes(planState.estimatedOutputBytes)}`
+          }`}>
           <AppText variant="caption" tone="secondary">
             Estimated output
           </AppText>
