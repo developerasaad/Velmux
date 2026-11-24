@@ -211,3 +211,107 @@ with_pkg_config() {
 host_has_system() {
   pkg-config --exists "$1" 2>/dev/null
 }
+
+# ---------------------------------------------------------------------------
+# Build identity (artifact reuse contract)
+#
+# Every produced artifact records a BUILD-IDENTITY file: a hash over all
+# inputs that determine its contents — the pinned versions (versions.json),
+# the builder scripts themselves (configure flags live in them), the
+# target/ABI/slice, the policy knobs (API level, deployment target, feature
+# switches) and the toolchain revision that produced it. Consumers reuse an
+# artifact ONLY when the recorded identity matches the identity computed
+# from the current tree; anything else rebuilds. This prevents the
+# "blindly consume the latest artifact" failure mode.
+# ---------------------------------------------------------------------------
+
+# _hash_input_line <label> <value-or-file>
+_hash_input_line() {
+  printf '%s=' "$1"
+  if [ -f "$2" ]; then
+    sha256_of "$2"
+  else
+    printf '%s' "$2"
+  fi
+  printf '\n'
+}
+
+# compute_identity <target> <extra-k=v...> — print the identity hash.
+# Extra key=value pairs encode target policy knobs (api=29, deployment=15.0,
+# svt=1, ...). Toolchain identity is appended automatically per target:
+#   host  -> cc -dumpversion
+#   android -> NDK Pkg.Revision from ANDROID_NDK_HOME/ROOT source.properties
+#   ios   -> xcodebuild -version (first line)
+compute_identity() {
+  local target="$1"; shift
+  local inputs=()
+  local f
+  for f in versions.json lib.sh "build-$target.sh"; do
+    [ -f "$BUILDER_ROOT/$f" ] || die "identity input missing: $BUILDER_ROOT/$f"
+    inputs+=("$(_hash_input_line "file:$f" "$BUILDER_ROOT/$f")")
+  done
+  inputs+=("target=$target")
+  local kv
+  for kv in "$@"; do
+    inputs+=("knob:$kv")
+  done
+  case "$target" in
+    host)
+      inputs+=("toolchain=cc:$(cc -dumpversion 2>/dev/null || gcc -dumpversion 2>/dev/null || echo unknown)")
+      ;;
+    android)
+      local ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+      local rev="unknown"
+      if [ -n "$ndk" ] && [ -f "$ndk/source.properties" ]; then
+        rev="$(sed -n 's/^Pkg.Revision *= *//p' "$ndk/source.properties" | tr -d '[:space:]')"
+        [ -n "$rev" ] || rev="unreadable"
+      fi
+      inputs+=("toolchain=ndk:$rev")
+      ;;
+    ios)
+      inputs+=("toolchain=xcode:$(xcodebuild -version 2>/dev/null | head -1 | tr -d '\n' || echo unknown)")
+      ;;
+  esac
+  printf '%s\n' "${inputs[@]}" | sha256sum | cut -d' ' -f1
+}
+
+# identity_recorded <out-dir> — the hash recorded in BUILD-IDENTITY (empty
+# when absent or unreadable).
+identity_recorded() {
+  local f="$1/BUILD-IDENTITY"
+  if [ -f "$f" ]; then
+    head -1 "$f" 2>/dev/null || true
+  fi
+}
+
+# identity_matches <out-dir> <expected-hash>
+identity_matches() {
+  [ "$(identity_recorded "$1")" = "$2" ]
+}
+
+# write_identity <out-dir> <hash> <description> — records the identity plus
+# a human-readable provenance block for debugging.
+write_identity() {
+  local dir="$1" hash="$2" desc="$3"
+  mkdir -p "$dir"
+  {
+    printf '%s\n' "$hash"
+    printf 'built: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
+    printf '%s\n' "$desc"
+  } > "$dir/BUILD-IDENTITY"
+}
+
+# fixup_pkgconfig_prefix <dir> — make restored artifacts position-independent:
+# FFmpeg's generated .pc files bake the build-time prefix into absolute
+# paths; rewrite prefix= to the directory the artifact actually lives in
+# now. Everything else in the .pc files is ${prefix}-relative.
+fixup_pkgconfig_prefix() {
+  local dir="$1" pc
+  [ -d "$dir" ] || return 0
+  local abs
+  abs="$(cd "$dir" && pwd)"
+  for pc in "$dir"/lib/pkgconfig/*.pc "$dir"/lib64/pkgconfig/*.pc; do
+    [ -f "$pc" ] || continue
+    sed -i.bak "s|^prefix=.*|prefix=$abs|" "$pc" && rm -f "$pc.bak"
+  done
+}

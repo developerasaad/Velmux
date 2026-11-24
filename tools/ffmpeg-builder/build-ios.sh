@@ -212,9 +212,17 @@ build_one_slice() {
   local slice="$1"
   slice_settings "$slice"
   local manifest="$SLICE_PREFIX/share/velmux/ffmpeg-capabilities.json"
-  if [ -f "$SLICE_PREFIX/lib/pkgconfig/libavcodec.pc" ] && [ -f "$manifest" ]; then
-    log "[$slice] build up to date"
+  local identity
+  identity="$(compute_identity ios "slice=$slice" "deployment=$DEPLOYMENT_TARGET" "svt=$SLICE_WANT_SVT")"
+  if [ -f "$SLICE_PREFIX/lib/pkgconfig/libavcodec.pc" ] && [ -f "$manifest" ] \
+     && identity_matches "$SLICE_PREFIX" "$identity"; then
+    log "[$slice] build up to date (identity verified)"
+    fixup_pkgconfig_prefix "$SLICE_PREFIX"
     return 0
+  fi
+  if [ -d "$SLICE_PREFIX" ] && ! identity_matches "$SLICE_PREFIX" "$identity"; then
+    log "[$slice] recorded build identity does not match the current tree; rebuilding"
+    rm -rf "$SLICE_PREFIX"
   fi
 
   local build_tmp="$SRC_DIR/build-$SLICE_TAG"
@@ -637,6 +645,9 @@ ZPC
   python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest" >&2
 
   unset CC CXX AR RANLIB STRIP NM PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
+  write_identity "$SLICE_PREFIX" "$identity" \
+    "ios FFmpeg, slice=$slice deployment=$DEPLOYMENT_TARGET, jobs=$JOBS"
+  fixup_pkgconfig_prefix "$SLICE_PREFIX"
   log "[$slice] build complete: $SLICE_PREFIX"
 }
 
@@ -656,6 +667,7 @@ cp -R "$OUT_DIR/ios/slices/ios-device-arm64/lib" "$DEVICE_OUT/"
 mkdir -p "$DEVICE_OUT/share/velmux"
 cp "$OUT_DIR/ios/slices/ios-device-arm64/share/velmux/ffmpeg-capabilities.json" \
    "$DEVICE_OUT/share/velmux/"
+cp "$OUT_DIR/ios/slices/ios-device-arm64/BUILD-IDENTITY" "$DEVICE_OUT/" 2>/dev/null || true
 
 log "assembling iphonesimulator layout (lipo arm64 + x86_64)"
 SIM_OUT="$OUT_DIR/ios/iphonesimulator"
@@ -677,6 +689,9 @@ for lib in "$SIM_ARM64"/lib/*.a; do
 done
 # pkg-config files are consumed at build time only; ship the arm64 ones.
 cp -R "$SIM_ARM64/lib/pkgconfig" "$SIM_OUT/lib/" 2>/dev/null || true
+# The assembled simulator layout reuses the arm64 slice identity (the
+# pkg-config files and headers come from that slice).
+cp "$OUT_DIR/ios/slices/ios-sim-arm64/BUILD-IDENTITY" "$SIM_OUT/" 2>/dev/null || true
 
 AGGREGATE="$OUT_DIR/ios/manifest.json"
 log "aggregating manifests"

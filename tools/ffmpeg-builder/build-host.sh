@@ -42,9 +42,22 @@ host_build_complete() {
   return 0
 }
 
-if host_build_complete; then
-  log "host build up to date"
+# Build identity over every input that determines the artifact contents.
+HOST_IDENTITY="$(compute_identity host)"
+
+if host_build_complete && identity_matches "$HOST_PREFIX" "$HOST_IDENTITY"; then
+  log "host build up to date (identity verified)"
+  fixup_pkgconfig_prefix "$HOST_PREFIX"
   exit 0
+fi
+
+# When the recorded identity of an existing (possibly incomplete or stale)
+# prefix does not match the current tree, wipe it so the per-library
+# "already installed" checks below cannot silently mix artifacts from
+# different builder/versions generations.
+if [ -d "$HOST_PREFIX" ] && ! identity_matches "$HOST_PREFIX" "$HOST_IDENTITY"; then
+  log "recorded build identity does not match the current tree; rebuilding from scratch"
+  rm -rf "$HOST_PREFIX"
 fi
 
 mkdir -p "$HOST_PREFIX" "$SRC_DIR"
@@ -350,5 +363,12 @@ fi
 # ---------------------------------------------------------------------------
 log "validating build"
 python3 "$BUILDER_ROOT/validate.py" "$MANIFEST"
+
+# Final gate: every library, the pkg-config files and the capability
+# manifest must be present, and the identity must be recorded.
+host_build_complete || die "host build finished but the artifact is incomplete"
+write_identity "$HOST_PREFIX" "$HOST_IDENTITY" \
+  "host FFmpeg ($(uname -srm)), jobs=$JOBS"
+fixup_pkgconfig_prefix "$HOST_PREFIX"
 
 log "host build complete: $HOST_PREFIX"

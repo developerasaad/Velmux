@@ -16,13 +16,24 @@ if linkage != nil
   use_frameworks! :linkage => linkage.to_sym
 end
 
-# The engine pod compiles the FFmpeg backend only when VELMUX_FFMPEG_ROOT
-# points at the packaged xcframework (see VelmuxEngine.podspec). The same
-# variable decides whether the VelmuxEngineTests bundle may reference the
-# real FFmpeg backend in C++ — the generated header below carries that
-# decision to the test target at compile time.
+# FFmpeg is MANDATORY for the Velmux app: VELMUX_FFMPEG_ROOT must point at
+# the packaged xcframework (see VelmuxEngine.podspec). scripts/ios/build.sh
+# resolves/builds and packages it before calling `pod install`; running
+# pod install by hand without it fails loudly instead of silently building
+# an app without its FFmpeg backend. The same variable decides whether the
+# VelmuxEngineTests bundle may reference the real FFmpeg backend in C++ —
+# the generated header below carries that decision to the test target at
+# compile time.
 velmux_ffmpeg_root = ENV['VELMUX_FFMPEG_ROOT']
-velmux_ffmpeg_enabled = !velmux_ffmpeg_root.nil? && !velmux_ffmpeg_root.empty?
+if velmux_ffmpeg_root.nil? || velmux_ffmpeg_root.empty?
+  raise <<~MSG
+    VELMUX_FFMPEG_ROOT is not set: the Velmux app requires the pinned FFmpeg
+    backend. Run the build through scripts/ios/build.sh (resolves or builds
+    the artifacts and exports the variable), or set it manually to the
+    output of tools/ffmpeg-builder/package-ios-xcframework.sh.
+  MSG
+end
+velmux_ffmpeg_enabled = true
 
 target 'Velmux' do
   config = use_native_modules!

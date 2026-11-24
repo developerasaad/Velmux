@@ -156,10 +156,18 @@ build_one_abi() {
 
   local prefix="$OUT_DIR/android/$abi"
   local manifest="$prefix/share/velmux/ffmpeg-capabilities.json"
-  if [ -f "$prefix/lib/pkgconfig/libavcodec.pc" ] && [ -f "$manifest" ]; then
-    log "[$abi] build up to date"
+  local identity
+  identity="$(compute_identity android "abi=$abi" "api=$API_LEVEL" "svt=$WANT_SVT")"
+  if [ -f "$prefix/lib/pkgconfig/libavcodec.pc" ] && [ -f "$manifest" ] \
+     && identity_matches "$prefix" "$identity"; then
+    log "[$abi] build up to date (identity verified)"
+    fixup_pkgconfig_prefix "$prefix"
     echo "$abi"
     return 0
+  fi
+  if [ -d "$prefix" ] && ! identity_matches "$prefix" "$identity"; then
+    log "[$abi] recorded build identity does not match the current tree; rebuilding"
+    rm -rf "$prefix"
   fi
 
   local srctag="android-$abi"
@@ -580,6 +588,13 @@ ZPC
   # stdout stays reserved for the ABI name (captured by the caller for the
   # aggregate manifest); validation output belongs to the build log.
   python3 "$BUILDER_ROOT/validate.py" $exempt "$manifest" >&2
+
+  # Record the build identity and make the pkg-config files
+  # position-independent (restored artifacts may live at a different path
+  # than the machine that built them).
+  write_identity "$prefix" "$identity" \
+    "android FFmpeg, abi=$abi api=$API_LEVEL, jobs=$JOBS"
+  fixup_pkgconfig_prefix "$prefix"
 
   # Unset per-ABI exports so the next ABI starts clean.
   unset CC CXX AR RANLIB STRIP NM PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
