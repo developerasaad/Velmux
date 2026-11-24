@@ -238,7 +238,7 @@ verify_launch() {
     || vdie "$phase: am start failed"
   local alive=0 pid=""
   for i in $(seq 1 12); do
-    pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r')"
+    pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r' || true)"
     if [ -n "$pid" ]; then
       alive=1
       break
@@ -267,7 +267,7 @@ verify_launch() {
   # dialog-up and app-resumed states).
   local resumed dismissed=0 i
   for i in $(seq 1 10); do
-    resumed="$(timeout 10 adb shell dumpsys activity activities 2>/dev/null | tr -d '\r')"
+    resumed="$(timeout 10 adb shell dumpsys activity activities 2>/dev/null | tr -d '\r' || true)"
     if printf '%s' "$resumed" | grep -q "ResumedActivity.*com.velmux.mobile"; then
       break
     fi
@@ -283,7 +283,7 @@ verify_launch() {
   # Keep it alive for a sustained window; a late crash (JNI load failure,
   # TurboModule registration, engine startup) must fail the run.
   sleep 12
-  pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r')"
+  pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r' || true)"
   [ -n "$pid" ] || vdie "$phase: the app process died shortly after launch"
   # RN initialization marker: the JS runtime must reach app init AND find
   # the native bridge. This is what proves libappmodules.so loaded (its
@@ -331,6 +331,13 @@ run_in "$ANDROID_DIR" ./gradlew connectedDebugAndroidTest --no-daemon --stacktra
 # ---------------------------------------------------------------------------
 # Terminate + relaunch (lifecycle smoke; the process must come back up)
 # ---------------------------------------------------------------------------
+# AGP uninstalls BOTH APKs when connectedDebugAndroidTest completes
+# (PACKAGE_REMOVED / PACKAGE_FULLY_REMOVED broadcasts in the run's
+# diagnostics; 'am force-stop' then logs 'Invalid packageName'). The
+# relaunch smoke needs the app back on the device first.
+vlog "reinstalling the app after the instrumented run"
+adb install -r "$APK" > /dev/null \
+  || vdie "relaunch: reinstalling $APK failed"
 vlog "force-stopping and relaunching"
 adb_t shell am force-stop com.velmux.mobile
 sleep 3
