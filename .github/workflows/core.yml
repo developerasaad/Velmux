@@ -1,6 +1,10 @@
 # Host CI for the shared C++ core and the FFmpeg backend.
-# Runs on a Linux x64 host: build the pinned FFmpeg through the Velmux
-# builder, then configure/build/test with CMake + Ninja + ctest.
+#
+# Dumb executor: checkout + toolchain + repository scripts + upload. All
+# build logic lives in the repository — ./scripts/test.sh resolves (or
+# builds) the pinned host FFmpeg, configures CMake, builds every registered
+# suite and runs ctest; scripts/ffmpeg/identity.sh supplies the exact cache
+# key so "cache hit" and "artifact valid" can never disagree.
 name: Core & FFmpeg backend (host)
 
 on:
@@ -56,56 +60,48 @@ jobs:
           fi
           cmake --version
 
+      - name: Compute FFmpeg artifact identity
+        id: ffid
+        run: echo "identity=$(bash scripts/ffmpeg/identity.sh host)" >> "$GITHUB_OUTPUT"
+
       - name: Restore host FFmpeg cache
         id: ffmpeg-cache
         uses: actions/cache/restore@v4
         with:
-          # Cache both the built host toolchain and the downloaded source
-          # tarballs. The key changes whenever the pinned versions change.
+          # Both the built host artifacts and the downloaded source tarballs.
+          # The key is the exact identity the scripts verify before reuse.
           path: |
             tools/ffmpeg-builder/out/host
             tools/ffmpeg-builder/downloads
-          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
-          restore-keys: |
-            ffmpeg-host-${{ runner.os }}-
+          key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
 
-      - name: Build pinned host FFmpeg
-        id: build-ffmpeg
+      # The repository script owns everything: FFmpeg resolve/rebuild,
+      # CMake configure, build, ctest. FFmpeg is mandatory — the script
+      # fails loudly when it cannot be produced; there is no fallback.
+      - name: Host suite (FFmpeg resolve + build + ctest)
+        id: host-suite
         env:
           # ubuntu-latest runners provide 4 vCPUs.
           VELMUX_FFMPEG_JOBS: 4
-        run: |
-          # The builder is idempotent: on a warm cache it detects the existing
-          # out/host artifacts and skips the expensive rebuild.
-          tools/ffmpeg-builder/build-host.sh
+        run: ./scripts/test.sh
 
       - name: Save host FFmpeg cache
-        # Save only when the builder succeeded and this run actually built
-        # something (no exact cache hit), so a partial output can never poison
-        # the cache. A lost cross-run cache race only costs a later rebuild,
-        # hence continue-on-error.
-        if: steps.build-ffmpeg.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        # Save only when the suite succeeded and this run actually built
+        # something (no exact cache hit), so a partial output can never
+        # poison the cache. A lost cross-run cache race only costs a later
+        # rebuild, hence continue-on-error.
+        if: steps.host-suite.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
             tools/ffmpeg-builder/out/host
             tools/ffmpeg-builder/downloads
-          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
-
-      - name: Configure (CMake)
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVELMUX_BUILD_TESTS=ON -DVELMUX_FFMPEG_PREFIX="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/host"
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Test (ctest)
-        run: ctest --test-dir build --output-on-failure
+          key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
 
       # Runs only when a .clang-format file exists at the repository root;
       # hashFiles returns an empty string otherwise and the step is skipped
-      # silently.
+      # silently. (A lint, not build logic — it stays in CI.)
       - name: clang-format check
         if: hashFiles('.clang-format') != ''
         run: |
@@ -122,14 +118,27 @@ jobs:
             echo "No C/C++ sources found; nothing to check."
           fi
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      # TypeScript suite (type check + lint) through the repository script;
+      # it installs the JS dependencies itself when node_modules is missing.
+      - name: TypeScript suite (type check + lint)
+        run: ./scripts/test.sh --ts
+
       - name: Upload build and test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: core-build-logs
-          # Not every failure produces logs; missing files are tolerated.
+          # The host suite builds in build/host. Not every failure produces
+          # logs; missing files are tolerated.
           path: |
-            build/**/Testing/
-            build/CMakeFiles/*.log
+            build/host/**/Testing/
+            build/host/CMakeFiles/*.log
           if-no-files-found: ignore
           retention-days: 7

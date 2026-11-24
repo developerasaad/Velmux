@@ -1,8 +1,11 @@
-# Heavy FFmpeg cross-compilation for mobile platforms. Produces the native
-# artifacts consumed by the Android and Apple backends (Milestone 3).
+# Heavy FFmpeg cross-compilation for mobile platforms through the
+# repository build script. Produces the native FFmpeg artifacts under
+# tools/ffmpeg-builder/out; consumers restore them from identity-keyed
+# actions/cache entries (see android.yml / ios.yml / release.yml), so the
+# run artifacts uploaded here serve inspection and manual debugging.
 #
-# Heavy builds: manual dispatch only until Milestone 3 validates the toolchain;
-# path-based auto-trigger will be enabled when build times are acceptable.
+# Heavy builds: manual dispatch only; path-based auto-trigger will be
+# enabled when build times are acceptable.
 name: FFmpeg mobile artifacts
 
 on:
@@ -26,23 +29,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
-      - name: Set up JDK 17
+      # sdkmanager is a Java tool; the build script needs it when the pinned
+      # NDK is not present yet and must be installed.
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      # ubuntu-latest runners ship the Android SDK with cmdline-tools at
-      # /usr/local/lib/android/sdk (ANDROID_HOME is preset). The
-      # android-actions/setup-android action is unnecessary here and currently
-      # broken (it tries to install the removed legacy 'tools' package).
-      - name: Install NDK 27.0.12077973 and platform-tools
-        run: |
-          # sdkmanager lives in the preinstalled cmdline-tools, not on PATH.
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "ndk;27.0.12077973" "platform-tools"
+      # The build script auto-resolves the pinned NDK: it finds
+      # $ANDROID_HOME/ndk/<pinned> or installs it through sdkmanager, which
+      # lives in the preinstalled cmdline-tools (not on PATH by default).
+      - name: Expose sdkmanager (NDK auto-install fallback)
+        run: echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       - name: Install host build tools
         run: |
@@ -50,12 +49,6 @@ jobs:
           # meson: dav1d/fribidi cross builds; nasm: dav1d x86_64 asm;
           # pkg-config: FFmpeg configure probes the cross prefix.
           sudo apt-get install -y ninja-build meson nasm pkg-config
-
-      - name: Export ANDROID_NDK_HOME
-        run: |
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.0.12077973" >> "$GITHUB_ENV"
-          # Fail fast if the NDK did not land where we expect it.
-          test -d "${ANDROID_HOME}/ndk/27.0.12077973"
 
       - name: Restore FFmpeg source cache
         id: ffmpeg-sources
@@ -68,14 +61,14 @@ jobs:
           restore-keys: |
             ffmpeg-downloads-${{ runner.os }}-
 
+      # The repository script owns everything: NDK resolution and the
+      # arm64-v8a / armeabi-v7a / x86_64 cross-builds.
       - name: Build FFmpeg for all Android ABIs
         id: build-ffmpeg
         env:
           # ubuntu-latest runners provide 4 vCPUs.
           VELMUX_FFMPEG_JOBS: 4
-        run: |
-          # Script contract: builds arm64-v8a, armeabi-v7a, and x86_64.
-          tools/ffmpeg-builder/build-android.sh --all-abis
+        run: ./scripts/build.sh --ffmpeg-android --all-abis
 
       - name: Save FFmpeg source cache
         # Save only after a successful build and only when this run actually
@@ -127,12 +120,12 @@ jobs:
           restore-keys: |
             ffmpeg-downloads-${{ runner.os }}-
 
+      # The repository script owns everything: the iphoneos and
+      # iphonesimulator slices, laid out so they can be wrapped into an
+      # xcframework.
       - name: Build FFmpeg for iOS
         id: build-ffmpeg
-        run: |
-          # Script contract: builds iphoneos and iphonesimulator slices,
-          # laid out so they can be wrapped into an xcframework.
-          tools/ffmpeg-builder/build-ios.sh
+        run: ./scripts/build.sh --ffmpeg-ios
 
       - name: Save FFmpeg source cache
         # Save only after a successful build and only when this run actually

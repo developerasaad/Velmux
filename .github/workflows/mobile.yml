@@ -1,5 +1,8 @@
 # CI for the React Native application (TypeScript only: type check + lint).
-# Native builds live in android.yml and ios.yml.
+#
+# Thin wrapper: ./scripts/test.sh --ts owns the logic (JS dependency install
+# included). This workflow stays separate from core.yml because its trigger
+# paths (apps/**, bridge/ts/**) are broader than core.yml's.
 name: Mobile app (TS)
 
 on:
@@ -28,8 +31,6 @@ jobs:
     name: Type check and lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # NOTE: until apps/mobile/package.json exists, this job fails at the
-    # Node/npm setup or install step; the workflow itself stays valid.
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -41,21 +42,5 @@ jobs:
           cache: npm
           cache-dependency-path: apps/mobile/package-lock.json
 
-      - name: Install dependencies
-        working-directory: apps/mobile
-        run: |
-          # Prefer a reproducible install from the lockfile; fall back to a
-          # plain install only when the lockfile is missing or out of sync.
-          if ! npm ci --no-audit --no-fund; then
-            echo "npm ci failed (lockfile missing or out of sync); falling back to npm install"
-            npm install --no-audit --no-fund
-          fi
-
-      - name: Type check (tsc)
-        working-directory: apps/mobile
-        run: npx tsc --noEmit
-
-      - name: Lint
-        working-directory: apps/mobile
-        run: npm run lint
-        continue-on-error: false
+      - name: TypeScript suite
+        run: ./scripts/test.sh --ts

@@ -1,8 +1,9 @@
-# CI for the iOS application: CocoaPods install, a simulator build with
-# code signing disabled (no certificates needed on CI), the VelmuxEngine
-# simulator XCTest suite (real engine execution: native, FFmpeg and hybrid
-# paths; FFmpeg-dependent tests skip honestly on builds without the pinned
-# artifacts), and a Release build to keep it green on every push.
+# CI for the iOS application: the repository's test script (simulator run:
+# FFmpeg resolve/rebuild, Release simulator app build with the embedded JS
+# bundle, cold-launch + RN init marker verification, the VelmuxEngineTests
+# XCTest suite, relaunch) followed by the unsigned device Release product
+# build through the repository's build script. CI only provides the
+# toolchain, an identity-keyed FFmpeg cache, and the artifact upload.
 name: iOS build
 
 on:
@@ -29,18 +30,15 @@ concurrency:
 
 permissions:
   contents: read
-  # actions: read is required to download artifacts produced by the
-  # ffmpeg-mobile workflow's runs (Milestone 3 wiring).
-  actions: read
 
 jobs:
-  build:
-    name: iOS simulator build
+  ios:
+    name: iOS simulator suite and device build
     runs-on: macos-15
-    # The Debug + Release builds and the engine test suite (fixtures are
-    # generated and transcoded on-simulator) together need more than the
-    # old 60-minute budget on busy runners.
-    timeout-minutes: 90
+    # The simulator suite (FFmpeg + Release app build + engine XCTest suite
+    # with on-simulator fixtures) plus the device Release build need more
+    # than the old 90-minute budget on busy runners when FFmpeg is cold.
+    timeout-minutes: 120
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -49,111 +47,71 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
 
-      - name: Install JS dependencies
-        working-directory: apps/mobile
-        run: npm ci --no-audit --no-fund
+      # The iOS FFmpeg cross-build (run by the scripts when the artifacts
+      # are missing or stale) needs these. cmake/ninja/pkg-config are
+      # preinstalled on macOS runners.
+      - name: Install FFmpeg build tools
+        run: |
+          # meson: dav1d/fribidi cross builds; nasm assembles libvpx's
+          # x86_64 code for the Intel simulator slice.
+          if ! command -v meson >/dev/null 2>&1; then
+            brew install meson
+          fi
+          if ! command -v nasm >/dev/null 2>&1; then
+            brew install nasm
+          fi
 
-      # Milestone 3 wiring: consume the pinned FFmpeg iOS artifacts from the
-      # latest successful ffmpeg-mobile run on main so the built app carries
-      # the real FFmpeg backend. Push events only: fork pull requests cannot
-      # read this repository's cross-run artifacts.
-      - name: Locate FFmpeg iOS artifacts
-        id: ffmpeg-artifact
-        if: github.event_name == 'push'
-        uses: actions/github-script@v7
+      - name: Compute FFmpeg artifact identity
+        id: ffid
+        run: echo "identity=$(bash scripts/ffmpeg/identity.sh ios device)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore FFmpeg artifacts
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
         with:
-          script: |
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'ffmpeg-mobile.yml',
-                status: 'success',
-                per_page: 10,
-              },
-            );
-            const run = runs.find(
-              (r) => r.head_branch === 'main' && r.path === '.github/workflows/ffmpeg-mobile.yml',
-            );
-            if (!run) {
-              core.warning(
-                'No successful ffmpeg-mobile run on main; building without the FFmpeg backend',
-              );
-              return;
-            }
-            core.info(`Using FFmpeg artifacts from run ${run.id}`);
-            core.setOutput('run-id', String(run.id));
+          # Both the built iOS artifacts (device + simulator slices) and the
+          # downloaded source tarballs. The key is the exact identity the
+          # scripts verify before reuse.
+          path: |
+            tools/ffmpeg-builder/out/ios
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-ios-device-${{ steps.ffid.outputs.identity }}
 
-      - name: Download FFmpeg iOS artifacts
-        if: steps.ffmpeg-artifact.outputs.run-id != ''
-        uses: actions/download-artifact@v4
+      # The repository script owns everything: FFmpeg resolve/rebuild,
+      # xcframework packaging, pod install, the Release simulator app
+      # build, simulator boot, cold-launch + RN init marker verification,
+      # the VelmuxEngineTests XCTest suite, and the relaunch check.
+      - name: iOS simulator suite (FFmpeg resolve + app build + XCTest)
+        id: ios-sim
+        run: ./scripts/test.sh --ios-sim
+
+      # The product-build gate: the unsigned device Release build
+      # (CODE_SIGNING_ALLOWED=NO is passed by the script). Products land in
+      # apps/mobile/ios/build-device/Build/Products/Release-iphoneos/.
+      - name: Build Release for iOS devices (unsigned)
+        id: device-build
+        run: ./scripts/build.sh --ios --release
+
+      - name: Save FFmpeg artifacts
+        # Save only after the builds succeeded and only when this run
+        # actually built something (no exact cache hit), so a partial
+        # output can never poison the cache. A lost cross-run cache race
+        # only costs a later rebuild, hence continue-on-error.
+        if: steps.device-build.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
         with:
-          name: velmux-ffmpeg-ios
-          run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: tools/ffmpeg-builder/out/ios
+          path: |
+            tools/ffmpeg-builder/out/ios
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-ios-device-${{ steps.ffid.outputs.identity }}
 
-      - name: Package FFmpeg xcframework
-        if: steps.ffmpeg-artifact.outputs.run-id != ''
-        run: |
-          if [ -d "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios/iphoneos" ]; then
-            bash tools/ffmpeg-builder/package-ios-xcframework.sh \
-              "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/ios" \
-              "${GITHUB_WORKSPACE}/ffmpeg-ios-packaged"
-            echo "VELMUX_FFMPEG_ROOT=${GITHUB_WORKSPACE}/ffmpeg-ios-packaged" >> "$GITHUB_ENV"
-          else
-            echo "::warning::FFmpeg iOS artifacts incomplete; building without the FFmpeg backend"
-          fi
-
-      - name: Install CocoaPods dependencies
-        working-directory: apps/mobile/ios
-        run: |
-          if [ ! -f Podfile ]; then
-            echo "No Podfile found; skipping pod install."
-            exit 0
-          fi
-          # CocoaPods is preinstalled on macOS runners; install it on demand
-          # if the image ever drops it.
-          if ! command -v pod >/dev/null 2>&1; then
-            sudo gem install cocoapods
-          fi
-          if [ -n "${VELMUX_FFMPEG_ROOT:-}" ]; then
-            echo "pod install with FFmpeg backend (${VELMUX_FFMPEG_ROOT})"
-          fi
-          pod install
-
-      # Raw xcodebuild output only: piping through xcpretty hid compile
-      # diagnostics in earlier failures. CODE_SIGNING_ALLOWED=NO keeps the
-      # simulator build certificate-free.
-      - name: Build for the iOS simulator
-        working-directory: apps/mobile/ios
-        run: |
-          xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO
-
-      # Engine test suite (VelmuxEngineTests): real engine execution on the
-      # simulator — native whole-pipeline + FFmpeg transcodes through the
-      # app's exact engine surface, the core HybridExecutor composing the
-      # Apple/FFmpeg stage workers, forced F->N and N->F hybrid routes, and
-      # an honest mid-run-cancel lifecycle check. Fixtures are generated
-      # ON-SIMULATOR (AVAssetWriter H.264+AAC) and outputs are validated by
-      # an independent AVAsset/AVAssetReader probe. FFmpeg-dependent tests
-      # skip honestly when the app was built without the pinned FFmpeg
-      # artifacts (fork pull requests); HEVC-encode tests skip on runtimes
-      # without a VideoToolbox HEVC encoder. The device list is echoed for
-      # diagnosability when a destination is missing.
-      - name: Run engine tests on the iOS simulator
-        working-directory: apps/mobile/ios
-        run: |
-          xcrun simctl list devices available
-          xcodebuild test -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' CODE_SIGNING_ALLOWED=NO
-
-      # Release configuration must stay green on every push too: catches
-      # optimizer/dead-code issues the Debug build never sees. The full
-      # release artifact pipeline (packaging, checksums, GitHub Release)
-      # lives in .github/workflows/release.yml.
-      - name: Build Release for the iOS simulator
-        working-directory: apps/mobile/ios
-        run: |
-          xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Release -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO
+      - name: Upload device app
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-ios-device-app
+          path: apps/mobile/ios/build-device/Build/Products/Release-iphoneos/Velmux.app
+          if-no-files-found: error

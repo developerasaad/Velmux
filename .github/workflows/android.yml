@@ -1,5 +1,8 @@
-# CI for the Android application: JS dependency install plus debug APK
-# assembly through the Gradle wrapper.
+# CI for the Android application: a release build through the repository's
+# build script. FFmpeg is mandatory — ./scripts/build.sh resolves it
+# (identity-checked reuse or rebuild) itself; CI only provides the toolchain
+# (Node/JDK/Gradle), an identity-keyed FFmpeg cache, and the artifact
+# upload.
 name: Android build
 
 on:
@@ -26,15 +29,13 @@ concurrency:
 
 permissions:
   contents: read
-  # actions: read is required to download artifacts produced by the
-  # ffmpeg-mobile workflow's runs (Milestone 3 wiring).
-  actions: read
 
 jobs:
-  apk:
-    name: Assemble debug APK
+  android:
+    name: Android release build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # FFmpeg arm64 cold build + R8 release build.
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -46,10 +47,6 @@ jobs:
           cache: npm
           cache-dependency-path: apps/mobile/package-lock.json
 
-      - name: Install JS dependencies
-        working-directory: apps/mobile
-        run: npm ci --no-audit --no-fund
-
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -57,73 +54,71 @@ jobs:
           java-version: '21'
 
       # Gradle dependency and wrapper caching is enabled by default here.
-      # Note: the first run starts with an empty Gradle cache, so expect a
-      # cold and slow build; subsequent runs restore Gradle state from cache.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # Milestone 3 wiring: consume the pinned FFmpeg Android artifacts from
-      # the latest successful ffmpeg-mobile run on main so the shipped APK
-      # carries the real FFmpeg backend. Push events only: fork pull requests
-      # cannot read this repository's cross-run artifacts.
-      - name: Locate FFmpeg Android artifacts
-        id: ffmpeg-artifact
-        if: github.event_name == 'push'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'ffmpeg-mobile.yml',
-                status: 'success',
-                per_page: 10,
-              },
-            );
-            const run = runs.find(
-              (r) => r.head_branch === 'main' && r.path === '.github/workflows/ffmpeg-mobile.yml',
-            );
-            if (!run) {
-              core.warning(
-                'No successful ffmpeg-mobile run on main; building without the FFmpeg backend',
-              );
-              return;
-            }
-            core.info(`Using FFmpeg artifacts from run ${run.id}`);
-            core.setOutput('run-id', String(run.id));
+      # The build script auto-resolves the pinned NDK: it finds
+      # $ANDROID_HOME/ndk/<pinned> or installs it through sdkmanager, which
+      # lives in the preinstalled cmdline-tools (not on PATH by default).
+      - name: Expose sdkmanager (NDK auto-install fallback)
+        run: echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
-      - name: Download FFmpeg Android artifacts
-        if: steps.ffmpeg-artifact.outputs.run-id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: velmux-ffmpeg-android
-          run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # The artifact's pkg-config files bake absolute paths from the
-          # ffmpeg-mobile runner workspace; restoring the same tree keeps
-          # them valid (both workflows check out at
-          # /home/runner/work/Velmux/Velmux).
-          path: tools/ffmpeg-builder/out/android
-
-      - name: Assemble debug APK
-        working-directory: apps/mobile/android
+      - name: Compute FFmpeg artifact identity
+        id: ffid
         run: |
-          if [ -d "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/android/arm64-v8a" ]; then
-            ./gradlew assembleDebug --no-daemon --stacktrace \
-              -PvelmuxFFmpegPrefix="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/android"
-          else
-            echo "::warning::No FFmpeg Android artifacts available; the APK builds with the Android backend only (the engine reports this honestly at runtime)."
-            ./gradlew assembleDebug --no-daemon --stacktrace
-          fi
+          # The Android FFmpeg identity includes the resolved NDK revision;
+          # resolve the NDK exactly the way the build scripts do so the
+          # cache key can never disagree with the identity fetch.sh
+          # verifies during the build.
+          source scripts/lib/common.sh
+          resolve_android_ndk
+          echo "identity=$(bash scripts/ffmpeg/identity.sh android arm64-v8a)" >> "$GITHUB_OUTPUT"
 
-      # Always attempt the upload so a compiled APK is kept even when a later
-      # step fails, but never fail merely because no APK was produced.
-      - name: Upload debug APK
-        if: always()
+      - name: Restore FFmpeg artifacts
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          # Both the built arm64-v8a artifacts and the downloaded source
+          # tarballs. The key is the exact identity the scripts verify
+          # before reuse.
+          path: |
+            tools/ffmpeg-builder/out/android
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-android-arm64-v8a-${{ steps.ffid.outputs.identity }}
+
+      # The repository script owns everything: FFmpeg resolve/rebuild, JS
+      # dependency install, gradle assembleRelease + bundleRelease.
+      - name: Build release APK and AAB
+        id: build
+        env:
+          # ubuntu-latest runners provide 4 vCPUs.
+          VELMUX_FFMPEG_JOBS: 4
+        run: ./scripts/build.sh --android --release
+
+      - name: Save FFmpeg artifacts
+        # Save only after a successful build and only when this run actually
+        # built something (no exact cache hit), so a partial output can
+        # never poison the cache. A lost cross-run cache race only costs a
+        # later rebuild, hence continue-on-error.
+        if: steps.build.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            tools/ffmpeg-builder/out/android
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-android-arm64-v8a-${{ steps.ffid.outputs.identity }}
+
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: velmux-android-debug-apk
-          path: apps/mobile/android/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: ignore
+          name: velmux-android-release-apk
+          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload release AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: velmux-android-release-aab
+          path: apps/mobile/android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error

@@ -1,20 +1,17 @@
-# Android instrumented tests on real emulators (Milestones 1/13/4
-# validation).
+# Android instrumented tests on real emulators.
 #
 # The instrumented suite in apps/mobile runs REAL MediaCodec conversions
 # through the engine's JNI facade against fixtures generated on-device by
 # real encoders, and validates outputs with an independent MediaExtractor
-# probe. This workflow is the first time those tests actually execute:
-# API 29 (the product floor) and a modern API level, both x86_64 AOSP.
+# probe. This workflow runs them on API 29 (the product floor) and a modern
+# API level, both x86_64 google_apis images.
 #
-# The engine on the emulator carries BOTH backends whenever the pinned
-# FFmpeg Android artifacts from the latest successful ffmpeg-mobile run on
-# main are available (same mechanism as .github/workflows/android.yml):
-# the hybrid (stage-composed) instrumented tests then run for real —
-# FFmpeg stage decode -> Android MediaCodec stage encode and back.
-# Without the artifacts the engine honestly reports the FFmpeg backend
-# absent and those tests skip (Assume); the native Android backend tests
-# (including the all-Android stage-composed N->N hybrid) still run.
+# Dumb executor: CI provides KVM, the emulator/system image (cached), the
+# toolchain, and an identity-keyed FFmpeg cache; scripts/test.sh
+# --android-emulator owns everything else (KVM permission fix, AVD
+# creation, boot with timeout-wrapped polling, x86_64 app + FFmpeg build —
+# FFmpeg is mandatory and identity-checked — cold-launch verification, the
+# instrumented engine suite, and the relaunch check).
 name: Android emulated
 
 on:
@@ -41,9 +38,6 @@ concurrency:
 
 permissions:
   contents: read
-  # actions: read is required to download artifacts produced by the
-  # ffmpeg-mobile workflow's runs (Milestone 4 wiring, same as android.yml).
-  actions: read
 
 jobs:
   instrumented:
@@ -57,7 +51,8 @@ jobs:
           # google_apis images, not "default": the API 29 default image
           # hangs during headless boot on modern emulator builds (observed:
           # sys.boot_completed never set within 9 minutes with KVM working).
-          # google_apis images are the CI-proven set.
+          # google_apis images are the CI-proven set; the same pins live in
+          # scripts/lib/config.sh.
           - api-level: 29
             # Product floor: Android 10 / API 29 (docs/DECISIONS.md D-003).
             image: system-images;android-29;google_apis;x86_64
@@ -89,10 +84,6 @@ jobs:
           cache: npm
           cache-dependency-path: apps/mobile/package-lock.json
 
-      - name: Install JS dependencies
-        working-directory: apps/mobile
-        run: npm ci --no-audit --no-fund
-
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -101,6 +92,12 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      # The test script auto-resolves the pinned NDK: it finds
+      # $ANDROID_HOME/ndk/<pinned> or installs it through sdkmanager, which
+      # lives in the preinstalled cmdline-tools (not on PATH by default).
+      - name: Expose sdkmanager (NDK auto-install fallback)
+        run: echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       - name: Locate Android SDK tools
         id: sdk
@@ -141,149 +138,54 @@ jobs:
             /usr/local/lib/android/sdk/system-images/android-${{ matrix.api-level }}
           key: android-emu-v1-${{ matrix.api-level }}-${{ runner.os }}
 
-      - name: Restore NDK cache
-        id: ndk-cache
+      - name: Compute FFmpeg artifact identity
+        id: ffid
+        run: |
+          # The Android FFmpeg identity includes the resolved NDK revision;
+          # resolve the NDK exactly the way the build scripts do so the
+          # cache key can never disagree with the identity fetch.sh
+          # verifies during the build.
+          source scripts/lib/common.sh
+          resolve_android_ndk
+          echo "identity=$(bash scripts/ffmpeg/identity.sh android x86_64)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore FFmpeg artifacts
+        id: ffmpeg-cache
         uses: actions/cache/restore@v4
         with:
-          # Matched to apps/mobile/android/build.gradle ext.ndkVersion; the
-          # engine's CMake build needs it and AGP auto-installs on miss.
-          path: /usr/local/lib/android/sdk/ndk/27.1.12297006
-          key: android-ndk-27.1.12297006-${{ runner.os }}
+          # Both the built x86_64 artifacts (the emulator's ABI) and the
+          # downloaded source tarballs. The key is the exact identity the
+          # scripts verify before reuse.
+          path: |
+            tools/ffmpeg-builder/out/android
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-android-x86_64-${{ steps.ffid.outputs.identity }}
 
-      - name: Create AVD
-        run: |
-          mkdir -p "$ANDROID_AVD_HOME"
-          echo no | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/avdmanager \
-            create avd \
-            --name velmux-api${{ matrix.api-level }} \
-            --package "${{ matrix.image }}" \
-            --sdcard 2048M \
-            --force
-          # Keep the emulator from trying to load a heavy default profile.
-          printf '\n' >> "$ANDROID_AVD_HOME/velmux-api${{ matrix.api-level }}.avd/config.ini"
-          cat >> "$ANDROID_AVD_HOME/velmux-api${{ matrix.api-level }}.avd/config.ini" <<EOF
-          hw.ramSize=3072
-          hw.lcd.density=240
-          hw.lcd.width=720
-          hw.lcd.height=1280
-          disk.dataPartition.size=2G
-          hw.keyboard=yes
-          EOF
+      # The repository script owns everything: KVM permission fix, AVD
+      # creation, emulator boot with timeout-wrapped polling, the x86_64
+      # app + FFmpeg build (FFmpeg mandatory, identity-checked), install,
+      # cold-launch + fatal-error-scan verification, the instrumented engine
+      # suite, and the relaunch check.
+      - name: Emulator suite (boot + app build + instrumented tests)
+        id: emulator-suite
+        env:
+          # ubuntu-latest runners provide 4 vCPUs.
+          VELMUX_FFMPEG_JOBS: 4
+        run: ./scripts/test.sh --android-emulator --api ${{ matrix.api-level }}
 
-      - name: Boot emulator
-        timeout-minutes: 18
-        run: |
-          export PATH="/usr/local/lib/android/sdk/emulator:/usr/local/lib/android/sdk/platform-tools:$PATH"
-          nohup emulator -avd velmux-api${{ matrix.api-level }} \
-            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
-            -gpu swiftshader_indirect -accel on -cores 2 \
-            > /tmp/emulator.log 2>&1 &
-          adb wait-for-device
-          # Poll with visibility: print boot progress markers every 30 s so
-          # a hang is diagnosable from the log alone.
-          for i in $(seq 1 30); do
-            BOOT="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-            if [ "$BOOT" = "1" ]; then
-              echo "boot completed after ~$((i * 30))s"
-              break
-            fi
-            if ! pgrep -x emulator >/dev/null 2>&1; then
-              echo "emulator process died; log tail:"
-              tail -50 /tmp/emulator.log
-              exit 1
-            fi
-            sleep 30
-          done
-          BOOT="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
-          if [ "$BOOT" != "1" ]; then
-            echo "boot never completed; emulator log tail:"
-            tail -80 /tmp/emulator.log
-            adb devices -l || true
-            exit 1
-          fi
-          # Some system services settle slightly after boot_completed.
-          sleep 10
-          adb shell getprop sys.boot_completed
-          adb devices -l
-
-      # Milestone 4 wiring: the hybrid instrumented tests need the real
-      # FFmpeg backend on the emulator. Consume the pinned artifacts from
-      # the latest successful ffmpeg-mobile run on main (exact mechanism
-      # copied from .github/workflows/android.yml). Push events only: fork
-      # pull requests cannot read this repository's cross-run artifacts —
-      # without them the engine reports the FFmpeg backend absent and the
-      # FFmpeg-dependent tests Assume-skip honestly.
-      - name: Locate FFmpeg Android artifacts
-        id: ffmpeg-artifact
-        if: github.event_name == 'push'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'ffmpeg-mobile.yml',
-                status: 'success',
-                per_page: 10,
-              },
-            );
-            const run = runs.find(
-              (r) => r.head_branch === 'main' && r.path === '.github/workflows/ffmpeg-mobile.yml',
-            );
-            if (!run) {
-              core.warning(
-                'No successful ffmpeg-mobile run on main; the FFmpeg-dependent hybrid tests will skip',
-              );
-              return;
-            }
-            core.info(`Using FFmpeg artifacts from run ${run.id}`);
-            core.setOutput('run-id', String(run.id));
-
-      - name: Download FFmpeg Android artifacts
-        if: steps.ffmpeg-artifact.outputs.run-id != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: velmux-ffmpeg-android
-          run-id: ${{ steps.ffmpeg-artifact.outputs.run-id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Same tree as android.yml: the artifact's pkg-config files bake
-          # absolute paths from the ffmpeg-mobile runner workspace, and both
-          # workflows check out at /home/runner/work/Velmux/Velmux.
-          path: tools/ffmpeg-builder/out/android
-
-      - name: Run instrumented tests
-        working-directory: apps/mobile/android
-        run: |
-          export PATH="/usr/local/lib/android/sdk/platform-tools:$PATH"
-          # Disable animations for stable instrumentation timing.
-          adb shell settings put global window_animation_scale 0 || true
-          adb shell settings put global transition_animation_scale 0 || true
-          adb shell settings put global animator_duration_scale 0 || true
-          # Only the emulator's ABI is built (-PvelmuxAbis=x86_64): the
-          # native engine build drops to a third of the full ABI set. With
-          # the pinned FFmpeg artifacts available the engine on the
-          # emulator carries BOTH backends and the hybrid (stage-composed)
-          # tests run for real; without them the engine honestly reports
-          # the FFmpeg backend absent and those tests skip (Assume).
-          if [ -d "${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/android/x86_64" ]; then
-            ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
-              -PvelmuxAbis=x86_64 -PreactNativeArchitectures=x86_64 \
-              -PvelmuxFFmpegPrefix="${GITHUB_WORKSPACE}/tools/ffmpeg-builder/out/android"
-          else
-            echo "::warning::No FFmpeg Android artifacts available; running with the Android backend only (FFmpeg-dependent hybrid tests skip)."
-            ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
-              -PvelmuxAbis=x86_64 -PreactNativeArchitectures=x86_64
-          fi
-
-      - name: Save NDK cache
-        if: steps.ndk-cache.outputs.cache-hit != 'true'
+      - name: Save FFmpeg artifacts
+        # Save only after the suite succeeded and only when this run
+        # actually built something (no exact cache hit), so a partial
+        # output can never poison the cache. A lost cross-run cache race
+        # only costs a later rebuild, hence continue-on-error.
+        if: steps.emulator-suite.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: /usr/local/lib/android/sdk/ndk/27.1.12297006
-          key: android-ndk-27.1.12297006-${{ runner.os }}
+          path: |
+            tools/ffmpeg-builder/out/android
+            tools/ffmpeg-builder/downloads
+          key: ffmpeg-android-x86_64-${{ steps.ffid.outputs.identity }}
 
       - name: Collect diagnostics on failure
         if: failure()
@@ -293,7 +195,9 @@ jobs:
           # Bounded: a bugreport against a half-booted emulator can hang
           # indefinitely (observed eating 40 minutes of job time).
           timeout 90 adb bugreport /tmp/diag/bugreport.zip > /dev/null 2>&1 || true
-          cp /tmp/emulator.log /tmp/diag/ 2>/dev/null || true
+          # The test script writes its own emulator log to
+          # /tmp/velmux-emulator-*.log (mktemp pattern).
+          cp /tmp/velmux-emulator-*.log /tmp/diag/ 2>/dev/null || true
           adb shell getprop > /tmp/diag/getprop.txt 2>/dev/null || true
           adb devices -l > /tmp/diag/devices.txt 2>/dev/null || true
 
@@ -302,8 +206,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: velmux-android-emulated-api${{ matrix.api-level }}-diag
+          # /tmp/diag (bounded bugreport, getprop, devices) plus the test
+          # script's own emulator log and the gradle instrumented outputs.
           path: |
             /tmp/diag
+            /tmp/velmux-emulator-*.log
             apps/mobile/android/app/build/outputs/androidTest-results/
             apps/mobile/android/app/build/reports/
           if-no-files-found: ignore
