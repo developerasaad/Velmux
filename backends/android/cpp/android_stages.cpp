@@ -7,6 +7,8 @@
 
 #ifdef __ANDROID__
 
+#include "media_util.h"
+
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
@@ -213,6 +215,7 @@ struct AndroidStageDecoder::Impl {
   AMediaCodec *codec = nullptr;
   AImageReader *reader = nullptr;
   ANativeWindow *window = nullptr;
+  int extractorFd = -1; // source fd; closed after the extractor dies
   int videoTrack = -1;
   std::string videoMime;
   bool opened = false;
@@ -246,6 +249,10 @@ AndroidStageDecoder::~AndroidStageDecoder() {
   if (d.extractor != nullptr) {
     AMediaExtractor_delete(d.extractor);
   }
+  if (d.extractorFd >= 0) {
+    ::close(d.extractorFd);
+    d.extractorFd = -1;
+  }
 }
 
 Error AndroidStageDecoder::open(const std::string &sourcePath,
@@ -256,9 +263,10 @@ Error AndroidStageDecoder::open(const std::string &sourcePath,
   }
   Impl &d = *impl_;
   d.extractor = AMediaExtractor_new();
+  // fd-based source open: the path-based call fails on API 29
+  // ('can't create http service' — see media_util.h).
   if (d.extractor == nullptr ||
-      AMediaExtractor_setDataSource(d.extractor, sourcePath.c_str()) !=
-          AMEDIA_OK) {
+      !setExtractorDataSourceFd(d.extractor, sourcePath, d.extractorFd)) {
     return Error::make(ErrorCode::SourceUnavailable,
                        "cannot open the source", "android");
   }
@@ -987,6 +995,7 @@ struct AndroidMuxStage::Impl {
   std::string outputPath;
   // Audio copy (second extractor on the same source).
   AMediaExtractor *audioExtractor = nullptr;
+  int audioExtractorFd = -1; // source fd; closed after the extractor dies
   int audioTrack = -1;
   ssize_t audioMuxTrack = -1;
   StageSampleBuffer audioSample;
@@ -1019,6 +1028,10 @@ AndroidMuxStage::~AndroidMuxStage() {
   }
   if (m.audioExtractor != nullptr) {
     AMediaExtractor_delete(m.audioExtractor);
+  }
+  if (m.audioExtractorFd >= 0) {
+    ::close(m.audioExtractorFd);
+    m.audioExtractorFd = -1;
   }
 }
 
@@ -1063,10 +1076,10 @@ Error AndroidMuxStage::open(const std::string &outputPath,
   }
   if (tracks.copyAudio) {
     m.audioExtractor = AMediaExtractor_new();
+    // fd-based source open (path-based fails on API 29 — media_util.h).
     if (m.audioExtractor == nullptr ||
-        AMediaExtractor_setDataSource(m.audioExtractor,
-                                      tracks.sourcePath.c_str()) !=
-            AMEDIA_OK) {
+        !setExtractorDataSourceFd(m.audioExtractor, tracks.sourcePath,
+                                  m.audioExtractorFd)) {
       return Error::make(ErrorCode::SourceUnavailable,
                          "cannot open the audio copy source", "android");
     }

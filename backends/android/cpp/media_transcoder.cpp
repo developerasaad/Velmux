@@ -3,6 +3,8 @@
 
 #ifdef __ANDROID__
 
+#include "media_util.h"
+
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaExtractor.h>
 #include <media/NdkMediaFormat.h>
@@ -436,12 +438,16 @@ bool enumerateSupport(NativeSupport &out) {
 bool inspectFile(const std::string &path, MediaInfo &out,
                  std::string &error) {
   AMediaExtractor *extractor = AMediaExtractor_new();
-  media_status_t status = AMediaExtractor_setDataSource(extractor,
-                                                        path.c_str());
-  if (status != AMEDIA_OK) {
+  // Local sources go through the fd-based entry point: the path-based
+  // one fails on API 29 with AMEDIA_ERROR_UNSUPPORTED ('can't create
+  // http service' — see media_util.h).
+  int extractorFd = -1;
+  if (!setExtractorDataSourceFd(extractor, path, extractorFd)) {
     AMediaExtractor_delete(extractor);
-    error = "cannot open the source (status " + std::to_string(int(status)) +
-            ")";
+    if (extractorFd >= 0) {
+      ::close(extractorFd);
+    }
+    error = "cannot open the source";
     return false;
   }
   MediaInfo info;
@@ -519,6 +525,9 @@ bool inspectFile(const std::string &path, MediaInfo &out,
     AMediaFormat_delete(format);
   }
   AMediaExtractor_delete(extractor);
+  if (extractorFd >= 0) {
+    ::close(extractorFd);
+  }
   if (!info.hasVideo() && !info.hasAudio()) {
     error = "no recognizable media track";
     return false;
@@ -624,10 +633,15 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
   RunResult result;
   AMediaExtractor *extractor = AMediaExtractor_new();
   AMediaMuxer *muxer = nullptr;
+  int extractorFd = -1;
   int muxerFd = -1;
   auto cleanup = [&] {
     if (extractor != nullptr) {
       AMediaExtractor_delete(extractor);
+    }
+    if (extractorFd >= 0) {
+      ::close(extractorFd);
+      extractorFd = -1;
     }
     if (muxer != nullptr) {
       AMediaMuxer_delete(muxer);
@@ -638,8 +652,9 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
       muxerFd = -1;
     }
   };
-  if (AMediaExtractor_setDataSource(extractor, inPath.c_str()) !=
-      AMEDIA_OK) {
+  // fd-based source open: the path-based call fails on API 29
+  // ('can't create http service' — see media_util.h).
+  if (!setExtractorDataSourceFd(extractor, inPath, extractorFd)) {
     result.error = "cannot open the source";
     cleanup();
     return result;
@@ -795,10 +810,15 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   AMediaCodec *audioDecoder = nullptr;
   AMediaCodec *audioEncoder = nullptr;
   AMediaMuxer *muxer = nullptr;
+  int extractorFd = -1;
   int muxerFd = -1;
   auto cleanup = [&] {
     if (extractor != nullptr) {
       AMediaExtractor_delete(extractor);
+    }
+    if (extractorFd >= 0) {
+      ::close(extractorFd);
+      extractorFd = -1;
     }
     if (videoDecoder != nullptr) {
       AMediaCodec_stop(videoDecoder);
@@ -828,8 +848,9 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
       muxerFd = -1;
     }
   };
-  if (AMediaExtractor_setDataSource(extractor, inPath.c_str()) !=
-      AMEDIA_OK) {
+  // fd-based source open: the path-based call fails on API 29
+  // ('can't create http service' — see media_util.h).
+  if (!setExtractorDataSourceFd(extractor, inPath, extractorFd)) {
     result.error = "cannot open the source";
     cleanup();
     return result;
