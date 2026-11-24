@@ -13,9 +13,12 @@
 #      timeouts, which once ate an entire CI job silently);
 #   4. build the app for the emulator ABI ONLY (FFmpeg mandatory: the
 #      x86_64 artifacts are resolved or built through the identity-checked
-#      fetcher);
+#      fetcher). The debug build EMBEDS the JS bundle — there is no Metro
+#      on the CI machine, and the launch verification must exercise the
+#      real app (RN init, JS runtime, native bridge), not a Metro error;
 #   5. install, cold launch, and verify: process stays alive, activity
-#      resumed, no fatal errors in logcat;
+#      resumed, the RN init marker proves the JS runtime reached app init
+#      with the native bridge available, no fatal errors in logcat;
 #   6. run the full instrumented engine suite (real conversions, hybrid
 #      stage tests, checkpoint recovery) through gradle;
 #   7. force-stop, relaunch, verify alive again (lifecycle/persistence
@@ -210,8 +213,8 @@ timeout 30 adb wait-for-device 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # App build for the emulator ABI (FFmpeg mandatory through fetch.sh)
 # ---------------------------------------------------------------------------
-vlog "building the app for the emulator ($ABI)"
-bash "$SCRIPTS_DIR/android/build.sh" --debug --abi "$ABI"
+vlog "building the app for the emulator ($ABI, embedded JS bundle)"
+bash "$SCRIPTS_DIR/android/build.sh" --debug --abi "$ABI" --embed-bundle
 
 APK_GLOB="$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build/outputs/apk/debug/*.apk"
 APK="$(ls $APK_GLOB 2>/dev/null | head -1 || true)"
@@ -253,6 +256,25 @@ verify_launch() {
   sleep 12
   pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r')"
   [ -n "$pid" ] || vdie "$phase: the app process died shortly after launch"
+  # RN initialization marker: the JS runtime must reach app init AND find
+  # the native bridge. This is what proves libappmodules.so loaded (its
+  # JNI_OnLoad installs the TurboModule providers), React Native
+  # initialized, and the Velmux TurboModule answered — without it a
+  # process that is alive but RN-dead (e.g. 'PlatformConstants' could not
+  # be found) would pass silently.
+  local marker=""
+  for i in $(seq 1 15); do
+    marker="$(timeout 10 adb logcat -d 2>/dev/null | tr -d '\r' \
+      | grep -F '[Velmux] app init:' | tail -1 || true)"
+    [ -n "$marker" ] && break
+    sleep 2
+  done
+  [ -n "$marker" ] \
+    || vdie "$phase: the RN init marker never appeared (React Native or the JS runtime failed to initialize)"
+  case "$marker" in
+    *'[Velmux] app init: native bridge available'*) ;;
+    *) vdie "$phase: the native bridge is not available at app init: $marker" ;;
+  esac
   # Fatal-error scan over everything logged since launch.
   local log
   log="$(timeout 15 adb logcat -d 2>/dev/null || true)"
@@ -260,7 +282,7 @@ verify_launch() {
     printf '%s\n' "$log" | grep -E -A5 "FATAL EXCEPTION|SIGSEGV|SIGABRT|UnsatisfiedLinkError.*velmux" | head -60 >&2 || true
     vdie "$phase: fatal errors in logcat after launch"
   fi
-  vlog "$phase: app alive (pid $pid), MainActivity resumed, logcat clean"
+  vlog "$phase: app alive (pid $pid), RN init marker present, log clean"
 }
 
 verify_launch "cold launch"
@@ -273,6 +295,7 @@ ANDROID_DIR="$(repo_dir "$VELMUX_APP_ANDROID_DIR")"
 run_in "$ANDROID_DIR" ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
   -PvelmuxAbis="$ABI" -PreactNativeArchitectures="$ABI" \
   -PvelmuxFFmpegPrefix="$VELMUX_ROOT/$VELMUX_FFMPEG_OUT_DIR/android" \
+  -PvelmuxEmbedDebugBundle=true \
   -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
   -PvelmuxVersionCode="$VELMUX_VERSION_CODE"
 

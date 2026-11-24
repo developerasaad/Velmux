@@ -21,10 +21,16 @@ BUILD_TYPE="debug"
 ABIS="$VELMUX_ANDROID_DEFAULT_ABI"
 JOBS="${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 2)}"
 SIGNING=()
+EMBED_BUNDLE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --release) BUILD_TYPE="release" ;;
     --debug) BUILD_TYPE="debug" ;;
+    --embed-bundle)
+      # Embed the JS bundle in the debug build (no Metro on the machine:
+      # automated emulator runs). Forwarded as -PvelmuxEmbedDebugBundle.
+      EMBED_BUNDLE=1
+      ;;
     --abi) shift; ABIS="${1:?}" ;;
     --abi=*) ABIS="${1#--abi=}" ;;
     --jobs) shift; JOBS="${1:?}" ;;
@@ -74,12 +80,56 @@ vlog "building Android app ($BUILD_TYPE, ABIs: $ABIS)"
 # defaults to all four ABIs incl. x86), so abiFilters alone does not narrow
 # the CMake builds — the first emulator run built all four ABIs and failed
 # on the arm64 slice before ever reaching the x86_64 one it needed.
+GRADLE_ARGS=(
+  -PvelmuxAbis="$(echo "$ABIS" | tr ' ' ',')"
+  -PreactNativeArchitectures="$(echo "$ABIS" | tr ' ' ',')"
+  -PvelmuxFFmpegPrefix="$FFMPEG_PREFIX"
+  -PvelmuxVersionName="$VELMUX_VERSION_NAME"
+  -PvelmuxVersionCode="$VELMUX_VERSION_CODE"
+)
+[ "$EMBED_BUNDLE" = "1" ] && GRADLE_ARGS+=(-PvelmuxEmbedDebugBundle=true)
+
 run_in "$ANDROID_DIR" ./gradlew "${GRADLE_TASKS[@]}" --no-daemon --stacktrace \
-  -PvelmuxAbis="$(echo "$ABIS" | tr ' ' ',')" \
-  -PreactNativeArchitectures="$(echo "$ABIS" | tr ' ' ',')" \
-  -PvelmuxFFmpegPrefix="$FFMPEG_PREFIX" \
-  -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
-  -PvelmuxVersionCode="$VELMUX_VERSION_CODE" \
-  "${SIGNING[@]}"
+  "${GRADLE_ARGS[@]}" "${SIGNING[@]}"
+
+# ---------------------------------------------------------------------------
+# Product verification: every produced APK must carry BOTH native pieces
+# of the app for every requested ABI — libappmodules.so (React Native's
+# application library: JNI_OnLoad, TurboModule/component registration —
+# its absence is an instant startup crash) and libvelmux_jni.so (the
+# engine bridge). A build that silently packages neither, or only some
+# ABIs, must fail here instead of in the field.
+# ---------------------------------------------------------------------------
+check_apk_native_libs() {
+  local apk="$1"
+  python3 - "$apk" $ABIS <<'PYEOF'
+import sys, zipfile
+
+apk, abis = sys.argv[1], sys.argv[2:]
+required = {"libappmodules.so", "libvelmux_jni.so"}
+z = zipfile.ZipFile(apk)
+names = {n.rsplit("/", 1)[-1]: n for n in z.namelist() if n.startswith("lib/")}
+missing = []
+for abi in abis:
+    for lib in sorted(required):
+        entry = f"lib/{abi}/{lib}"
+        if entry not in z.namelist():
+            missing.append(entry)
+if missing:
+    print("ERROR: native libraries missing from " + apk + ": "
+          + ", ".join(missing)
+          + "; packaged lib entries: " + (", ".join(sorted(names.values())) or "none"),
+          file=sys.stderr)
+    sys.exit(1)
+print("verified " + apk + ": " + ", ".join(
+    f"lib/{a}/{l}" for a in abis for l in sorted(required)))
+PYEOF
+}
+
+APK_DIR="$ANDROID_DIR/app/build/outputs/apk/$BUILD_TYPE"
+for apk in "$APK_DIR"/*.apk; do
+  [ -f "$apk" ] || continue
+  check_apk_native_libs "$apk"
+done
 
 vlog "Android build complete ($BUILD_TYPE)"

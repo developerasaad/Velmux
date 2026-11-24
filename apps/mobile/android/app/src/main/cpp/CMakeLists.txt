@@ -1,41 +1,27 @@
-# Velmux Android app native code.
+# Velmux Android app native code — React Native application integration.
 #
-# Builds the shared C++ engine (core + platform backend + bridge facade) and
-# the JNI adapter that the Kotlin TurboModule talks to. The FFmpeg backend
-# links in when its cross-compiled artifacts are provided via
-# VELMUX_FFMPEG_ANDROID_PREFIX (Milestone 3 wiring); until then the engine
-# runs with the Android backend only and reports capabilities honestly.
+# RN 0.88 bridgeless REQUIRES libappmodules.so: the shared library carrying
+# the app's JNI_OnLoad, which installs DefaultTurboModuleManagerDelegate's
+# module providers and DefaultComponentsRegistry's component registration.
+# An app whose native build omits it fails every TurboModule lookup at
+# startup ('PlatformConstants' could not be found) and RN never initializes.
+#
+# The top level here must therefore be exactly React Native's expected
+# application entry point: project(appmodules) plus
+# ReactNative-application.cmake (REACT_ANDROID_DIR / PROJECT_BUILD_DIR are
+# injected by the React Native Gradle Plugin). That file globs *.cpp AT
+# THIS LEVEL and REPLACES the default OnLoad.cpp when it finds custom
+# sources there — so every Velmux source lives in the velmux/ subdirectory
+# (built as a child library) and the default OnLoad stays in charge of
+# TurboModule/component registration.
+#
+# The Velmux engine (core + platform backends + bridge facade) and the JNI
+# adapter are NOT app modules: they stay a separate shared library
+# (libvelmux_jni.so, loaded by System.loadLibrary in VelmuxJni.kt) built
+# from velmux/CMakeLists.txt.
 cmake_minimum_required(VERSION 3.22)
-project(velmux_app)
+project(appmodules)
 
-# cpp -> main -> src -> app -> android -> mobile -> apps -> repository root.
-get_filename_component(VELMUX_REPO_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../../../" ABSOLUTE)
-if(NOT EXISTS "${VELMUX_REPO_ROOT}/core/include/velmux/core/engine.h")
-  message(FATAL_ERROR "Velmux repository root not found at ${VELMUX_REPO_ROOT}")
-endif()
+include(${REACT_ANDROID_DIR}/cmake-utils/ReactNative-application.cmake)
 
-set(VELMUX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(VELMUX_EMBEDDED_SQLITE ON CACHE BOOL "" FORCE)
-
-# Optional FFmpeg mobile artifacts (out/android/<ABI> prefix produced by
-# tools/ffmpeg-builder/build-android.sh).
-set(VELMUX_FFMPEG_ANDROID_PREFIX "" CACHE PATH
-  "Per-ABI FFmpeg prefix for the Android build")
-
-set(_velmux_ffmpeg_prefix_for_abi "")
-if(VELMUX_FFMPEG_ANDROID_PREFIX)
-  if(EXISTS "${VELMUX_FFMPEG_ANDROID_PREFIX}/${ANDROID_ABI}/lib/pkgconfig/libavcodec.pc")
-    set(_velmux_ffmpeg_prefix_for_abi "${VELMUX_FFMPEG_ANDROID_PREFIX}/${ANDROID_ABI}")
-  else()
-    message(WARNING "VELMUX_FFMPEG_ANDROID_PREFIX given but no per-ABI pkg-config found; building without the FFmpeg backend")
-  endif()
-endif()
-set(VELMUX_FFMPEG_PREFIX "${_velmux_ffmpeg_prefix_for_abi}" CACHE PATH "" FORCE)
-
-add_subdirectory("${VELMUX_REPO_ROOT}" velmux-engine)
-
-add_library(velmux_jni SHARED velmux_jni.cpp)
-target_link_libraries(velmux_jni PRIVATE velmux_bridge)
-find_library(log-lib log)
-target_link_libraries(velmux_jni PRIVATE ${log-lib})
+add_subdirectory(velmux velmux-app)
