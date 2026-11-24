@@ -35,7 +35,11 @@ permissions:
 jobs:
   android:
     name: Android release build
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest became Ubuntu 26.04 in November 2026,
+    # where the Android emulator (37.3.10) dies instantly at boot; the
+    # 24.04 image is the validated environment (and keeps builds
+    # reproducible against a moving label).
+    runs-on: ubuntu-24.04
     # FFmpeg arm64 cold build + R8 release build.
     timeout-minutes: 75
     steps:
