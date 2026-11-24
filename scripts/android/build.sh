@@ -61,11 +61,15 @@ FFMPEG_PREFIX="$VELMUX_ROOT/$VELMUX_FFMPEG_OUT_DIR/android"
 # FFmpeg artifacts; every ABI listed must have been resolved above.
 # ---------------------------------------------------------------------------
 ANDROID_DIR="$(repo_dir "$VELMUX_APP_ANDROID_DIR")"
-GRADLE_TASKS="assembleDebug"
-[ "$BUILD_TYPE" = "release" ] && GRADLE_TASKS="assembleRelease bundleRelease"
+# Task LIST as an array: a quoted "assembleRelease bundleRelease" string
+# would be passed to gradlew as ONE argument, and Gradle would abort with
+# "Task 'assembleRelease bundleRelease' not found" (the first release run
+# through this script failed exactly that way).
+GRADLE_TASKS=(assembleDebug)
+[ "$BUILD_TYPE" = "release" ] && GRADLE_TASKS=(assembleRelease bundleRelease)
 
 vlog "building Android app ($BUILD_TYPE, ABIs: $ABIS)"
-run_in "$ANDROID_DIR" ./gradlew "$GRADLE_TASKS" --no-daemon --stacktrace \
+run_in "$ANDROID_DIR" ./gradlew "${GRADLE_TASKS[@]}" --no-daemon --stacktrace \
   -PvelmuxAbis="$(echo "$ABIS" | tr ' ' ',')" \
   -PvelmuxFFmpegPrefix="$FFMPEG_PREFIX" \
   -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
