@@ -299,6 +299,7 @@ ZPC
     log "[$slice] building x265"
     x265_tb="$(fetch_tarball x265)"
     x265_src="$(extract_tarball "$x265_tb" "$SLICE_TAG")"
+    patch_x265_cmake4_compat "$x265_src"
     x265_build="$build_tmp/x265"
     rm -rf "$x265_build"
     # ENABLE_ASSEMBLY=OFF: x265's nasm path cannot cross-compile for Apple

@@ -117,6 +117,7 @@ fi
 #     through FFmpeg, not only through MediaCodec/VideoToolbox) -------------
 x265_tb="$(fetch_tarball x265)"
 x265_src="$(extract_tarball "$x265_tb")"
+patch_x265_cmake4_compat "$x265_src"
 if [ ! -f "$HOST_PREFIX/lib/libx265.a" ]; then
   log "building x265"
   x265_build="$BUILD_TMP/x265"
