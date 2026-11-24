@@ -470,6 +470,11 @@ struct FfmpegMuxStage::Impl {
   int outAudio = -1;
   bool headerWritten = false;
   bool finalized = false;
+  // Last video packet pts in OUTPUT STREAM timebase ticks (valid only
+  // when haveLastVideoPts). The muxer requires strictly increasing dts
+  // (see writeVideoPacket).
+  bool haveLastVideoPts = false;
+  std::int64_t lastVideoPts = 0;
 };
 
 FfmpegMuxStage::FfmpegMuxStage() : impl_(std::make_unique<Impl>()) {}
@@ -620,6 +625,22 @@ Error FfmpegMuxStage::writeVideoPacket(const PacketView &packet) {
   outPacket->pts =
       av_rescale_q_rnd(packet.ptsUs, AVRational{1, 1000000},
                        video->time_base, rounding);
+  // Last-resort monotonicity guard: the interleaved muxers reject
+  // non-increasing dts ('Application provided invalid, non monotonically
+  // increasing dts'). Stage pipelines carry platform-decoder timestamps
+  // and the Android stage decoder already rebases duplicates (see
+  // AndroidStageDecoder::next), but this stage must stay safe for every
+  // packet source: bump non-increasing (or negative) pts/dts forward by
+  // one timebase tick, preserving order and keeping dts == pts.
+  if (outPacket->pts < 0) {
+    outPacket->pts = 0;
+  }
+  if (impl_->haveLastVideoPts &&
+      outPacket->pts <= impl_->lastVideoPts) {
+    outPacket->pts = impl_->lastVideoPts + 1;
+  }
+  impl_->lastVideoPts = outPacket->pts;
+  impl_->haveLastVideoPts = true;
   outPacket->dts = outPacket->pts;
   if (packet.durationUs > 0) {
     outPacket->duration =

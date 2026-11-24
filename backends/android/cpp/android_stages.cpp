@@ -229,6 +229,9 @@ struct AndroidStageDecoder::Impl {
   InterchangeFormat format;
   std::int64_t duration = 0; // microseconds
   double frameRate = 0.0;    // from the track format, 0 = unknown
+  // Last emitted frame pts (us); -1 = nothing emitted yet. The output
+  // timeline must be strictly increasing (see next()).
+  std::int64_t lastPtsUs = -1;
 };
 
 AndroidStageDecoder::AndroidStageDecoder()
@@ -475,11 +478,26 @@ Error AndroidStageDecoder::next(CpuFramePtr &frame) {
       }
       // AImage timestamps are nanoseconds on the source timeline (the
       // codec preserves the queued microsecond pts through the Surface).
-      const std::int64_t ptsUs = timestampNs / 1000;
+      std::int64_t ptsUs = timestampNs / 1000;
       const std::int64_t durUs =
           d.frameRate > 0.0
               ? std::int64_t(1000000.0 / d.frameRate)
               : 0;
+      // The interchange contract requires a strictly increasing frame
+      // timeline. Platform decoders have been observed to deliver rendered
+      // buffers with duplicate timestamps (seen on the x86_64 emulator
+      // codecs); MediaMuxer tolerates equal pts but the FFmpeg muxer
+      // rejects non-increasing dts and fails the whole conversion. Rebase
+      // non-increasing (or negative) timestamps onto the previous frame +
+      // one frame duration: order and pacing are preserved, and a
+      // platform quirk cannot poison the downstream muxers.
+      if (ptsUs < 0) {
+        ptsUs = 0;
+      }
+      if (d.lastPtsUs >= 0 && ptsUs <= d.lastPtsUs) {
+        ptsUs = d.lastPtsUs + (durUs > 0 ? durUs : 1);
+      }
+      d.lastPtsUs = ptsUs;
       out->setTiming(ptsUs, durUs);
       frame = std::move(out);
       // Frames rendered before the EOS buffer may still be in flight;
