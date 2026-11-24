@@ -89,6 +89,17 @@ else:
 PY
 }
 
+# sed_inplace <expression> <file> — portable in-place edit. GNU sed takes
+# -i with no suffix, BSD sed (macOS runners) REQUIRES one, and the two
+# parse "-i -e ..." differently (BSD consumes -e as the suffix and then
+# fails with "sed: -e: No such file or directory"). Temp-file + move is
+# portable everywhere and leaves no backup clutter.
+sed_inplace() {
+  local expr="$1" file="$2"
+  sed -E "$expr" "$file" > "$file.velmux-tmp" && \
+    mv "$file.velmux-tmp" "$file"
+}
+
 # patch_x265_cmake4_compat <x265-source-dir> — make x265 3.6's CMake files
 # work under CMake >= 4 (and stay fine under 3.x). Upstream 3.6 pins
 # CMP0025/CMP0054 to OLD behaviors that CMake 4 removed and declares
@@ -101,17 +112,15 @@ patch_x265_cmake4_compat() {
   local cm="$src/source/CMakeLists.txt"
   [ -f "$cm" ] || die "x265 CMakeLists not found: $cm"
   if grep -q "cmake_policy(SET CMP0025 OLD)" "$cm"; then
-    sed -i \
-      -e 's/cmake_policy(SET CMP0025 OLD).*/# CMP0025 pin removed for CMake 4 compat/' \
-      -e 's/cmake_policy(SET CMP0054 OLD).*/# CMP0054 pin removed for CMake 4 compat/' \
-      -e 's/cmake_minimum_required *( *VERSION 2\.8\.[0-9]*.*)/cmake_minimum_required(VERSION 3.5)/' \
+    sed_inplace \
+      's/cmake_policy(SET CMP0025 OLD).*/# CMP0025 pin removed for CMake 4 compat/; s/cmake_policy(SET CMP0054 OLD).*/# CMP0054 pin removed for CMake 4 compat/; s/cmake_minimum_required *( *VERSION 2\.8\.[0-9]*.*)/cmake_minimum_required(VERSION 3.5)/' \
       "$cm"
     log "patched x265 CMakeLists for CMake 4 compatibility"
   fi
   local hdr="$src/source/dynamicHDR10/CMakeLists.txt"
   if [ -f "$hdr" ] && grep -q 'cmake_minimum_required *( *VERSION 2\.' "$hdr"; then
-    sed -i \
-      -e 's/cmake_minimum_required *( *VERSION 2\.8\.[0-9]*.*)/cmake_minimum_required(VERSION 3.5)/' \
+    sed_inplace \
+      's/cmake_minimum_required *( *VERSION 2\.8\.[0-9]*.*)/cmake_minimum_required(VERSION 3.5)/' \
       "$hdr"
     log "patched x265 dynamicHDR10 CMakeLists for CMake 4 compatibility"
   fi
@@ -128,7 +137,7 @@ patch_x265_cmake4_compat() {
 sanitize_x265_pc() {
   local pc="$1/lib/pkgconfig/x265.pc"
   [ -f "$pc" ] || return 0
-  sed -i -E 's/[[:space:]]-l-l:[^[:space:]]+//g; s/[[:space:]]-l:libunwind\.a//g' "$pc"
+  sed_inplace 's/[[:space:]]-l-l:[^[:space:]]+//g; s/[[:space:]]-l:libunwind\.a//g' "$pc"
   log "sanitized x265.pc implicit-lib entries"
 }
 
