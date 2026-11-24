@@ -94,7 +94,7 @@ class HybridConversionTest {
       if (!info.isEncoder || !info.supportedTypes.contains("video/avc")) continue
       val caps = info.getCapabilitiesForType("video/avc") ?: continue
       val video = caps.videoCapabilities ?: continue
-      if (!video.widthRange.contains(width) || !video.heightRange.contains(height)) continue
+      if (!video.supportedWidths.contains(width) || !video.supportedHeights.contains(height)) continue
       if (!video.supportedFrameRates.contains(frameRate)) continue
       val color = when {
         planar in caps.colorFormats -> planar
@@ -115,11 +115,11 @@ class HybridConversionTest {
       val caps = info.getCapabilitiesForType("audio/mp4a-latm") ?: continue
       val audio = caps.audioCapabilities ?: continue
       if (!audio.supportedSampleRates.contains(sampleRate)) continue
-      if (audio.maxInputChannels < channels) continue
+      if (audio.maxInputChannelCount < channels) continue
       return info.name
     }
     throw IllegalStateException(
-        "no audio/mp4a-latm encoder on this device supports ${sampleRate}Hz/$channelsch")
+        "no audio/mp4a-latm encoder on this device supports ${sampleRate}Hz/${channels}ch")
   }
 
   private val fixtureTimeoutMs = 60_000L
