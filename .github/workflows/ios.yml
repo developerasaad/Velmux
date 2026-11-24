@@ -14,6 +14,18 @@ on:
       - backends/**
       - bridge/**
       - tools/ffmpeg-builder/**
+      # The scripts this workflow executes: test.sh --ios-sim dispatches
+      # to scripts/ios/simulator-test.sh, which builds through
+      # scripts/ios/build.sh (FFmpeg via scripts/ffmpeg/*); the device
+      # build goes through scripts/build.sh --ios. Both source
+      # scripts/lib/*. (A scripts-only change must still validate the iOS
+      # suite — the 7403b4f simulator-verification fix initially never
+      # got a run because scripts/ was not filtered in.)
+      - scripts/test.sh
+      - scripts/build.sh
+      - scripts/lib/**
+      - scripts/ffmpeg/**
+      - scripts/ios/**
       - .github/workflows/ios.yml
   pull_request:
     paths:
@@ -22,6 +34,11 @@ on:
       - backends/**
       - bridge/**
       - tools/ffmpeg-builder/**
+      - scripts/test.sh
+      - scripts/build.sh
+      - scripts/lib/**
+      - scripts/ffmpeg/**
+      - scripts/ios/**
       - .github/workflows/ios.yml
   workflow_dispatch:
 

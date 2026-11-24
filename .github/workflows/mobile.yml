@@ -10,11 +10,19 @@ on:
     paths:
       - apps/**
       - bridge/ts/**
+      # The scripts this workflow executes: test.sh --ts dispatches to
+      # scripts/lib/ts-suite.sh (through scripts/lib/common.sh and
+      # targets.sh). Only the shared library is filtered — the Android/iOS
+      # and FFmpeg scripts are never executed by the TS suite.
+      - scripts/test.sh
+      - scripts/lib/**
       - .github/workflows/mobile.yml
   pull_request:
     paths:
       - apps/**
       - bridge/ts/**
+      - scripts/test.sh
+      - scripts/lib/**
       - .github/workflows/mobile.yml
   workflow_dispatch:
 

@@ -22,6 +22,15 @@ on:
       - backends/**
       - bridge/**
       - tools/ffmpeg-builder/**
+      # The scripts this workflow executes: test.sh --android-emulator
+      # dispatches to scripts/android/emulator-test.sh, which builds the
+      # app through scripts/android/build.sh (FFmpeg via scripts/ffmpeg/*)
+      # and sources scripts/lib/*. (A scripts-only change must still
+      # validate the emulated suite.)
+      - scripts/test.sh
+      - scripts/lib/**
+      - scripts/ffmpeg/**
+      - scripts/android/**
       - .github/workflows/android-emulated.yml
   pull_request:
     paths:
@@ -30,6 +39,10 @@ on:
       - backends/**
       - bridge/**
       - tools/ffmpeg-builder/**
+      - scripts/test.sh
+      - scripts/lib/**
+      - scripts/ffmpeg/**
+      - scripts/android/**
       - .github/workflows/android-emulated.yml
   workflow_dispatch:
 
