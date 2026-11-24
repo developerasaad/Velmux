@@ -14,8 +14,10 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -340,7 +342,7 @@ std::string streamFieldOf(const std::string &path,
 // True when the file carries a video stream flagged attached_pic (the
 // cover-art / attached-picture disposition).
 bool hasAttachedPic(const std::string &path) {
-  return streamFieldOf(path, "v", "stream_disposition.attached_pic") ==
+  return streamFieldOf(path, "v", "stream_disposition=attached_pic") ==
          "1";
 }
 
@@ -2124,14 +2126,24 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  std::string tagArgs = " -metadata title=VelmuxHugeMetaTitle";
-  const std::string filler(1500, 'm');
-  for (int i = 0; i < 400; ++i) {
-    tagArgs += " -metadata velmux_tag_" + std::to_string(i) + "=" + filler;
+  // The bulk rides in an ffmetadata FILE: 400 -metadata CLI arguments
+  // would exceed the 128 KB single-argument exec limit through sh -c (the
+  // first CI run of this test died with exit 127 = E2BIG before ffmpeg
+  // ever started).
+  const std::string metaFile = (env.dir / "huge.ffmeta").string();
+  {
+    std::ofstream meta(metaFile, std::ios::trunc);
+    meta << ";FFMETADATA1\ntitle=VelmuxHugeMetaTitle\n";
+    const std::string filler(1500, 'm');
+    for (int i = 0; i < 400; ++i) {
+      meta << "velmux_tag_" << i << "=" << filler << "\n";
+    }
+    REQUIRE(meta.good());
   }
   const std::string tagged = (env.dir / "huge-meta.mp4").string();
   REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
-                       plain + "\"" + tagArgs + " -c copy \"" + tagged + "\"")
+                       plain + "\" -f ffmetadata -i \"" + metaFile +
+                       "\" -map 0 -map_metadata 1 -c copy \"" + tagged + "\"")
                           .c_str()) == 0);
   // The fixture really carries the payload (~600 KB of tags).
   REQUIRE(std::filesystem::file_size(tagged) >
@@ -2215,25 +2227,97 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
   }
 }
 
+// Rewinds one mid-file video PES PTS by half a second (33-bit
+// wrap-safe) inside an MPEG-TS file — authoring a genuine backward
+// timestamp jump, the shape real-world broken captures carry. Filters
+// and re-encoding cannot produce it: the encoder/muxer silently
+// re-stamp timestamps, which is exactly how the first authoring attempt
+// of this fixture produced a perfectly healthy file. Returns false when
+// no parseable video PES was found (the caller fails the fixture).
+bool rewindMidFileVideoPts(const std::string &tsPath) {
+  std::ifstream in(tsPath, std::ios::binary);
+  std::vector<unsigned char> buf((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+  if (buf.size() < 188 * 10) {
+    return false;
+  }
+  int videoPes = 0;
+  bool done = false;
+  for (std::size_t off = 0; off + 188 <= buf.size() && !done; off += 188) {
+    if (buf[off] != 0x47) {
+      return false; // not a TS packet
+    }
+    const unsigned b1 = buf[off + 1];
+    const unsigned b3 = buf[off + 3];
+    if (((b1 >> 6) & 1) == 0) {
+      continue; // not a payload-unit start
+    }
+    std::size_t p = off + 4;
+    const unsigned afc = (b3 >> 4) & 3;
+    if (afc == 3) {
+      p += 1 + buf[off + 4]; // skip the adaptation field
+    } else if (afc == 0) {
+      continue; // no payload
+    }
+    if (p + 14 > off + 188) {
+      continue;
+    }
+    if (buf[p] != 0x00 || buf[p + 1] != 0x00 || buf[p + 2] != 0x01 ||
+        (buf[p + 3] & 0xF0) != 0xE0) {
+      continue; // not a video PES start
+    }
+    if (((buf[p + 7] >> 6) & 3) < 2) {
+      continue; // this PES carries no PTS
+    }
+    ++videoPes;
+    if (videoPes < 12) {
+      continue; // rewind a mid-file PES (2 s @ 12 fps = 24 frames)
+    }
+    // 33-bit PTS in bytes p+9..p+13; subtract 45000 (0.5 s @ 90 kHz).
+    const std::uint64_t pts =
+        (std::uint64_t(buf[p + 9] >> 1) & 0x07) << 30 |
+        std::uint64_t(buf[p + 10]) << 22 |
+        (std::uint64_t(buf[p + 11] >> 1) & 0x7F) << 15 |
+        std::uint64_t(buf[p + 12]) << 7 |
+        (std::uint64_t(buf[p + 13] >> 1) & 0x7F);
+    const std::uint64_t newPts =
+        (pts + (1ULL << 33) - 45000) % (1ULL << 33);
+    buf[p + 9] = static_cast<unsigned char>(
+        (buf[p + 9] & 0xF1) | (((newPts >> 30) & 0x07) << 1));
+    buf[p + 10] = static_cast<unsigned char>((newPts >> 22) & 0xFF);
+    buf[p + 11] = static_cast<unsigned char>(
+        (buf[p + 11] & 0x01) | (((newPts >> 15) & 0x7F) << 1));
+    buf[p + 12] = static_cast<unsigned char>((newPts >> 7) & 0xFF);
+    buf[p + 13] = static_cast<unsigned char>(
+        (buf[p + 13] & 0x01) | (static_cast<unsigned>(newPts) & 0x7F) << 1);
+    done = true;
+  }
+  if (!done) {
+    return false;
+  }
+  std::ofstream out(tsPath, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(buf.data()),
+            std::streamsize(buf.size()));
+  return out.good();
+}
+
 TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") {
   TestEnv env;
-  // Base fixture, then a re-encode into MPEG-TS whose video PTS jumps
-  // BACKWARD mid-stream (the classic broken-capture shape: real-world TS
-  // files carry discontinuities and counter wraparounds). -bf 0 keeps
-  // pts order == dts order so the muxer writes the jump verbatim; audio
-  // keeps its natural timing, so the file also carries the A/V desync
-  // that follows such a jump in real captures.
+  // Base fixture, a clean stream-copy into MPEG-TS, then a surgical
+  // backward jump of one mid-file video PES PTS (see
+  // rewindMidFileVideoPts above): the classic broken-capture shape.
+  // Real-world TS files carry such discontinuities and counter
+  // wraparounds; the file also carries the A/V desync that follows.
   const std::string plain =
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
   const std::string broken = (env.dir / "nonmono.ts").string();
   REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
-                       plain + "\" -vf \"setpts='if(lt(N,12),PTS,PTS-0.5/TB)'\" "
-                       "-c:v libx264 -preset ultrafast -crf 35 -bf 0 "
-                       "-c:a copy -f mpegts \"" + broken + "\"")
+                       plain + "\" -c copy -f mpegts \"" + broken + "\"")
                           .c_str()) == 0);
   REQUIRE(std::filesystem::file_size(broken) > 1024);
+  REQUIRE(rewindMidFileVideoPts(broken));
 
   // The fixture really carries the pathology: at least one video packet
   // has a SMALLER pts than its predecessor. If generation ever silently
@@ -2344,9 +2428,9 @@ TEST_CASE("REAL multi-track audio: allTracks carries every lane with language") 
   REQUIRE(snap.has_value());
   // Every source lane survives the transcode, with its language metadata.
   CHECK(countStreams(snap->outputPath, "a") == 2);
-  CHECK(streamFieldOf(snap->outputPath, "a:0", "stream_tags.language") ==
+  CHECK(streamFieldOf(snap->outputPath, "a:0", "stream_tags=language") ==
         "eng");
-  CHECK(streamFieldOf(snap->outputPath, "a:1", "stream_tags.language") ==
+  CHECK(streamFieldOf(snap->outputPath, "a:1", "stream_tags=language") ==
         "fra");
   const ProbeResult probe = probeWith(snap->outputPath);
   CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.25));
@@ -2403,8 +2487,8 @@ TEST_CASE("REAL cover art: external image attaches to audio-only output") {
   const std::string cover = (env.dir / "cover.png").string();
   REQUIRE(std::system(
               (ffmpegBin() + " -y -hide_banner -loglevel error "
-               "-f lavfi -i testsrc2=size=320x240:rate=1 "
-               "-frames:v 1 \"" + cover + "\"")
+               "-filter_complex \"testsrc2=size=320x240:rate=1[v]\" "
+               "-map \"[v]\" -frames:v 1 \"" + cover + "\"")
                   .c_str()) == 0);
   REQUIRE(std::filesystem::file_size(cover) > 1024);
 
@@ -2450,7 +2534,8 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
                "-colorspace bt2020nc -pix_fmt yuv420p -t 2 \"" + hdr +
                "\"")
                   .c_str()) == 0);
-  REQUIRE(streamFieldOf(hdr, "v:0", "stream=color_trc") == "smpte2084");
+  REQUIRE(streamFieldOf(hdr, "v:0", "stream=color_transfer") ==
+      "smpte2084");
 
   // Transcode: the 8-bit software encoder cannot carry HDR, so the
   // engine tone-maps and tags SDR BT.709.
@@ -2468,7 +2553,7 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
     REQUIRE(terminal->state == JobState::Completed);
     const auto snap = env.engine->getJob(jobId.value());
     REQUIRE(snap.has_value());
-    CHECK(streamFieldOf(snap->outputPath, "v:0", "stream=color_trc") ==
+    CHECK(streamFieldOf(snap->outputPath, "v:0", "stream=color_transfer") ==
           "bt709");
     CHECK(streamFieldOf(snap->outputPath, "v:0",
                         "stream=color_primaries") == "bt709");
@@ -2495,7 +2580,7 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
     REQUIRE(terminal2->state == JobState::Completed);
     const auto snap2 = env.engine->getJob(jobId2.value());
     REQUIRE(snap2.has_value());
-    CHECK(streamFieldOf(snap2->outputPath, "v:0", "stream=color_trc") ==
+    CHECK(streamFieldOf(snap2->outputPath, "v:0", "stream=color_transfer") ==
           "smpte2084");
     CHECK(streamFieldOf(snap2->outputPath, "v:0",
                         "stream=color_primaries") == "bt2020");

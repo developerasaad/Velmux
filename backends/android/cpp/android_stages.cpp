@@ -544,6 +544,17 @@ struct AndroidStageEncoder::Impl {
 };
 
 AndroidStageEncoder::AndroidStageEncoder()
+    : impl_(std::make_unique<Impl>()) {}
+
+AndroidStageEncoder::~AndroidStageEncoder() {
+  if (impl_ == nullptr) {
+    return;
+  }
+  if (impl_->codec != nullptr) {
+    AMediaCodec_stop(impl_->codec);
+    AMediaCodec_delete(impl_->codec);
+  }
+}
 
 Error AndroidStageEncoder::open(const StageEncoderConfig &config,
                                 InterchangePixel pixel) {

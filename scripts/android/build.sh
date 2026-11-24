@@ -69,8 +69,14 @@ GRADLE_TASKS=(assembleDebug)
 [ "$BUILD_TYPE" = "release" ] && GRADLE_TASKS=(assembleRelease bundleRelease)
 
 vlog "building Android app ($BUILD_TYPE, ABIs: $ABIS)"
+# reactNativeArchitectures must mirror velmuxAbis: the React Native gradle
+# plugin drives the app's native ABI set from ITS property (gradle.properties
+# defaults to all four ABIs incl. x86), so abiFilters alone does not narrow
+# the CMake builds — the first emulator run built all four ABIs and failed
+# on the arm64 slice before ever reaching the x86_64 one it needed.
 run_in "$ANDROID_DIR" ./gradlew "${GRADLE_TASKS[@]}" --no-daemon --stacktrace \
   -PvelmuxAbis="$(echo "$ABIS" | tr ' ' ',')" \
+  -PreactNativeArchitectures="$(echo "$ABIS" | tr ' ' ',')" \
   -PvelmuxFFmpegPrefix="$FFMPEG_PREFIX" \
   -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
   -PvelmuxVersionCode="$VELMUX_VERSION_CODE" \

@@ -78,6 +78,11 @@ public:
 
 private:
   struct Impl;
+  // captureConfigFromFormat (android_stages.cpp) captures the encoder's
+  // AMediaCodec output-format csd buffers into the TLV config blob; it
+  // lives at file scope next to the other pull-path helpers and needs
+  // access to Impl.
+  friend void captureConfigFromFormat(Impl &);
   std::unique_ptr<Impl> impl_;
 };
 
