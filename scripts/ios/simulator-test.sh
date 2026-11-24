@@ -48,10 +48,13 @@ rm -rf "$DIAG_DIR"; mkdir -p "$DIAG_DIR"
 
 collect_diagnostics() {
   vlog "collecting simulator diagnostics into $DIAG_DIR"
-  xcrun simctl spawn "$UDID" log show --last 10m \
+  # ${UDID:-booted}: the ERR trap can fire before a simulator is ever
+  # selected (e.g. the FFmpeg build failed); "booted" is simctl's
+  # placeholder and degrades gracefully when nothing is running.
+  xcrun simctl spawn "${UDID:-booted}" log show --last 10m \
     --style compact --predicate 'process == "Velmux"' \
     > "$DIAG_DIR/velmux-process.log" 2>/dev/null || true
-  xcrun simctl diagnose "$UDID" --archive "$DIAG_DIR/simdiag" \
+  xcrun simctl diagnose "${UDID:-booted}" --archive "$DIAG_DIR/simdiag" \
     > "$DIAG_DIR/simctl-diagnose.log" 2>&1 || true
   tail -80 "$DIAG_DIR/velmux-process.log" >&2 || true
 }

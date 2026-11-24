@@ -182,7 +182,9 @@ fetch_tarball() {
     ua="$(ua_for_url "$u")"
     local ua_args=()
     [ -n "$ua" ] && ua_args=(-A "$ua")
-    if curl -fsL "${ua_args[@]}" \
+    # ${arr[@]+...}: bash 3.2 (macOS runners) treats the expansion of an
+    # EMPTY array under set -u as an unbound variable; expand conditionally.
+    if curl -fsL ${ua_args[@]+"${ua_args[@]}"} \
         --retry 3 --connect-timeout 30 \
         --speed-limit 1024 --speed-time 60 --max-time 900 \
         -o "$dest" "$u"; then ok=1; break; fi
