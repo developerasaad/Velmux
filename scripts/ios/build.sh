@@ -79,19 +79,29 @@ case "$SDK_KIND" in
   device)
     XCODE_SDK="iphoneos"
     DERIVED="build-device"
-    SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='')
+    SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNING_IDENTITY='')
+    XCODE_ARCHS="${VELMUX_IOS_DEVICE_ARCHS:-arm64}"
     ;;
   simulator)
     XCODE_SDK="iphonesimulator"
     DERIVED="build"
     SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO)
+    # The pinned FFmpeg simulator artifact is the single-arch arm64 slice
+    # (D-058). Without an explicit ARCHS, xcodebuild builds a UNIVERSAL
+    # simulator binary and the x86_64 link demands an FFmpeg slice the
+    # artifact model intentionally does not build by default ('ld:
+    # library velmux_ffmpeg not found'). Intel-Mac simulator development
+    # pairs VELMUX_IOS_SIM_X86_64=1 (build the slice) with
+    # VELMUX_IOS_SIM_ARCHS=x86_64 (link it).
+    XCODE_ARCHS="${VELMUX_IOS_SIM_ARCHS:-arm64}"
     ;;
 esac
 
-vlog "building iOS app ($BUILD_TYPE, $SDK_KIND)"
+vlog "building iOS app ($BUILD_TYPE, $SDK_KIND, arch=$XCODE_ARCHS)"
 run_in "$IOS_DIR" xcodebuild -workspace Velmux.xcworkspace -scheme Velmux \
   -configuration "$BUILD_TYPE" -sdk "$XCODE_SDK" \
   -derivedDataPath "$DERIVED" \
+  ARCHS="$XCODE_ARCHS" \
   MARKETING_VERSION="${VELMUX_VERSION_NAME%%-*}" \
   CURRENT_PROJECT_VERSION="$VELMUX_VERSION_CODE" \
   build "${SIGN_ARGS[@]}"
