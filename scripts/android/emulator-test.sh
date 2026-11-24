@@ -247,8 +247,29 @@ verify_launch() {
   done
   [ "$alive" = "1" ] || vdie "$phase: the app process is not alive after launch"
   # The activity must actually be resumed (not a blank/crashed launch).
-  local resumed
-  resumed="$(timeout 10 adb shell dumpsys activity activities 2>/dev/null | tr -d '\r')"
+  # Android 13+: MainActivity asks for POST_NOTIFICATIONS once at startup
+  # (M8 product behavior), so on a fresh install the system permission
+  # dialog legitimately covers it — mResumedActivity is then
+  # GrantPermissionsActivity, not a launch failure. Dismiss the dialog
+  # exactly like a user who refuses (BACK key = denial) and still require
+  # MainActivity to become the resumed activity afterwards. That also
+  # verifies the documented deny path: users who refuse keep working
+  # conversions. The activity class name (com.android.permissioncontroller
+  # ...GrantPermissionsActivity) is stable across the controller's package
+  # renames, so the class name alone is matched.
+  local resumed dismissed=0 i
+  for i in $(seq 1 10); do
+    resumed="$(timeout 10 adb shell dumpsys activity activities 2>/dev/null | tr -d '\r')"
+    if printf '%s' "$resumed" | grep -q "mResumedActivity.*com.velmux.mobile"; then
+      break
+    fi
+    if [ "$dismissed" -lt 2 ] && printf '%s' "$resumed" \
+        | grep -q "mResumedActivity.*GrantPermissionsActivity"; then
+      adb_t shell input keyevent 4  # BACK: refuse the runtime permission
+      dismissed=$((dismissed + 1))
+    fi
+    sleep 2
+  done
   printf '%s' "$resumed" | grep -q "mResumedActivity.*com.velmux.mobile" \
     || vdie "$phase: MainActivity is not the resumed activity"
   # Keep it alive for a sustained window; a late crash (JNI load failure,
