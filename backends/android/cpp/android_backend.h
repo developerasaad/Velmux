@@ -10,6 +10,7 @@
 // C++ core decides.
 #pragma once
 
+#include "android_stages.h"
 #include "media_transcoder.h"
 #include "velmux/backend/contracts.h"
 
@@ -60,10 +61,17 @@ public:
 
   velmux::backend::IInspector *inspector() override { return &inspector_; }
   velmux::backend::IPipelineExecutor *executor() override { return &executor_; }
+  // Milestone 4: the Android stage workers (android_stages.cpp) decode to
+  // Yuv420P CPU frames, encode from CPU frames and mux — the backend
+  // participates in hybrid (stage-composed) pipelines through them.
+  velmux::backend::IStageBackend *stages() override {
+    return mediaAvailable_ ? &stageBackend_ : nullptr;
+  }
 
 private:
   AndroidInspector inspector_;
   AndroidExecutor executor_;
+  media::AndroidStageBackend stageBackend_;
   bool mediaAvailable_ = false;
   media::NativeSupport support_;
 

@@ -94,6 +94,11 @@ BackendCapabilities AndroidBackend::capabilities() const {
   if (!mediaAvailable_) {
     return caps;
   }
+  // Milestone 4 stage-composition participation: the Android stage workers
+  // (android_stages.cpp) decode to Yuv420P CPU frames and encode/mux from
+  // them. Registration mirrors the FFmpeg backend's capability report.
+  caps.stageDecodeToCpuFrames = true;
+  caps.stageEncodeFromCpuFrames = true;
   for (const Container c : kWritableContainers) {
     caps.writableContainers.push_back(c);
   }

@@ -158,6 +158,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(velmux_backend_android
   backends/android/cpp/android_backend.cpp
+  backends/android/cpp/android_stages.cpp
   backends/android/cpp/media_transcoder.cpp)
 target_link_libraries(velmux_backend_android PUBLIC velmux::core ${CMAKE_DL_LIBS})
 target_include_directories(velmux_backend_android
