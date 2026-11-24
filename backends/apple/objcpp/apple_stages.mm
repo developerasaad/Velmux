@@ -426,9 +426,12 @@ struct AppleStageEncoder::Impl {
         const std::uint8_t *ps = nullptr;
         std::size_t size = 0;
         std::size_t total = 0;
+        // parameterSetCountOut is the 5th argument (size_t*);
+        // NALUnitHeaderLengthOut (6th) is int* and is not needed here —
+        // only the parameter sets themselves are extracted.
         const OSStatus status =
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                format, index, &ps, &size, nullptr, &total);
+                format, index, &ps, &size, &total, nullptr);
         if (status != noErr) {
           break;
         }
@@ -449,7 +452,7 @@ struct AppleStageEncoder::Impl {
         std::size_t total = 0;
         const OSStatus status =
             CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                format, index, &ps, &size, nullptr, &total);
+                format, index, &ps, &size, &total, nullptr);
         if (status != noErr) {
           break;
         }
@@ -949,7 +952,10 @@ Error AppleMuxStage::writeVideoPacket(const PacketView &packet) {
       pointers.push_back(nal.data());
       sizes.push_back(nal.size());
     }
-    OSStatus status = paramErr;
+    // -50 is paramErr (the MacTypes constant is not in this file's
+    // include graph); every branch below either assigns a real status or
+    // returns an explicit Error, so the initializer is purely defensive.
+    OSStatus status = -50;
     if (impl_->tracks.videoCodec == VideoCodec::HEVC) {
       if (@available(macOS 10.13, iOS 11.0, *)) {
         status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
@@ -1017,15 +1023,13 @@ Error AppleMuxStage::writeVideoPacket(const PacketView &packet) {
     return Error::make(ErrorCode::ExecutionFailed,
                        "cannot rebuild the video sample", "apple");
   }
-  CFMutableDictionaryRef attachments =
-      static_cast<CFMutableDictionaryRef>(
-          CFArrayGetValueAtIndex(CMSampleBufferGetSampleAttachmentsArray(
-                                     sample, 1),
-                                 0));
-  if (attachments != nullptr) {
-    CFDictionarySetValue(attachments, kCMSampleAttachmentKey_NotSync,
-                         packet.keyframe ? kCFBooleanFalse : kCFBooleanTrue);
-  }
+  // Mark non-keyframes as not-sync. CMSetAttachment is the documented
+  // API for sample attachments; reaching into the attachments array with
+  // a mutable cast no longer compiles (CFArrayGetValueAtIndex returns
+  // const void * in current SDKs).
+  CMSetAttachment(sample, kCMSampleAttachmentKey_NotSync,
+                  packet.keyframe ? kCFBooleanFalse : kCFBooleanTrue,
+                  kCMAttachmentMode_ShouldNotPropagate);
 
   // Non-realtime inputs still have backpressure; wait briefly for
   // readiness so appends never buffer unbounded, but never deadlock:
