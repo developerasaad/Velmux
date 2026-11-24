@@ -1,15 +1,23 @@
 package com.velmux.mobile
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.os.BatteryManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
@@ -25,6 +33,11 @@ import java.util.concurrent.ConcurrentHashMap
  *  - a Cancel action that goes straight to the engine — it works without
  *    the React Native UI being initialized (spec §23).
  *
+ * The service is also the platform resource host (spec §21): while it
+ * lives, it feeds the core scheduler thermal/battery/memory state through
+ * the same bridge plumbing the RN module uses (VelmuxJni
+ * .nativeUpdateResources), so concurrency follows real device conditions.
+ *
  * The service starts from EngineHolder when work becomes active and stops
  * itself when the engine idles. It owns no media policy.
  */
@@ -38,8 +51,7 @@ class ConversionService : Service(), EngineHolder.EventListener {
 
   override fun onCreate() {
     super.onCreate()
-    notifications = getSystemService(Context.NOTIFICATION_SERVICE)
-      as NotificationManager
+    notifications = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     notifications.createNotificationChannel(
       NotificationChannel(
         CHANNEL_ACTIVE,
@@ -55,6 +67,7 @@ class ConversionService : Service(), EngineHolder.EventListener {
       ),
     )
     EngineHolder.addListener(this)
+    startResourceMonitoring()
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -97,12 +110,151 @@ class ConversionService : Service(), EngineHolder.EventListener {
   }
 
   override fun onDestroy() {
+    stopResourceMonitoring()
     EngineHolder.removeListener(this)
     EngineHolder.serviceRunning = false
     super.onDestroy()
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
+
+  // -- Platform resource feed (spec §21) -----------------------------------------
+  //
+  // The core scheduler consumes thermal/battery/memory state to steer
+  // concurrency. This service is the Android-side host of that feed: while
+  // it exists (work is active), thermal-status and battery listeners plus
+  // a slow periodic refresh push updates through the bridge, in EXACTLY
+  // the JSON shape velmux_update_resources parses. Pushes are debounced:
+  // only real state changes leave the process, at most every few seconds.
+  // Every listener is unregistered in onDestroy.
+
+  private val resourceHandler = Handler(Looper.getMainLooper())
+  private var resourceMonitoring = false
+  private var lastResourcePushMs = 0L
+  private var lastResourcePayload: String? = null
+
+  /** Thermal status -> normalized pressure (0 = cool, 1 = emergency). */
+  private fun thermalPressureOf(status: Int): Double = when (status) {
+    PowerManager.THERMAL_STATUS_NONE, PowerManager.THERMAL_STATUS_LIGHT -> 0.0
+    PowerManager.THERMAL_STATUS_MODERATE -> 0.5
+    PowerManager.THERMAL_STATUS_SEVERE -> 0.75
+    PowerManager.THERMAL_STATUS_CRITICAL -> 0.9
+    PowerManager.THERMAL_STATUS_EMERGENCY,
+    PowerManager.THERMAL_STATUS_SHUTDOWN -> 1.0
+    else -> 0.0
+  }
+
+  /**
+   * True while the device draws battery power (not plugged in). Read from
+   * the ACTION_BATTERY_CHANGED sticky broadcast, which also carries the
+   * charge level (the engine's resource model consumes the power source;
+   * the level rides along on the same broadcast for future use).
+   */
+  private fun onBatteryPower(): Boolean {
+    val sticky = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+      ?: return false
+    return sticky.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) == 0
+  }
+
+  /** Available RAM in MB per ActivityManager (0 when unavailable). */
+  private fun availableMemoryMb(): Long {
+    val activityManager =
+      getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+    val info = ActivityManager.MemoryInfo()
+    activityManager.getMemoryInfo(info)
+    return info.availMem / (1024L * 1024L)
+  }
+
+  /**
+   * Pushes the current snapshot through the bridge. Debounced: identical
+   * state never re-sends, and no two sends are closer than the throttle
+   * window unless [force] (memory-pressure events must land immediately).
+   */
+  private fun pushResources(force: Boolean = false) {
+    val handle = EngineHolder.engineHandleOrNull() ?: return
+    val now = SystemClock.elapsedRealtime()
+    if (!force && now - lastResourcePushMs < RESOURCE_MIN_INTERVAL_MS) {
+      return
+    }
+    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+    val payload = JSONObject().apply {
+      put("cpuCores", Runtime.getRuntime().availableProcessors())
+      put("memoryAvailableMb", availableMemoryMb())
+      put("thermalPressure", thermalPressureOf(powerManager.currentThermalStatus))
+      put("onBattery", onBatteryPower())
+    }
+    if (payload.toString() == lastResourcePayload) {
+      lastResourcePushMs = now
+      return
+    }
+    if (VelmuxJni.nativeUpdateResources(handle, payload.toString())) {
+      lastResourcePayload = payload.toString()
+      lastResourcePushMs = now
+    }
+  }
+
+  private val batteryReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context?, intent: Intent?) {
+      // Charging state flips matter to the scheduler; level-only changes
+      // are covered by the periodic refresh.
+      pushResources()
+    }
+  }
+
+  private val thermalListener =
+    PowerManager.OnThermalStatusChangedListener { pushResources() }
+
+  private val resourceRefresh = object : Runnable {
+    override fun run() {
+      if (!resourceMonitoring) {
+        return
+      }
+      pushResources()
+      resourceHandler.postDelayed(this, RESOURCE_REFRESH_MS)
+    }
+  }
+
+  private fun startResourceMonitoring() {
+    if (resourceMonitoring) {
+      return
+    }
+    resourceMonitoring = true
+    // ACTION_BATTERY_CHANGED is a protected system sticky broadcast: it is
+    // delivered immediately on registration (first push) and on every
+    // level/charging change afterwards.
+    registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+    powerManager.addThermalStatusListener(thermalListener)
+    resourceHandler.post(resourceRefresh)
+  }
+
+  private fun stopResourceMonitoring() {
+    if (!resourceMonitoring) {
+      return
+    }
+    resourceMonitoring = false
+    resourceHandler.removeCallbacks(resourceRefresh)
+    try {
+      unregisterReceiver(batteryReceiver)
+    } catch (error: IllegalArgumentException) {
+      // Already unregistered; nothing to clean.
+    }
+    val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+    try {
+      powerManager.removeThermalStatusListener(thermalListener)
+    } catch (error: IllegalArgumentException) {
+      // Listener never attached; nothing to clean.
+    }
+  }
+
+  override fun onTrimMemory(level: Int) {
+    super.onTrimMemory(level)
+    if (resourceMonitoring) {
+      // Memory just tightened: the scheduler should know now, not at the
+      // next periodic refresh.
+      pushResources(force = true)
+    }
+  }
 
   // -- EngineHolder.EventListener --------------------------------------------------
 
@@ -281,5 +433,9 @@ class ConversionService : Service(), EngineHolder.EventListener {
     const val FOREGROUND_ID = 42
     const val ACTION_CANCEL = "com.velmux.mobile.action.CANCEL_JOB"
     const val EXTRA_JOB_ID = "jobId"
+    // Resource feed cadence: a slow periodic refresh (the listeners cover
+    // real changes) and a hard floor between pushes.
+    const val RESOURCE_REFRESH_MS = 5_000L
+    const val RESOURCE_MIN_INTERVAL_MS = 2_000L
   }
 }

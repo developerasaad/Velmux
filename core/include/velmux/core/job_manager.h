@@ -133,6 +133,15 @@ public:
           gate,
       std::function<void(const std::string &jobId)> onHardwareStarted);
 
+  // Runtime failure feedback (spec §15): when a job finalizes with an
+  // execution-attributable backend error, the manager reports the exact
+  // failed configuration through this hook so the capability registry can
+  // steer the next plan away from it. Wired by the engine (which owns the
+  // registry). Only backend execution errors are reported — never user
+  // cancels, planner/contract rejections or environmental failures.
+  void
+  setFailureRecorder(std::function<void(const FailedConfigKey &)> recorder);
+
   // Scheduler entry point: executes one job to completion (worker thread).
   // Called by the engine's scheduler callback when capacity allows.
   ExecuteOutcome executeJob(const std::string &jobId);
@@ -172,6 +181,7 @@ private:
   std::function<bool(const std::string &jobId, const Pipeline &pipeline)>
       dispatchGate_;
   std::function<void(const std::string &jobId)> hardwareStartedCb_;
+  std::function<void(const FailedConfigKey &)> failureRecorder_;
 
   EngineConfig config_;
   EventBus &events_;

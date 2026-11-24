@@ -31,6 +31,15 @@ struct PlannedPipeline {
   std::optional<std::int64_t> estimatedOutputBytes;
 };
 
+// The narrow failure key a given (source, request, output codec) targets on
+// a backend: codec + profile + output geometry + pixel format. Computed
+// IDENTICALLY at planning time (to skip routes whose key has a live failure
+// record) and at failure-recording time (job manager), so the two sides
+// always agree on what "this configuration" means.
+FailedConfigKey failedConfigKeyFor(BackendId backend, const MediaInfo &source,
+                                   const ConversionRequest &request,
+                                   VideoCodec outVideoCodec);
+
 struct PlanResult {
   bool feasible = false;
   std::string message; // infeasibility explanation or notes

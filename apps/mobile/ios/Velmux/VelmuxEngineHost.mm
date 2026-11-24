@@ -7,6 +7,8 @@
 
 #import <VelmuxEngine/velmux_bridge.h>
 
+#import <os/proc.h>
+
 #import <mutex>
 
 static NSString *const kVelmuxBGTaskId = @"com.velmux.mobile.resume";
@@ -16,6 +18,9 @@ static NSString *const kVelmuxBGTaskId = @"com.velmux.mobile.resume";
 static const NSTimeInterval kVelmuxPollInterval = 0.25;
 // ~12s of fully idle polling before the timer stops.
 static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
+// Resource feed: at most one push per window while work runs (listener
+// events can push sooner; identical state never re-sends).
+static const NSTimeInterval kVelmuxResourcePushInterval = 3.0;
 
 @interface VelmuxEngineHost ()
 @property (atomic, assign) VelmuxEngineHandle *engine;
@@ -27,6 +32,13 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
 @property (strong) NSMutableDictionary<NSUUID *, void (^)(NSDictionary *)>
     *listeners;
 @property (strong) NSMutableDictionary<NSString *, NSDictionary *> *jobStates;
+// Platform resource feed (spec §21); state on `queue` only.
+@property (assign) BOOL resourceMonitoring;
+@property (nullable, strong) id thermalObserver;
+@property (nullable, strong) id batteryObserver;
+@property (nullable, strong) id memoryObserver;
+@property (copy, nullable) NSString *lastResourcePayload;
+@property (assign) NSTimeInterval lastResourcePushAt;
 @end
 
 @implementation VelmuxEngineHost {
@@ -160,6 +172,15 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
   } else {
     [self noteIdleRound];
   }
+  // Platform resource feed (spec §21): the scheduler consumes
+  // thermal/battery/memory state while conversions run; monitoring is
+  // tied to active work and fully torn down when the engine idles.
+  if ([self activeWorkFromQueue]) {
+    [self startResourceMonitoringFromQueue];
+    [self pushResourcesFromQueue:NO];
+  } else {
+    [self stopResourceMonitoringFromQueue];
+  }
 }
 
 /// Must run on `_queue`.
@@ -192,6 +213,142 @@ static const NSInteger kVelmuxIdleRoundsBeforeExit = 48;
     }
   }
   [self maybeNotifyTerminal:event];
+}
+
+#pragma mark - Platform resource feed (spec §21)
+
+/// Normalized thermal pressure (0 = nominal, 1 = critical) from the
+/// process thermal state.
+static double VelmuxThermalPressure(void) {
+  switch (NSProcessInfo.processInfo.thermalState) {
+    case NSProcessInfoThermalStateNominal:
+      return 0.0;
+    case NSProcessInfoThermalStateFair:
+      return 0.25;
+    case NSProcessInfoThermalStateSerious:
+      return 0.6;
+    case NSProcessInfoThermalStateCritical:
+      return 1.0;
+    default:
+      return 0.0;
+  }
+}
+
+/// Bytes still available to this process (0 when the API is absent).
+static int64_t VelmuxAvailableMemoryBytes(void) {
+  return (int64_t)os_proc_available_memory();
+}
+
+/// True while the device runs on battery power (unknown counts as plugged:
+/// the scheduler only narrows concurrency when battery power is certain).
+static BOOL VelmuxOnBatteryPower(void) {
+  return [UIDevice currentDevice].batteryState ==
+         UIDeviceBatteryStateUnplugged;
+}
+
+/// Starts thermal/battery/memory observers. Must run on `_queue`.
+- (void)startResourceMonitoringFromQueue {
+  if (_resourceMonitoring) {
+    return;
+  }
+  _resourceMonitoring = YES;
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  __weak VelmuxEngineHost *weakSelf = self;
+  // The host is process-owned (singleton); holding its queue strongly in
+  // the observer blocks keeps dispatch_async valid even if the host ever
+  // stopped existing, and the weak self turns late callbacks into no-ops.
+  dispatch_queue_t hostQueue = _queue;
+  _thermalObserver =
+      [center addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                          object:nil
+                           queue:nil
+                      usingBlock:^(NSNotification *) {
+                        dispatch_async(hostQueue, ^{
+                          [weakSelf pushResourcesFromQueue:YES];
+                        });
+                      }];
+  // batteryLevel/batteryState only report real values while monitoring is
+  // enabled; disabled again when work goes idle.
+  [UIDevice currentDevice].batteryMonitoringEnabled = YES;
+  _batteryObserver =
+      [center addObserverForName:UIDeviceBatteryStateDidChangeNotification
+                          object:nil
+                           queue:nil
+                      usingBlock:^(NSNotification *) {
+                        dispatch_async(hostQueue, ^{
+                          [weakSelf pushResourcesFromQueue:YES];
+                        });
+                      }];
+  _memoryObserver = [center
+      addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *) {
+                  dispatch_async(hostQueue, ^{
+                    // Memory just tightened: the scheduler must know now,
+                    // not at the next throttled refresh.
+                    [weakSelf pushResourcesFromQueue:YES];
+                  });
+                }];
+}
+
+/// Stops observers and battery monitoring. Must run on `_queue`.
+- (void)stopResourceMonitoringFromQueue {
+  if (!_resourceMonitoring) {
+    return;
+  }
+  _resourceMonitoring = NO;
+  NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+  if (_thermalObserver != nil) {
+    [center removeObserver:_thermalObserver];
+    _thermalObserver = nil;
+  }
+  if (_batteryObserver != nil) {
+    [center removeObserver:_batteryObserver];
+    _batteryObserver = nil;
+  }
+  if (_memoryObserver != nil) {
+    [center removeObserver:_memoryObserver];
+    _memoryObserver = nil;
+  }
+  [UIDevice currentDevice].batteryMonitoringEnabled = NO;
+}
+
+/// Pushes the current thermal/battery/memory snapshot through the bridge
+/// (same JSON shape the RN module's updateResources produces). Throttled
+/// unless `force` (listener events); identical state never re-sends.
+/// Must run on `_queue`.
+- (void)pushResourcesFromQueue:(BOOL)force {
+  VelmuxEngineHandle *handle = self.engine;
+  if (handle == nullptr) {
+    return;
+  }
+  const NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+  if (!force && now - _lastResourcePushAt < kVelmuxResourcePushInterval) {
+    return;
+  }
+  NSDictionary *snapshot = @{
+    @"cpuCores" : @([NSProcessInfo processInfo].activeProcessorCount),
+    @"memoryAvailableMb" : @(VelmuxAvailableMemoryBytes() / (1024 * 1024)),
+    @"thermalPressure" : @(VelmuxThermalPressure()),
+    @"onBattery" : @(VelmuxOnBatteryPower()),
+  };
+  NSError *error = nil;
+  NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot
+                                                  options:0
+                                                    error:&error];
+  if (data == nil) {
+    return; // never push malformed state
+  }
+  NSString *payload = [[NSString alloc] initWithData:data
+                                             encoding:NSUTF8StringEncoding];
+  _lastResourcePushAt = now;
+  if ([payload isEqualToString:_lastResourcePayload]) {
+    return;
+  }
+  if (velmux_update_resources(handle, payload.UTF8String) == 0) {
+    _lastResourcePayload = payload;
+  }
 }
 
 #pragma mark - Job state

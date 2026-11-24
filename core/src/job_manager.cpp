@@ -66,6 +66,33 @@ std::string sanitizeFileName(const std::string &name) {
   return out;
 }
 
+// Which backend a pipeline's execution is attributed to: the single
+// backend that served every stage, or — for hybrid pipelines — the
+// encode/mux side that finalizes the output (the same attribution the
+// telemetry PerfRecord uses).
+BackendId attributedBackendFor(const Pipeline &pipeline,
+                               backend::IBackend *backend, bool hybridPath) {
+  if (!hybridPath) {
+    return backend != nullptr ? backend->id() : BackendId::Ffmpeg;
+  }
+  if (pipeline.assigns(StageId::Mux, BackendId::Android)) {
+    return BackendId::Android;
+  }
+  if (pipeline.assigns(StageId::Mux, BackendId::Apple)) {
+    return BackendId::Apple;
+  }
+  return BackendId::Ffmpeg;
+}
+
+// Only these error codes mean "the backend attempted execution and
+// errored": they are the runtime feedback the capability registry wants.
+// Cancels, contract-level rejections (invalid arguments), environmental
+// failures (storage full, source gone) and validation failures are not the
+// backend's execution fault and must not steer planning.
+bool isExecutionFailure(ErrorCode code) {
+  return code == ErrorCode::ExecutionFailed || code == ErrorCode::BackendFailure;
+}
+
 JobSnapshot snapshotOf(const JobRecord &record) {
   JobSnapshot snapshot;
   snapshot.id = record.id;
@@ -660,6 +687,11 @@ void JobManager::setDispatchHooks(
   hardwareStartedCb_ = std::move(onHardwareStarted);
 }
 
+void JobManager::setFailureRecorder(
+    std::function<void(const FailedConfigKey &)> recorder) {
+  failureRecorder_ = std::move(recorder);
+}
+
 JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   Error loadError;
   auto record = store_.loadJob(jobId, loadError);
@@ -894,13 +926,7 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   // Feed real observations into telemetry (performance learning).
   if (execResult.wallClockSec > 0.0) {
     PerfRecord perf;
-    perf.backend = hybridPath
-                        ? pipeline.assigns(StageId::Mux, BackendId::Android)
-                              ? BackendId::Android
-                          : pipeline.assigns(StageId::Mux, BackendId::Apple)
-                              ? BackendId::Apple
-                              : BackendId::Ffmpeg
-                        : backend->id();
+    perf.backend = attributedBackendFor(pipeline, backend, hybridPath);
     if (pipeline.videoStreamCopy == false && !info.video.empty()) {
       perf.videoCodec = pipeline.videoCodec;
     }
@@ -945,16 +971,34 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   }
 
   if (!execResult.success) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!runStillCurrent(jobId, generation)) {
-      return ExecuteOutcome::Finished; // superseded by a newer run
+    // Runtime failure feedback (spec §15): an execution-attributable
+    // backend error marks the exact failed configuration so the next plan
+    // avoids that route. Computed from the same request the plan used
+    // (the fit-under-size budget changes bitrates only, which are not part
+    // of the narrow key).
+    std::optional<FailedConfigKey> failedKey;
+    if (isExecutionFailure(execResult.error.code)) {
+      failedKey = failedConfigKeyFor(
+          attributedBackendFor(pipeline, backend, hybridPath), info,
+          effectiveRequest, pipeline.videoCodec);
     }
-    auto &running = running_[jobId];
-    running.record.state = JobState::Failed;
-    running.record.error = execResult.error.message.empty()
-                               ? "execution failed"
-                               : execResult.error.message;
-    finishFailure(running.record);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!runStillCurrent(jobId, generation)) {
+        return ExecuteOutcome::Finished; // superseded by a newer run
+      }
+      auto &running = running_[jobId];
+      running.record.state = JobState::Failed;
+      running.record.error = execResult.error.message.empty()
+                                 ? "execution failed"
+                                 : execResult.error.message;
+      finishFailure(running.record);
+    }
+    // Leaf call into the capability registry (its own lock), made outside
+    // the manager lock so recording can never deadlock against it.
+    if (failedKey.has_value() && failureRecorder_) {
+      failureRecorder_(*failedKey);
+    }
     return ExecuteOutcome::Finished;
   }
 

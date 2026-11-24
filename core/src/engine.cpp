@@ -101,6 +101,16 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
   }
   engine->jobs_->setValidator(engine->validator_.get());
 
+  // Runtime failure feedback (spec §15): when a job finalizes with an
+  // execution-attributable backend error, the job manager reports the exact
+  // failed configuration; the registry steers the next plan away from that
+  // route while the record is live (its cooldown expires transient
+  // failures). Runs on worker threads, which are joined before teardown.
+  engine->jobs_->setFailureRecorder(
+      [engineRaw = engine.get()](const FailedConfigKey &key) {
+        engineRaw->capabilities_.recordFailure(key);
+      });
+
   // Scheduler: executes jobs on worker threads OWNED by this engine (so
   // shutdown can join them), honoring resource limits.
   ResourceSnapshot initial;

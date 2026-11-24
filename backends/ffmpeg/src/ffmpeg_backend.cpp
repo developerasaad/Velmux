@@ -13,6 +13,7 @@
 #include <fstream>
 #include <mutex>
 #include <sys/stat.h>
+#include <system_error>
 #include <unordered_map>
 
 extern "C" {
@@ -741,15 +742,18 @@ bool decodeSubtitleStreamToSrt(AVFormatContext *in, int streamIndex,
 // Extracts one subtitle stream into a standalone text subtitle file via
 // demux + packet-copy remux (valid for text formats whose packets are the
 // file's native cue representation). Used to materialize a burn-in source
-// when a timing offset must be applied first.
+// when a timing offset must be applied first, and by extraction jobs.
+// On failure, writeRc carries the output-write AVERROR code when known
+// (ENOSPC lets the caller surface the terminal StorageFull error).
 bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
-                                 const std::string &outPath) {
+                                 const std::string &outPath,
+                                 int &writeRc) {
   AVFormatContext *in = nullptr;
   AVFormatContext *out = nullptr;
   bool ok = false;
   do {
-    if (avformat_open_input(&in, inPath.c_str(), nullptr, nullptr) < 0 ||
-        avformat_find_stream_info(in, nullptr) < 0) {
+    int rc = avformat_open_input(&in, inPath.c_str(), nullptr, nullptr);
+    if (rc < 0 || avformat_find_stream_info(in, nullptr) < 0) {
       break;
     }
     if (streamIndex < 0 ||
@@ -773,11 +777,16 @@ bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
     avcodec_parameters_copy(outStream->codecpar, in->streams[streamIndex]->codecpar);
     outStream->codecpar->codec_tag = 0;
     av_dict_copy(&outStream->metadata, in->streams[streamIndex]->metadata, 0);
-    if (!(out->oformat->flags & AVFMT_NOFILE) &&
-        avio_open(&out->pb, outPath.c_str(), AVIO_FLAG_WRITE) < 0) {
-      break;
+    if (!(out->oformat->flags & AVFMT_NOFILE)) {
+      rc = avio_open(&out->pb, outPath.c_str(), AVIO_FLAG_WRITE);
+      if (rc < 0) {
+        writeRc = rc;
+        break;
+      }
     }
-    if (avformat_write_header(out, nullptr) < 0) {
+    rc = avformat_write_header(out, nullptr);
+    if (rc < 0) {
+      writeRc = rc;
       break;
     }
     AVPacket *pkt = av_packet_alloc();
@@ -798,7 +807,9 @@ bool extractSubtitleStreamToFile(const std::string &inPath, int streamIndex,
           av_rescale_q(pkt->duration, src->time_base, outStream->time_base);
       pkt->pos = -1;
       pkt->stream_index = 0;
-      if (av_interleaved_write_frame(out, pkt) < 0) {
+      const int frameRc = av_interleaved_write_frame(out, pkt);
+      if (frameRc < 0) {
+        writeRc = frameRc;
         writeFailed = true;
       }
       av_packet_unref(pkt);
@@ -1156,8 +1167,10 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
 
   // Copy path: native text formats whose packets ARE the file format.
   bool ok = false;
+  int sidecarWriteRc = 0;
   if (subtitleFileExtensionFor(cid) != nullptr) {
-    ok = extractSubtitleStreamToFile(*inPath, subStream, params.outputPath);
+    ok = extractSubtitleStreamToFile(*inPath, subStream, params.outputPath,
+                                     sidecarWriteRc);
   } else {
     // Decode path: container-internal text (mov_text, ttml, ...) decodes
     // to AVSubtitle text rects, written as SRT cues.
@@ -1166,12 +1179,20 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
   }
   avformat_close_input(&in);
   if (!ok) {
-    result.error = Error::make(
-        ErrorCode::UnsupportedFeature,
-        std::string("cannot extract subtitle codec ") +
-            avcodec_get_name(cid) +
-            " (bitmap formats need OCR, which is outside V1)",
-        "ffmpeg");
+    // A full disk is environmental, not a codec limitation: surface the
+    // terminal StorageFull error instead of the extraction message.
+    if (sidecarWriteRc != 0) {
+      result.error = outputWriteError(sidecarWriteRc,
+                                      "cannot write the subtitle sidecar",
+                                      params.outputPath);
+    } else {
+      result.error = Error::make(
+          ErrorCode::UnsupportedFeature,
+          std::string("cannot extract subtitle codec ") +
+              avcodec_get_name(cid) +
+              " (bitmap formats need OCR, which is outside V1)",
+          "ffmpeg");
+    }
     std::error_code ec;
     std::filesystem::remove(params.outputPath, ec);
     return result;
@@ -1315,15 +1336,13 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
                    AVIO_FLAG_WRITE);
     if (rc < 0) {
-      result.error =
-          makeAvError(ErrorCode::ExecutionFailed, "open output", rc);
+      result.error = outputWriteError(rc, "open output", params.outputPath);
       return result;
     }
   }
   rc = avformat_write_header(cleanup.out, nullptr);
   if (rc < 0) {
-    result.error =
-        makeAvError(ErrorCode::ExecutionFailed, "write header", rc);
+    result.error = outputWriteError(rc, "write header", params.outputPath);
     return result;
   }
 
@@ -1333,6 +1352,9 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   std::int64_t processedPackets = 0;
   bool cancelled = false;
   bool writeFailed = false;
+  // AVERROR code of the output-write failure (0 = unknown); ENOSPC maps
+  // to the terminal StorageFull error below.
+  int writeFailureRc = 0;
   // Trim window (spec §15/§16): seek to the keyframe at/before the start
   // (stream copy cannot re-time compressed data, so the output begins
   // there — the honest keyframe-snapped trim) and stop at the end gate.
@@ -1442,7 +1464,9 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
       }
     }
 
-    if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+    const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
+    if (writeRc < 0) {
+      writeFailureRc = writeRc;
       writeFailed = true;
     }
     av_packet_free(&outPacket);
@@ -1475,8 +1499,9 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
     return result;
   }
   if (writeFailed) {
-    result.error = Error::make(ErrorCode::ExecutionFailed,
-                               "write failed during remux", "ffmpeg");
+    result.error = outputWriteError(writeFailureRc,
+                                    "write failed during remux",
+                                    params.outputPath);
     return result;
   }
   result.success = true;
@@ -2158,13 +2183,19 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           }
           const std::string extracted =
               (outFs.parent_path() / ("." + stem + "-subs" + ext)).string();
+          int subsWriteRc = 0;
           if (!extractSubtitleStreamToFile(*inPath, subGlobalIndex,
-                                           extracted)) {
+                                           extracted, subsWriteRc)) {
             result.error =
-                Error::make(ErrorCode::ExecutionFailed,
-                            "cannot extract the embedded subtitle stream for "
-                            "timing adjustment",
-                            "ffmpeg");
+                subsWriteRc != 0
+                    ? outputWriteError(subsWriteRc,
+                                       "cannot write the timing-offset "
+                                       "subtitle artifact",
+                                       extracted)
+                    : Error::make(ErrorCode::ExecutionFailed,
+                                  "cannot extract the embedded subtitle "
+                                  "stream for timing adjustment",
+                                  "ffmpeg");
             return result;
           }
           cleanup.tempFiles.push_back(extracted);
@@ -2941,15 +2972,14 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     rc = avio_open(&cleanup.out->pb, params.outputPath.c_str(),
                    AVIO_FLAG_WRITE);
     if (rc < 0) {
-      result.error =
-          makeAvError(ErrorCode::ExecutionFailed, "open output", rc);
+      result.error = outputWriteError(rc, "open output", params.outputPath);
       av_frame_free(&videoFrame);
       return result;
     }
   }
-  if (avformat_write_header(cleanup.out, nullptr) < 0) {
-    result.error =
-        Error::make(ErrorCode::ExecutionFailed, "write header", "ffmpeg");
+  rc = avformat_write_header(cleanup.out, nullptr);
+  if (rc < 0) {
+    result.error = outputWriteError(rc, "write header", params.outputPath);
     av_frame_free(&videoFrame);
     return result;
   }
@@ -2962,6 +2992,10 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   std::int64_t framesDone = 0;
   bool cancelled = false;
   bool writeFailed = false;
+  // AVERROR code of the output-write failure (0 = unknown); ENOSPC maps
+  // to the terminal StorageFull error below. Shared by every write lane:
+  // video/audio encoder packets, stream copies and subtitle packets.
+  int writeFailureRc = 0;
 
   // Encodes one prepared frame (already in encoder time base) and writes
   // the resulting packets. Shared by the direct, burn-in and drain paths.
@@ -2972,7 +3006,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         encPacket->stream_index = videoOut;
         av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
                              cleanup.out->streams[videoOut]->time_base);
-        if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+        const int writeRc = av_interleaved_write_frame(cleanup.out, encPacket);
+        if (writeRc < 0) {
+          writeFailureRc = writeRc;
           writeFailed = true;
         }
         ++framesDone;
@@ -3036,7 +3072,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       encPacket->stream_index = videoOut;
       av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
                            cleanup.out->streams[videoOut]->time_base);
-      if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+      const int writeRc = av_interleaved_write_frame(cleanup.out, encPacket);
+      if (writeRc < 0) {
+        writeFailureRc = writeRc;
         writeFailed = true;
       }
       av_packet_unref(encPacket);
@@ -3053,7 +3091,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       encPacket->stream_index = track.out;
       av_packet_rescale_ts(encPacket, track.enc->time_base,
                            cleanup.out->streams[std::size_t(track.out)]->time_base);
-      if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+      const int writeRc = av_interleaved_write_frame(cleanup.out, encPacket);
+      if (writeRc < 0) {
+        writeFailureRc = writeRc;
         writeFailed = true;
       }
       av_packet_unref(encPacket);
@@ -3197,7 +3237,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           encPacket->stream_index = track.out;
           av_packet_rescale_ts(encPacket, track.enc->time_base,
                                cleanup.out->streams[std::size_t(track.out)]->time_base);
-          if (av_interleaved_write_frame(cleanup.out, encPacket) < 0) {
+          const int writeRc = av_interleaved_write_frame(cleanup.out, encPacket);
+          if (writeRc < 0) {
+            writeFailureRc = writeRc;
             writeFailed = true;
           }
           av_packet_unref(encPacket);
@@ -3314,7 +3356,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           cleanup.out->streams[std::size_t(track.out)]->time_base);
       outPacket->pos = -1;
       outPacket->stream_index = track.out;
-      if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+      const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
+      if (writeRc < 0) {
+        writeFailureRc = writeRc;
         writeFailed = true;
       }
       av_packet_free(&outPacket);
@@ -3603,7 +3647,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           cleanup.out->streams[std::size_t(audioTrack->out)]->time_base);
       outPacket->pos = -1;
       outPacket->stream_index = audioTrack->out;
-      if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+      const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
+      if (writeRc < 0) {
+        writeFailureRc = writeRc;
         writeFailed = true;
       }
       av_packet_free(&outPacket);
@@ -3656,7 +3702,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             cleanup.out->streams[std::size_t(picOut)]->time_base);
         outPacket->pos = -1;
         outPacket->stream_index = picOut;
-        if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+        const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
+        if (writeRc < 0) {
+          writeFailureRc = writeRc;
           writeFailed = true;
         }
         av_packet_free(&outPacket);
@@ -3727,7 +3775,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         }
         outPacket->pos = -1;
         outPacket->stream_index = subOut;
-        if (av_interleaved_write_frame(cleanup.out, outPacket) < 0) {
+        const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
+        if (writeRc < 0) {
+          writeFailureRc = writeRc;
           writeFailed = true;
         }
         av_packet_free(&outPacket);
@@ -3817,8 +3867,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     return result;
   }
   if (writeFailed) {
-    result.error = Error::make(ErrorCode::ExecutionFailed,
-                               "write failed during transcode", "ffmpeg");
+    result.error = outputWriteError(writeFailureRc,
+                                    "write failed during transcode",
+                                    params.outputPath);
     return result;
   }
   struct stat st{};
@@ -3856,14 +3907,20 @@ bool segmentArtifactUsable(const std::string &path) {
 // Stream-copy assembly of finalized segments through the concat demuxer.
 // Each segment carries its own timeline starting at 0; concat chains them
 // by cumulative duration (spec §25: final assembly from validated pieces).
+// On failure, writeRc carries the output-write AVERROR code when known so
+// callers can surface ENOSPC as the terminal StorageFull error.
 bool assembleSegments(const std::vector<std::string> &segments,
-                      const std::string &outputPath, Container container) {
+                      const std::string &outputPath, Container container,
+                      int &writeRc) {
   const std::filesystem::path outFs(outputPath);
   const std::filesystem::path listPath =
       outFs.parent_path() / (outFs.filename().string() + ".concat.txt");
   {
     std::ofstream list(listPath, std::ios::binary | std::ios::trunc);
     if (!list) {
+      if (errno == ENOSPC) {
+        writeRc = AVERROR(ENOSPC);
+      }
       return false;
     }
     for (const std::string &seg : segments) {
@@ -3879,6 +3936,9 @@ bool assembleSegments(const std::vector<std::string> &segments,
       list << "file '" << escaped << "'\n";
     }
     if (!list.good()) {
+      if (errno == ENOSPC) {
+        writeRc = AVERROR(ENOSPC);
+      }
       return false;
     }
   }
@@ -3920,11 +3980,17 @@ bool assembleSegments(const std::vector<std::string> &segments,
     if (outIndexOfIn.size() != in->nb_streams) {
       break;
     }
-    if (!(out->oformat->flags & AVFMT_NOFILE) &&
-        avio_open(&out->pb, outputPath.c_str(), AVIO_FLAG_WRITE) < 0) {
-      break;
+    if (!(out->oformat->flags & AVFMT_NOFILE)) {
+      const int ioRc = avio_open(&out->pb, outputPath.c_str(),
+                                AVIO_FLAG_WRITE);
+      if (ioRc < 0) {
+        writeRc = ioRc;
+        break;
+      }
     }
-    if (avformat_write_header(out, nullptr) < 0) {
+    const int headerRc = avformat_write_header(out, nullptr);
+    if (headerRc < 0) {
+      writeRc = headerRc;
       break;
     }
     AVPacket *pkt = av_packet_alloc();
@@ -3944,7 +4010,9 @@ bool assembleSegments(const std::vector<std::string> &segments,
           av_rescale_q(pkt->duration, srcStream->time_base,
                        dstStream->time_base);
       pkt->pos = -1;
-      if (av_interleaved_write_frame(out, pkt) < 0) {
+      const int frameRc = av_interleaved_write_frame(out, pkt);
+      if (frameRc < 0) {
+        writeRc = frameRc;
         writeFailed = true;
       }
       av_packet_unref(pkt);
@@ -4188,20 +4256,33 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
       if (ec) {
         std::filesystem::copy_file(committed.front().path, params.outputPath,
                                    ec);
+        if (ec) {
+          // The rename fallback failed too (e.g. a full disk): never fall
+          // through to fake success without the final output.
+          result.error = outputWriteError(
+              ec == std::errc::no_space_on_device ? AVERROR(ENOSPC) : 0,
+              "cannot promote the finished output", params.outputPath);
+          return result;
+        }
       }
-    } else if (!assembleSegments(
-                   std::vector<std::string>([](const std::vector<ValidSegment> &c) {
-                     std::vector<std::string> paths;
-                     paths.reserve(c.size());
-                     for (const auto &v : c) {
-                       paths.push_back(v.path);
-                     }
-                     return paths;
-                   }(committed)),
-                   params.outputPath, params.pipeline.container)) {
-      result.error = Error::make(ErrorCode::ExecutionFailed,
-                                 "cannot assemble committed segments", "ffmpeg");
-      return result;
+    } else {
+      int asmRc = 0;
+      const bool assembled = assembleSegments(
+          std::vector<std::string>([](const std::vector<ValidSegment> &c) {
+            std::vector<std::string> paths;
+            paths.reserve(c.size());
+            for (const auto &v : c) {
+              paths.push_back(v.path);
+            }
+            return paths;
+          }(committed)),
+          params.outputPath, params.pipeline.container, asmRc);
+      if (!assembled) {
+        result.error = outputWriteError(asmRc,
+                                        "cannot assemble committed segments",
+                                        params.outputPath);
+        return result;
+      }
     }
     std::filesystem::remove_all(segDir, ec);
     result.success = true;
@@ -4296,8 +4377,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
     if (ec) {
       std::filesystem::copy_file(committed.front().path, params.outputPath, ec);
       if (ec) {
-        result.error = Error::make(ErrorCode::ExecutionFailed,
-                                   "cannot promote the finished output", "ffmpeg");
+        result.error = outputWriteError(
+            ec == std::errc::no_space_on_device ? AVERROR(ENOSPC) : 0,
+            "cannot promote the finished output", params.outputPath);
         return result;
       }
     }
@@ -4307,11 +4389,12 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
     for (const auto &v : committed) {
       paths.push_back(v.path);
     }
+    int asmRc = 0;
     if (!assembleSegments(paths, params.outputPath,
-                          params.pipeline.container)) {
-      result.error =
-          Error::make(ErrorCode::ExecutionFailed,
-                      "cannot assemble the finished segments", "ffmpeg");
+                          params.pipeline.container, asmRc)) {
+      result.error = outputWriteError(asmRc,
+                                      "cannot assemble the finished segments",
+                                      params.outputPath);
       return result;
     }
   }

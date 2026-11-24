@@ -140,6 +140,79 @@ public:
   FakeExecutor executor_;
 };
 
+// Test doubles for the runtime failure-feedback wiring (spec §15): two
+// backends with identical capability surfaces, one whose executor always
+// errors and one that always succeeds. The planner prefers the faster
+// prior (ffmpeg) first, so the scripted failure lands on a deterministic
+// route.
+class ScriptedExecutor final : public IPipelineExecutor {
+public:
+  explicit ScriptedExecutor(bool fail) : fail_(fail) {}
+
+  bool canExecute(const Pipeline &, const ConversionRequest &) const override {
+    return true;
+  }
+
+  ExecuteResult execute(const ExecuteParams &params) override {
+    executions.fetch_add(1);
+    ExecuteResult result;
+    if (fail_) {
+      result.error = Error::make(ErrorCode::BackendFailure,
+                                 "scripted backend failure", "scripted");
+      return result;
+    }
+    // Produce a real output file the validator can inspect.
+    std::ofstream out(params.outputPath, std::ios::binary);
+    for (int i = 0; i < 128 * 1024; ++i) {
+      out.put('\x02');
+    }
+    result.success = true;
+    result.framesProcessed = 300;
+    result.wallClockSec = 0.01;
+    return result;
+  }
+
+  std::atomic<int> executions{0};
+
+private:
+  bool fail_;
+};
+
+class ScriptedBackend final : public velmux::backend::IBackend {
+public:
+  ScriptedBackend(BackendId id, bool fail) : id_(id), executor_(fail) {}
+
+  BackendId id() const override { return id_; }
+  std::string name() const override {
+    return id_ == BackendId::Ffmpeg ? "ScriptedFfmpeg" : "ScriptedApple";
+  }
+  Error initialize() override { return {}; }
+  BackendCapabilities capabilities() const override {
+    BackendCapabilities caps;
+    caps.backend = id_;
+    caps.implementation = "scripted-for-tests";
+    caps.canInspect = true;
+    caps.video.push_back(
+        VideoCapability{VideoCodec::H264, {true, true, true}, false, 0, 0});
+    caps.video.push_back(
+        VideoCapability{VideoCodec::VP9, {true, true, true}, false, 0, 0});
+    caps.audio.push_back(AudioCapability{AudioCodec::Aac, {true, true, true}});
+    caps.audio.push_back(
+        AudioCapability{AudioCodec::Opus, {true, true, true}});
+    caps.readableContainers = {Container::Mp4, Container::Mkv,
+                               Container::WebM};
+    caps.writableContainers = {Container::Mp4, Container::Mkv,
+                               Container::WebM};
+    return caps;
+  }
+  IInspector *inspector() override { return &inspector_; }
+  IPipelineExecutor *executor() override { return &executor_; }
+
+  BackendId id_;
+  FakeInspector inspector_;
+  ScriptedExecutor executor_;
+};
+
 class EventRecorder final : public IJobEventSink {
 public:
   void onJobEvent(const JobEvent &event) override {
@@ -440,5 +513,117 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
     CHECK(terminal->state == JobState::Completed);
     CHECK(terminal->jobId == jobId);
   }
+  std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE("backend execution failures are recorded and reroute the next plan") {
+  // Two scripted backends with identical capabilities: the fast one (ffmpeg
+  // priors win the first plan) always fails execution, the slower one works.
+  // Job 1 must fail on the fast one; the capability registry must record
+  // the exact failed configuration; the next plan for the SAME request must
+  // land on the working backend; and the record must stay narrow (a
+  // different output codec still plans on the failed backend).
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("velmux-failfeedback-" + std::to_string(::getpid()));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+  const std::string media = makeFakeMedia(dir / "in.mp4");
+
+  auto failing = std::make_unique<ScriptedBackend>(BackendId::Ffmpeg, true);
+  auto working = std::make_unique<ScriptedBackend>(BackendId::Apple, false);
+  ScriptedBackend *failingBackend = failing.get();
+  ScriptedBackend *workingBackend = working.get();
+  std::vector<std::unique_ptr<velmux::backend::IBackend>> backends;
+  backends.push_back(std::move(failing));
+  backends.push_back(std::move(working));
+  auto engine =
+      VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
+  REQUIRE(engine != nullptr);
+
+  ConversionRequest request;
+  request.source.uri = media;
+  request.source.displayName = "sample.mp4";
+  request.outputContainer = Container::Mkv;
+  request.goal.kind = GoalKind::Recommended;
+  request.video.codec = VideoCodec::VP9;
+  request.audio.codec = AudioCodec::Opus;
+
+  // Baseline: the faster ffmpeg route wins the plan (cost priors).
+  {
+    const Result<PlanResult> plan =
+        engine->plan(MediaSource{media, "sample.mp4"}, request);
+    REQUIRE(plan.ok());
+    REQUIRE(plan.value().feasible);
+    REQUIRE(plan.value().best.has_value());
+    CHECK(plan.value().best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
+  }
+
+  // Job 1 executes on the failing backend and fails for real.
+  EventRecorder recorder;
+  engine->events().subscribe(&recorder);
+  const Result<std::string> first = engine->startJob(request);
+  REQUIRE(first.ok());
+  const auto terminal = recorder.waitForTerminal(std::chrono::seconds(10));
+  REQUIRE(terminal.has_value());
+  CHECK(terminal->state == JobState::Failed);
+  CHECK(failingBackend->executor_.executions.load() == 1);
+
+  // The failure is recorded (the record lands right after the terminal
+  // event; poll briefly so the assertion never races the worker).
+  bool recorded = false;
+  for (int i = 0; i < 200 && !recorded; ++i) {
+    recorded = engine->capabilities().failureCount() == 1;
+    if (!recorded) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  REQUIRE(recorded);
+  FailedConfigKey expected;
+  expected.backend = BackendId::Ffmpeg;
+  expected.codec = VideoCodec::VP9;
+  expected.width = 1280;
+  expected.height = 720;
+  CHECK(engine->capabilities().hasFailed(expected));
+
+  // The next plan for the SAME request avoids the failed route and lands
+  // on the working backend.
+  {
+    const Result<PlanResult> plan =
+        engine->plan(MediaSource{media, "sample.mp4"}, request);
+    REQUIRE(plan.ok());
+    REQUIRE(plan.value().feasible);
+    REQUIRE(plan.value().best.has_value());
+    CHECK_FALSE(
+        plan.value().best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
+    CHECK(plan.value().best->pipeline.assigns(StageId::Mux, BackendId::Apple));
+  }
+
+  // Job 2 completes through the working backend.
+  EventRecorder secondRecorder;
+  engine->events().subscribe(&secondRecorder);
+  const Result<std::string> second = engine->startJob(request);
+  REQUIRE(second.ok());
+  const auto terminal2 =
+      secondRecorder.waitForTerminal(std::chrono::seconds(10));
+  REQUIRE(terminal2.has_value());
+  CHECK(terminal2->state == JobState::Completed);
+  CHECK(terminal2->jobId == second.value());
+  CHECK(workingBackend->executor_.executions.load() == 1);
+  CHECK(failingBackend->executor_.executions.load() == 1);
+
+  // Narrowness: a different output codec on the failed backend still plans
+  // there — the record is a configuration key, not a backend ban.
+  {
+    ConversionRequest h264 = request;
+    h264.video.codec = VideoCodec::H264; // forces a transcode
+    const Result<PlanResult> plan =
+        engine->plan(MediaSource{media, "sample.mp4"}, h264);
+    REQUIRE(plan.ok());
+    REQUIRE(plan.value().feasible);
+    REQUIRE(plan.value().best.has_value());
+    CHECK(plan.value().best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
+  }
+
   std::filesystem::remove_all(dir, ec);
 }

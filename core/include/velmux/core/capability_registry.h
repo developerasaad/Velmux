@@ -12,6 +12,8 @@
 
 #include "velmux/core/types.h"
 
+#include <cstdint>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -103,6 +105,21 @@ struct FailedConfigKey {
 
 class CapabilityRegistry {
 public:
+  // Value semantics for test helpers that build registries by value: the
+  // destination starts with a fresh (unlocked) mutex; the source's state is
+  // moved/copied under its lock.
+  CapabilityRegistry() = default;
+  CapabilityRegistry(const CapabilityRegistry &other) {
+    std::lock_guard<std::mutex> lock(other.failuresMutex_);
+    backends_ = other.backends_;
+    failures_ = other.failures_;
+  }
+  CapabilityRegistry(CapabilityRegistry &&other) {
+    std::lock_guard<std::mutex> lock(other.failuresMutex_);
+    backends_ = std::move(other.backends_);
+    failures_ = std::move(other.failures_);
+  }
+
   void registerBackend(BackendCapabilities capabilities);
 
   // Remove everything a backend reported (used when a backend shuts down or
@@ -122,7 +139,15 @@ public:
                                                  AudioCodec codec) const;
 
   // Narrow failure records. Recording a failure never bans the codec: only
-  // this exact configuration on this backend.
+  // this exact configuration on this backend. Records come from the job
+  // manager when an execution-attributable backend error finalizes a job;
+  // the planner consults them so the next plan avoids the failed route.
+  //
+  // Semantics: records live for a cooldown window (see the .cpp) and then
+  // expire — a transient failure (codec reset, momentary resource
+  // pressure) must not poison a route forever, and re-recording the same
+  // key refreshes the cooldown. All failure APIs are thread-safe:
+  // recording happens on worker threads while planning reads concurrently.
   void recordFailure(const FailedConfigKey &key);
   bool hasFailed(const FailedConfigKey &key) const;
   void clearFailures(BackendId backend);
@@ -132,8 +157,18 @@ public:
   const BackendCapabilities *capabilitiesOf(BackendId backend) const;
 
 private:
+  // One narrow failure record plus its wall-clock age (cooldown expiry
+  // re-admits the backend for that configuration).
+  struct FailureRecord {
+    FailedConfigKey key;
+    std::int64_t recordedAtMs = 0;
+  };
+
+  static bool recordIsLive(const FailureRecord &record, std::int64_t nowMs);
+
   std::vector<BackendCapabilities> backends_;
-  std::vector<FailedConfigKey> failures_;
+  std::vector<FailureRecord> failures_;
+  mutable std::mutex failuresMutex_;
 };
 
 } // namespace velmux::core

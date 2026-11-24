@@ -5,6 +5,7 @@
 #include "velmux/core/types.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <string>
 
 extern "C" {
@@ -30,13 +31,41 @@ inline Error makeAvError(ErrorCode code, const std::string &context,
   return Error::make(code, context + ": " + avErrorString(errnum), "ffmpeg");
 }
 
+// Output-write failure mapping. A full disk is a terminal environmental
+// error (ErrorCode::StorageFull): the recovery layer must surface it to
+// the user, never retry or silently truncate. The errno check is
+// authoritative (libav* reports write errors as AVERROR(ENOSPC)); the
+// strerror text is a fallback for paths where only a message survives.
+inline bool isNoSpaceLeft(int errnum) {
+  return errnum == AVERROR(ENOSPC) ||
+         avErrorString(errnum).find("No space left") != std::string::npos;
+}
+
+inline Error outputWriteError(int errnum, const std::string &context,
+                              const std::string &outputPath) {
+  if (isNoSpaceLeft(errnum)) {
+    return Error::make(ErrorCode::StorageFull,
+                       context + ": no space left on device while writing " +
+                           outputPath,
+                       "ffmpeg");
+  }
+  if (errnum < 0) {
+    // Negative = an AVERROR code from libav*; keep the established
+    // "context: strerror" style. Zero = unknown cause (e.g. a failed
+    // stream write without a code): the bare context stays honest.
+    return Error::make(ErrorCode::ExecutionFailed,
+                       context + ": " + avErrorString(errnum), "ffmpeg");
+  }
+  return Error::make(ErrorCode::ExecutionFailed, context, "ffmpeg");
+}
+
 // Map a Velmux quality request (0..100) to the encoder's CRF-style quality
 // parameter (higher quality -> lower CRF).
 inline int qualityToCrf(VideoCodec codec, std::int32_t quality) {
   const int q = std::clamp(quality, 0, 100);
   switch (codec) {
     case VideoCodec::H264: // libx264 crf 0..51
-    case VideoCodec::Hevc: // libx265 crf 0..51
+    case VideoCodec::HEVC: // libx265 crf 0..51
       return 51 - (q * 51) / 100;
     case VideoCodec::AV1: // libsvtav1 crf 0..63
     case VideoCodec::VP9: // libvpx-vp9 crf 0..63
@@ -53,7 +82,7 @@ inline const char *encoderNameFor(VideoCodec codec) {
   switch (codec) {
     case VideoCodec::H264:
       return "libx264";
-    case VideoCodec::Hevc:
+    case VideoCodec::HEVC:
       // Pinned since the x265 3.6 build (feature matrix: HEVC D+E+C).
       return "libx265";
     case VideoCodec::AV1:

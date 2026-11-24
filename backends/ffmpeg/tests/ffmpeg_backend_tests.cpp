@@ -13,6 +13,7 @@
 
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -2036,4 +2037,200 @@ TEST_CASE("HARDENING: unwritable output destination fails cleanly") {
                           << " error: " << terminal->error);
   REQUIRE(terminal->state == JobState::Failed);
   CHECK_FALSE(terminal->error.empty());
+}
+
+TEST_CASE("HARDENING: very large container metadata converts honestly") {
+  TestEnv env;
+  // Base fixture, then re-mux it with hundreds of large container tags
+  // (~600 KB of metadata — far beyond anything a real library writes).
+  // The engine must copy or strip them per the request and complete with a
+  // validated, non-truncated output — or fail with a real error. Never a
+  // hang (bounded by the terminal waits), never a crash (the test process
+  // survives), never a silent truncation (duration + probe cross-checks).
+  const std::string plain =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  std::string tagArgs = " -metadata title=VelmuxHugeMetaTitle";
+  const std::string filler(1500, 'm');
+  for (int i = 0; i < 400; ++i) {
+    tagArgs += " -metadata velmux_tag_" + std::to_string(i) + "=" + filler;
+  }
+  const std::string tagged = (env.dir / "huge-meta.mp4").string();
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+                       plain + "\"" + tagArgs + " -c copy \"" + tagged + "\"")
+                          .c_str()) == 0);
+  // The fixture really carries the payload (~600 KB of tags).
+  REQUIRE(std::filesystem::file_size(tagged) >
+          std::filesystem::file_size(plain) + std::int64_t(400) * 1300);
+
+  // INDEPENDENT metadata cross-check: reads one container tag via ffprobe.
+  const auto tagOf = [](const std::string &path, const std::string &key) {
+    std::FILE *pipe =
+        popen((ffprobeBin() + " -v error -show_entries format_tags=" + key +
+               " -of csv=p=0 \"" + path + "\"")
+                  .c_str(),
+              "r");
+    REQUIRE(pipe != nullptr);
+    char buf[512] = {0};
+    const char *got = std::fgets(buf, sizeof(buf), pipe);
+    pclose(pipe);
+    std::string s = got != nullptr ? buf : "";
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+      s.pop_back();
+    }
+    return s;
+  };
+
+  // Run 1: remux (stream copy) with metadata preserved (the default).
+  // Completed must mean the sentinel tag survived and the output covers
+  // the source duration.
+  {
+    EventWaiter waiter;
+    env.engine->events().subscribe(&waiter);
+    const Result<std::string> jobId = env.engine->startJob(
+        transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
+                         AudioCodec::Aac));
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal.has_value());
+    INFO("terminal state: " << int(terminal->state)
+                            << " error: " << terminal->error);
+    if (terminal->state == JobState::Completed) {
+      const auto snap = env.engine->getJob(jobId.value());
+      REQUIRE(snap.has_value());
+      const ProbeResult probe = probeWith(snap->outputPath);
+      CHECK(probe.videoCodec == "h264");
+      CHECK(probe.durationSec >= 1.0); // 2 s source; never a truncation
+      CHECK(snap->outputSizeBytes > 1024);
+      // Metadata preserved per the request: the sentinel title survives.
+      CHECK(tagOf(snap->outputPath, "title") == "VelmuxHugeMetaTitle");
+    } else {
+      REQUIRE(terminal->state == JobState::Failed);
+      CHECK_FALSE(terminal->error.empty());
+    }
+  }
+
+  // Run 2: real transcode (height change forces re-encoding) with
+  // stripMetadata=true — the decode/encode path must carry or drop the
+  // tags per the request, honestly either way.
+  {
+    ConversionRequest strip =
+        transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
+                         AudioCodec::Aac, 144, 400'000);
+    strip.stripMetadata = true;
+    EventWaiter waiter2;
+    env.engine->events().subscribe(&waiter2);
+    const Result<std::string> jobId2 = env.engine->startJob(strip);
+    REQUIRE(jobId2.ok());
+    const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal2.has_value());
+    INFO("terminal state: " << int(terminal2->state)
+                            << " error: " << terminal2->error);
+    if (terminal2->state == JobState::Completed) {
+      const auto snap = env.engine->getJob(jobId2.value());
+      REQUIRE(snap.has_value());
+      const ProbeResult probe = probeWith(snap->outputPath);
+      CHECK(probe.height == 144);
+      CHECK(probe.durationSec >= 1.0);
+      // Stripped per the request: the sentinel must NOT survive.
+      CHECK(tagOf(snap->outputPath, "title").empty());
+    } else {
+      REQUIRE(terminal2->state == JobState::Failed);
+      CHECK_FALSE(terminal2->error.empty());
+    }
+  }
+}
+
+TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") {
+  TestEnv env;
+  // Base fixture, then a re-encode into MPEG-TS whose video PTS jumps
+  // BACKWARD mid-stream (the classic broken-capture shape: real-world TS
+  // files carry discontinuities and counter wraparounds). -bf 0 keeps
+  // pts order == dts order so the muxer writes the jump verbatim; audio
+  // keeps its natural timing, so the file also carries the A/V desync
+  // that follows such a jump in real captures.
+  const std::string plain =
+      generateFixture(env.dir / "in.mp4",
+                      "testsrc2=size=320x240:rate=12",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  const std::string broken = (env.dir / "nonmono.ts").string();
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error -i \"" +
+                       plain + "\" -vf \"setpts='if(lt(N,12),PTS,PTS-0.5/TB)'\" "
+                       "-c:v libx264 -preset ultrafast -crf 35 -bf 0 "
+                       "-c:a copy -f mpegts \"" + broken + "\"")
+                          .c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(broken) > 1024);
+
+  // The fixture really carries the pathology: at least one video packet
+  // has a SMALLER pts than its predecessor. If generation ever silently
+  // "fixes" the timestamps, fail loudly instead of testing a healthy file.
+  {
+    std::FILE *pipe =
+        popen((ffprobeBin() + " -v error -select_streams v:0 "
+                              "-show_entries packet=pts -of csv=p=0 \"" +
+               broken + "\"")
+                  .c_str(),
+              "r");
+    REQUIRE(pipe != nullptr);
+    bool nonMonotonic = false;
+    bool havePrev = false;
+    std::int64_t prev = 0;
+    char line[64];
+    while (std::fgets(line, sizeof(line), pipe) != nullptr) {
+      if (line[0] < '0' || line[0] > '9') {
+        continue; // header noise / packets without pts
+      }
+      const std::int64_t pts = std::atoll(line);
+      if (havePrev && pts < prev) {
+        nonMonotonic = true;
+        break;
+      }
+      prev = pts;
+      havePrev = true;
+    }
+    pclose(pipe);
+    REQUIRE(nonMonotonic);
+  }
+
+  ConversionRequest request =
+      transcodeRequest(broken, Container::Mp4, VideoCodec::H264,
+                       AudioCodec::Aac);
+
+  // Honest outcomes, one forbidden shape (fake success): the engine may
+  // refuse at inspection, plan infeasible, or fail the job with a real
+  // error — or complete with a VALID, decodable output whose duration
+  // covers what inspection promised (minus the ~0.5 s the jump costs).
+  // Never a hang (bounded waits), never a crash, never fake success.
+  const Result<PlanResult> plan =
+      env.engine->plan(MediaSource{broken, "nonmono.ts"}, request);
+  if (plan.ok() && plan.value().feasible) {
+    const Result<MediaInfo> inspected =
+        env.engine->inspect(MediaSource{broken, "nonmono.ts"});
+    REQUIRE(inspected.ok());
+    const double inspectedDuration = inspected.value().durationSec;
+    EventWaiter waiter;
+    env.engine->events().subscribe(&waiter);
+    const Result<std::string> jobId = env.engine->startJob(request);
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal.has_value());
+    INFO("terminal state: " << int(terminal->state)
+                            << " error: " << terminal->error);
+    if (terminal->state == JobState::Completed) {
+      const auto snap = env.engine->getJob(jobId.value());
+      REQUIRE(snap.has_value());
+      const ProbeResult probe = probeWith(snap->outputPath);
+      CHECK(probe.videoCodec == "h264");
+      CHECK(probe.durationSec >= inspectedDuration - 1.0);
+      CHECK(snap->outputSizeBytes > 1024);
+    } else {
+      REQUIRE(terminal->state == JobState::Failed);
+      CHECK_FALSE(terminal->error.empty());
+    }
+  } else if (plan.ok()) {
+    CHECK(plan.value().message.size() > 0);
+  } else {
+    CHECK(plan.error().message.size() > 0);
+  }
 }

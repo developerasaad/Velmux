@@ -64,6 +64,45 @@ bool backendServesWholePipeline(const CapabilityRegistry &caps,
 
 } // namespace
 
+FailedConfigKey failedConfigKeyFor(BackendId backend, const MediaInfo &source,
+                                   const ConversionRequest &request,
+                                   VideoCodec outVideoCodec) {
+  FailedConfigKey key;
+  key.backend = backend;
+  key.codec = outVideoCodec;
+  if (request.video.profile.has_value()) {
+    key.profile = *request.video.profile;
+  }
+  if (request.video.pixelFormat.has_value()) {
+    key.pixelFormat = pixelFormatName(*request.video.pixelFormat);
+  }
+  if (!source.video.empty()) {
+    // Output geometry through the executor's transform order
+    // (crop -> rotation -> scale); mirrors what validateOutput expects.
+    std::int32_t w = source.video.front().width;
+    std::int32_t h = source.video.front().height;
+    if (request.video.crop.has_value() && request.video.crop->active()) {
+      w = std::clamp(request.video.crop->width, 2,
+                     std::max(0, w - request.video.crop->x));
+      h = std::clamp(request.video.crop->height, 2,
+                     std::max(0, h - request.video.crop->y));
+    }
+    if (request.video.rotationDegrees == 90 ||
+        request.video.rotationDegrees == 270) {
+      std::swap(w, h);
+    }
+    if (request.video.resolutionHeight.has_value() && h > 0) {
+      const std::int32_t targetH = *request.video.resolutionHeight;
+      w = std::max<std::int32_t>(
+          2, std::int32_t(std::lround(double(w) * double(targetH) / double(h))) & ~1);
+      h = targetH;
+    }
+    key.width = w;
+    key.height = h;
+  }
+  return key;
+}
+
 Planner::Planner(const FeatureRegistry &features,
                  const CapabilityRegistry &caps, const ITelemetryQuery *telemetry)
     : features_(features), caps_(caps), telemetry_(telemetry) {}
@@ -257,6 +296,10 @@ PlanResult Planner::plan(const MediaInfo &source,
     double preferenceScore = 0.0;
   };
   std::vector<Candidate> candidates;
+  // Set when a viable candidate was dropped solely because its exact
+  // configuration has a live failure record; the infeasibility message
+  // must then explain that (it is not a capability gap).
+  bool blockedByFailureRecord = false;
 
   // Extraction candidates: demux + subtitle processing on a backend that
   // extracts. The artifact is a text sidecar; the extension comes from the
@@ -415,6 +458,15 @@ PlanResult Planner::plan(const MediaInfo &source,
           encodeBackends.end()) {
         return;
       }
+    }
+    // Runtime failure feedback (spec §15): a configuration that already
+    // failed execution on this backend is avoided while the record is
+    // live (the registry's cooldown re-admits it later). This is narrow —
+    // a different codec/profile/geometry on the same backend still plans.
+    if (caps_.hasFailed(
+            failedConfigKeyFor(backend, source, request, outVideoCodec))) {
+      blockedByFailureRecord = true;
+      return;
     }
     // Processing capabilities: geometry / rate / audio-format changes and
     // subtitle work only route to backends that actually implement them
@@ -706,6 +758,14 @@ PlanResult Planner::plan(const MediaInfo &source,
           decoders.end()) {
         continue;
       }
+      // Same runtime-failure avoidance as single-backend candidates: a
+      // decode side with a live failure record for this configuration
+      // must not be composed into the only remaining route.
+      if (caps_.hasFailed(failedConfigKeyFor(decodeBackend, source, request,
+                                             outVideoCodec))) {
+        blockedByFailureRecord = true;
+        continue;
+      }
       for (BackendId muxBackend : caps_.registeredBackends()) {
         const auto *muxCaps = caps_.capabilitiesOf(muxBackend);
         if (muxCaps == nullptr || !muxCaps->stageEncodeFromCpuFrames) {
@@ -727,6 +787,11 @@ PlanResult Planner::plan(const MediaInfo &source,
             caps_.backendsFor(outVideoCodec, CodecOp::Encode);
         if (std::find(encoders.begin(), encoders.end(), muxBackend) ==
             encoders.end()) {
+          continue;
+        }
+        if (caps_.hasFailed(failedConfigKeyFor(muxBackend, source, request,
+                                               outVideoCodec))) {
+          blockedByFailureRecord = true;
           continue;
         }
         if (!audioCopyable) {
@@ -784,11 +849,18 @@ PlanResult Planner::plan(const MediaInfo &source,
 
   if (candidates.empty()) {
     result.feasible = false;
-    result.message =
-        wantsVideo
-            ? "No registered backend can decode this source and encode the "
-              "requested output on this device."
-            : "No registered backend can produce the requested output.";
+    if (blockedByFailureRecord) {
+      result.message =
+          "Every backend route for this exact configuration failed "
+          "recently; the failure record cools down automatically. Try "
+          "again later or change the output settings.";
+    } else {
+      result.message =
+          wantsVideo
+              ? "No registered backend can decode this source and encode the "
+                "requested output on this device."
+              : "No registered backend can produce the requested output.";
+    }
     return result;
   }
 

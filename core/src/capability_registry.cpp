@@ -1,8 +1,24 @@
 #include "velmux/core/capability_registry.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace velmux::core {
+
+namespace {
+
+// Failure-record cooldown: a recorded configuration failure steers the
+// planner away from that route for this long; afterwards the backend gets
+// another chance (transient failures must not poison a route forever).
+constexpr std::int64_t kFailureCooldownMs = 10 * 60 * 1000;
+
+std::int64_t nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+} // namespace
 
 bool FailedConfigKey::operator==(const FailedConfigKey &other) const {
   return backend == other.backend && codec == other.codec &&
@@ -122,25 +138,60 @@ CapabilityRegistry::audioCapability(BackendId backend,
   return std::nullopt;
 }
 
+bool CapabilityRegistry::recordIsLive(const FailureRecord &record,
+                                      std::int64_t now) {
+  return now - record.recordedAtMs < kFailureCooldownMs;
+}
+
 void CapabilityRegistry::recordFailure(const FailedConfigKey &key) {
-  if (!hasFailed(key)) {
-    failures_.push_back(key);
+  std::lock_guard<std::mutex> lock(failuresMutex_);
+  const std::int64_t now = nowMs();
+  // Deduplicate by identity, not by liveness: an expired record for the
+  // same key is refreshed in place (a repeat failure restarts the
+  // cooldown) rather than accumulating stale rows.
+  for (FailureRecord &record : failures_) {
+    if (record.key == key) {
+      record.recordedAtMs = now;
+      return;
+    }
   }
+  failures_.push_back(FailureRecord{key, now});
 }
 
 bool CapabilityRegistry::hasFailed(const FailedConfigKey &key) const {
-  return std::find(failures_.begin(), failures_.end(), key) != failures_.end();
+  std::lock_guard<std::mutex> lock(failuresMutex_);
+  const std::int64_t now = nowMs();
+  for (const FailureRecord &record : failures_) {
+    if (record.key == key && recordIsLive(record, now)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void CapabilityRegistry::clearFailures(BackendId backend) {
+  std::lock_guard<std::mutex> lock(failuresMutex_);
   failures_.erase(std::remove_if(failures_.begin(), failures_.end(),
-                                 [backend](const FailedConfigKey &k) {
-                                   return k.backend == backend;
+                                 [backend](const FailureRecord &r) {
+                                   return r.key.backend == backend;
                                  }),
                   failures_.end());
 }
 
-std::size_t CapabilityRegistry::failureCount() const { return failures_.size(); }
+std::size_t CapabilityRegistry::failureCount() const {
+  std::lock_guard<std::mutex> lock(failuresMutex_);
+  // Count live records without mutating: const queries must not prune. The
+  // bounded key space keeps the vector small; recordFailure deduplicates
+  // and clearFailures/invalidate drop stale rows.
+  const std::int64_t now = nowMs();
+  std::size_t live = 0;
+  for (const FailureRecord &record : failures_) {
+    if (recordIsLive(record, now)) {
+      ++live;
+    }
+  }
+  return live;
+}
 
 std::vector<BackendId> CapabilityRegistry::registeredBackends() const {
   std::vector<BackendId> result;
