@@ -32,6 +32,7 @@ import type {SampleState} from './convert/SamplePreviewCard';
 import {SourceInfoCard} from './convert/SourceInfoCard';
 import type {InspectState} from './convert/SourceInfoCard';
 import {SubtitlesSection} from './convert/SubtitlesSection';
+import {TrimSection} from './convert/TrimSection';
 
 type ConvertScreenProps = NativeStackScreenProps<RootStackParamList, 'Convert'>;
 
@@ -43,6 +44,7 @@ export function ConvertScreen({route}: ConvertScreenProps) {
 
   const beginDraft = useConvertStore(state => state.beginDraft);
   const draft = useConvertStore(state => state.draft);
+  const setTrim = useConvertStore(state => state.setTrim);
   const bridgeAvailable = useJobsStore(state => state.bridgeAvailable);
   const startJob = useJobsStore(state => state.startJob);
 
@@ -241,6 +243,11 @@ export function ConvertScreen({route}: ConvertScreenProps) {
     planState.status === 'ready' && planState.feasible === false;
   const canStart = bridgeAvailable && draft.source !== null && !planInfeasible;
 
+  // Source length drives the trim bounds; unknown until inspection
+  // succeeds (loading, failed, or bridge unavailable).
+  const sourceDurationSec =
+    inspectState.status === 'ready' ? inspectState.info.durationSec : null;
+
   const handleStart = useCallback(async () => {
     const computed = computeRequest(useConvertStore.getState().draft);
     if (computed === null) {
@@ -300,6 +307,11 @@ export function ConvertScreen({route}: ConvertScreenProps) {
       <GoalSection />
       <OutputSection />
       <AudioSection />
+      <TrimSection
+        durationSec={sourceDurationSec}
+        trim={draft.trim}
+        onSetTrim={setTrim}
+      />
       <SubtitlesSection />
       <EstimateCard planState={planState} onRetry={() => {
         runPlan();
