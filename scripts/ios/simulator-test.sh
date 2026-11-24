@@ -51,7 +51,7 @@ collect_diagnostics() {
   # ${UDID:-booted}: the ERR trap can fire before a simulator is ever
   # selected (e.g. the FFmpeg build failed); "booted" is simctl's
   # placeholder and degrades gracefully when nothing is running.
-  xcrun simctl spawn "${UDID:-booted}" log show --last 10m \
+  xcrun simctl spawn "${UDID:-booted}" log show --info --last 10m \
     --style compact --predicate 'process == "Velmux"' \
     > "$DIAG_DIR/velmux-process.log" 2>/dev/null || true
   xcrun simctl diagnose "${UDID:-booted}" --archive "$DIAG_DIR/simdiag" \
@@ -127,12 +127,6 @@ verify_launch() {
   local phase="$1"
   xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
   sleep 2
-  # Stream the unified log for the app process while it runs.
-  local log="$DIAG_DIR/${phase}.log"
-  xcrun simctl spawn "$UDID" log stream --style compact \
-    --predicate 'process == "Velmux"' > "$log" 2>/dev/null &
-  local LOG_PID=$!
-
   local launch_out pid
   launch_out="$(xcrun simctl launch "$UDID" "$BUNDLE_ID")" \
     || vdie "$phase: simctl launch failed"
@@ -146,8 +140,16 @@ verify_launch() {
     vdie "$phase: the app process died shortly after launch (pid $pid)"
   fi
 
-  kill "$LOG_PID" 2>/dev/null || true
-  wait "$LOG_PID" 2>/dev/null || true
+  # Unified log for the window, read from the PERSISTED log after the
+  # fact. The previous live 'log stream' capture was fragile (a background
+  # process killed after the window; one run captured zero entries —
+  # buffered output lost on kill). --info is REQUIRED: the RN init marker
+  # is console.info -> os_log(OS_LOG_TYPE_INFO), and both 'log stream' and
+  # 'log show' hide info-level entries without it (the AppDelegate raises
+  # RN's release log threshold so the marker reaches os_log at all).
+  local log="$DIAG_DIR/${phase}.log"
+  xcrun simctl spawn "$UDID" log show --info --last 2m --style compact \
+    --predicate 'process == "Velmux"' > "$log" 2>/dev/null || true
 
   # RN initialization marker: proves the JS runtime executed app init and
   # found the native bridge + engine.
