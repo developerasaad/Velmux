@@ -6,15 +6,21 @@
 #   env: VELMUX_IOS_DEPLOYMENT_TARGET (default 15.0, D-004)
 #        VELMUX_FFMPEG_JOBS=<parallel jobs> (default: sysctl -n hw.ncpu)
 #        VELMUX_WITH_SVT (default 1; SVT-AV1 encoder on arm64 slices)
+#        VELMUX_IOS_SIM_X86_64 (default 0; opt-in Intel-simulator slice)
 #
-# Slices:
-#   iphoneos/arm64          -> out/ios/iphoneos/{include,lib,...}
-#   iphonesimulator/arm64   -> merged (lipo) into
-#   iphonesimulator/x86_64     out/ios/iphonesimulator/{include,lib,...}
+# Target model (simulator is a development/test target, never a product
+# target — it exists for ./scripts/test.sh --ios-sim):
+#   iphoneos/arm64        -> out/ios/iphoneos/{include,lib,...}
+#   iphonesimulator/arm64 -> out/ios/iphonesimulator/{include,lib,...}
 #
-# The x86_64 simulator slice omits SVT-AV1 (its x86 asm requires nasm and
-# the slice is development-only); AV1 decode stays available via dav1d and
-# the manifests report the difference honestly.
+# The DEFAULT simulator layout is the single-arch arm64 slice itself: its
+# BUILD-IDENTITY accurately describes the layout (same assembly shape as
+# the device layout, which is what fetch.sh verifies). The Intel-simulator
+# slice (sim-x86_64, lipo-merged fat libs) is built only when explicitly
+# requested with VELMUX_IOS_SIM_X86_64=1 for a real Intel-Mac use case;
+# the merged layout then records BOTH slice identities plus the merged
+# architecture list in its BUILD-IDENTITY, so the recorded identity never
+# misdescribes the artifact.
 #
 # Idempotent per slice: exits 0 quickly when that slice's manifest exists.
 # Output also aggregates out/ios/manifest.json.
@@ -24,6 +30,10 @@ set -euo pipefail
 
 DEPLOYMENT_TARGET="${VELMUX_IOS_DEPLOYMENT_TARGET:-15.0}"
 WITH_SVT="${VELMUX_WITH_SVT:-1}"
+# The Intel-simulator slice is NOT built by default (D-058): the normal
+# Apple Silicon path needs only the arm64 simulator slice, and the fat
+# lipo merge complicated artifact identity for no product value.
+WITH_SIM_X86_64="${VELMUX_IOS_SIM_X86_64:-0}"
 
 case "$(uname -s)" in
   Darwin) ;;
@@ -90,6 +100,8 @@ slice_settings() {
       SLICE_SDK="iphonesimulator"
       SLICE_ARCH="x86_64"
       SLICE_MIN_FLAG="-mios-simulator-version-min=$DEPLOYMENT_TARGET"
+      # OPT-IN slice (VELMUX_IOS_SIM_X86_64=1, Intel-Mac development only):
+      # never built by default (D-058).
       # The official x86_64 simulator toolchain: darwin18 would inject
       # -mmacosx-version-min + the MacOSX sysroot, which clang REJECTS when
       # combined with the simulator min-version ("invalid argument
@@ -682,7 +694,9 @@ ZPC
 # ---------------------------------------------------------------------------
 build_one_slice device-arm64
 build_one_slice sim-arm64
-build_one_slice sim-x86_64
+if [ "$WITH_SIM_X86_64" = "1" ]; then
+  build_one_slice sim-x86_64
+fi
 
 log "assembling iphoneos layout"
 DEVICE_OUT="$OUT_DIR/ios/iphoneos"
@@ -693,40 +707,61 @@ cp -R "$OUT_DIR/ios/slices/ios-device-arm64/lib" "$DEVICE_OUT/"
 mkdir -p "$DEVICE_OUT/share/velmux"
 cp "$OUT_DIR/ios/slices/ios-device-arm64/share/velmux/ffmpeg-capabilities.json" \
    "$DEVICE_OUT/share/velmux/"
-cp "$OUT_DIR/ios/slices/ios-device-arm64/BUILD-IDENTITY" "$DEVICE_OUT/" 2>/dev/null || true
+cp "$OUT_DIR/ios/slices/ios-device-arm64/BUILD-IDENTITY" "$DEVICE_OUT/"
 
-log "assembling iphonesimulator layout (lipo arm64 + x86_64)"
-SIM_OUT="$OUT_DIR/ios/iphonesimulator"
-rm -rf "$SIM_OUT"
-mkdir -p "$SIM_OUT/include" "$SIM_OUT/lib" "$SIM_OUT/share/velmux"
-cp -R "$OUT_DIR/ios/slices/ios-sim-arm64/include/." "$SIM_OUT/include/"
-cp "$OUT_DIR/ios/slices/ios-sim-arm64/share/velmux/ffmpeg-capabilities.json" \
-   "$SIM_OUT/share/velmux/"
 SIM_ARM64="$OUT_DIR/ios/slices/ios-sim-arm64"
-SIM_X86="$OUT_DIR/ios/slices/ios-sim-x86_64"
-for lib in "$SIM_ARM64"/lib/*.a; do
-  name="$(basename "$lib")"
-  if [ -f "$SIM_X86/lib/$name" ]; then
-    lipo -create "$lib" "$SIM_X86/lib/$name" -output "$SIM_OUT/lib/$name"
-  else
-    # Slice-specific library (e.g. SVT-AV1 on arm64 only): ship as-is.
-    cp "$lib" "$SIM_OUT/lib/$name"
-  fi
-done
-# pkg-config files are consumed at build time only; ship the arm64 ones.
-cp -R "$SIM_ARM64/lib/pkgconfig" "$SIM_OUT/lib/" 2>/dev/null || true
-# The assembled simulator layout reuses the arm64 slice identity (the
-# pkg-config files and headers come from that slice).
-cp "$OUT_DIR/ios/slices/ios-sim-arm64/BUILD-IDENTITY" "$SIM_OUT/" 2>/dev/null || true
+SIM_OUT="$OUT_DIR/ios/iphonesimulator"
+SIM_ARCHS="arm64"
+rm -rf "$SIM_OUT"
+if [ "$WITH_SIM_X86_64" = "1" ]; then
+  log "assembling iphonesimulator layout (lipo arm64 + x86_64; opt-in)"
+  SIM_X86="$OUT_DIR/ios/slices/ios-sim-x86_64"
+  SIM_ARCHS="arm64 x86_64"
+  mkdir -p "$SIM_OUT/include" "$SIM_OUT/lib" "$SIM_OUT/share/velmux"
+  cp -R "$SIM_ARM64/include/." "$SIM_OUT/include/"
+  cp "$SIM_ARM64/share/velmux/ffmpeg-capabilities.json" \
+     "$SIM_OUT/share/velmux/"
+  for lib in "$SIM_ARM64"/lib/*.a; do
+    name="$(basename "$lib")"
+    if [ -f "$SIM_X86/lib/$name" ]; then
+      lipo -create "$lib" "$SIM_X86/lib/$name" -output "$SIM_OUT/lib/$name"
+    else
+      # Slice-specific library (e.g. SVT-AV1 on arm64 only): ship as-is.
+      cp "$lib" "$SIM_OUT/lib/$name"
+    fi
+  done
+  # pkg-config files are consumed at build time only; ship the arm64 ones.
+  cp -R "$SIM_ARM64/lib/pkgconfig" "$SIM_OUT/lib/"
+  # The merged layout's identity keeps the sim-arm64 identity as line 1
+  # (the slice the headers, .pc files and manifest come from — the identity
+  # fetch.sh verifies for reuse) and records the merge honestly: the arch
+  # list and the x86_64 slice's own identity are part of the provenance.
+  {
+    cat "$SIM_ARM64/BUILD-IDENTITY"
+    printf 'merged-architectures: %s\n' "$SIM_ARCHS"
+    printf 'x86_64-slice-identity: %s\n' "$(identity_recorded "$SIM_X86")"
+  } > "$SIM_OUT/BUILD-IDENTITY"
+else
+  # Default: the simulator layout IS the single-arch arm64 slice — same
+  # assembly shape as the device layout, with the slice's own identity
+  # describing exactly what is shipped.
+  log "assembling iphonesimulator layout (arm64 slice)"
+  mkdir -p "$SIM_OUT/share/velmux"
+  cp -R "$SIM_ARM64/include" "$SIM_OUT/"
+  cp -R "$SIM_ARM64/lib" "$SIM_OUT/"
+  cp "$SIM_ARM64/share/velmux/ffmpeg-capabilities.json" \
+     "$SIM_OUT/share/velmux/"
+  cp "$SIM_ARM64/BUILD-IDENTITY" "$SIM_OUT/"
+fi
 
 AGGREGATE="$OUT_DIR/ios/manifest.json"
 log "aggregating manifests"
-python3 - "$OUT_DIR/ios" "$FFMPEG_VERSION" "$DEPLOYMENT_TARGET" <<'PY'
+python3 - "$OUT_DIR/ios" "$FFMPEG_VERSION" "$DEPLOYMENT_TARGET" "$SIM_ARCHS" <<'PY'
 import json, sys
 from pathlib import Path
 
 out_dir = Path(sys.argv[1])
-version, target = sys.argv[2], sys.argv[3]
+version, target, sim_archs = sys.argv[2], sys.argv[3], sys.argv[4].split()
 
 def load(rel):
     return json.loads(
@@ -748,7 +783,7 @@ result = {
         "configuration": device["configuration"],
     },
     "iphonesimulator": {
-        "archs": ["arm64", "x86_64"],
+        "archs": sim_archs,
         "manifest": "iphonesimulator/share/velmux/ffmpeg-capabilities.json",
         "decoders": len(sim["decoders"]),
         "encoders": len(sim["encoders"]),
@@ -757,7 +792,7 @@ result = {
     },
 }
 (out_dir / "manifest.json").write_text(json.dumps(result, indent=1) + "\n")
-print("aggregated iphoneos + iphonesimulator (fat arm64/x86_64)")
+print("aggregated iphoneos + iphonesimulator (" + ", ".join(sim_archs) + ")")
 PY
 
 log "ios build complete: $OUT_DIR/ios"

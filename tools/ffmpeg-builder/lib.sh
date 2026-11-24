@@ -396,13 +396,38 @@ write_identity() {
 # FFmpeg's generated .pc files bake the build-time prefix into absolute
 # paths; rewrite prefix= to the directory the artifact actually lives in
 # now. Everything else in the .pc files is ${prefix}-relative.
+#
+# Symlink-safe and portable (macOS BSD tools + GNU): some pins install .pc
+# names as SYMLINKS (libpng 1.6.46's cmake install ships libpng.pc ->
+# libpng16.pc). BSD sed refuses in-place editing of symlinks ("in-place
+# editing only works for regular files"), and GNU sed -i would silently
+# replace the link while leaving the target stale — desynchronizing the
+# two names. Instead: read through the link, rewrite into a temp file and
+# atomically move it over the ENTRY — the result is a self-contained
+# regular .pc with the correct prefix under every name, on every platform.
 fixup_pkgconfig_prefix() {
   local dir="$1" pc
   [ -d "$dir" ] || return 0
   local abs
   abs="$(cd "$dir" && pwd)"
   for pc in "$dir"/lib/pkgconfig/*.pc "$dir"/lib64/pkgconfig/*.pc; do
-    [ -f "$pc" ] || continue
-    sed -i.bak "s|^prefix=.*|prefix=$abs|" "$pc" && rm -f "$pc.bak"
+    [ -e "$pc" ] || continue
+    # Resolve one level of symlink portably (no readlink -f: macOS had it
+    # only from 12.3). Loop guards against pathological chains.
+    local target="$pc" guard
+    guard=0
+    while [ -L "$target" ] && [ "$guard" -lt 8 ]; do
+      local link
+      link="$(readlink "$target")"
+      case "$link" in
+        /*) target="$link" ;;
+        *) target="$(dirname "$target")/$link" ;;
+      esac
+      guard=$((guard + 1))
+    done
+    [ -f "$target" ] || continue
+    sed "s|^prefix=.*|prefix=$abs|" "$target" > "$pc.tmp" \
+      && mv -f "$pc.tmp" "$pc" \
+      || { rm -f "$pc.tmp"; die "fixup_pkgconfig_prefix: failed to rewrite $pc"; }
   done
 }

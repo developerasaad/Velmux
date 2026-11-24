@@ -47,11 +47,30 @@ export VELMUX_FFMPEG_JOBS="${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || sysctl -
 BUILDER="$VELMUX_ROOT/$VELMUX_FFMPEG_BUILDER_DIR"
 
 # artifact_ok <dir> <expected-identity> — complete AND identity-matched.
+# Reports the EXACT unmet condition (which file is missing, or the expected
+# vs recorded identity) so a failed gate is diagnosable from the log alone
+# instead of a bare "missing or stale".
 artifact_ok() {
   local dir="$1" identity="$2"
-  [ -f "$dir/lib/pkgconfig/libavcodec.pc" ] || return 1
-  [ -f "$dir/share/velmux/ffmpeg-capabilities.json" ] || return 1
-  identity_matches "$dir" "$identity"
+  if [ ! -f "$dir/lib/pkgconfig/libavcodec.pc" ]; then
+    vwarn "artifact check: missing $dir/lib/pkgconfig/libavcodec.pc"
+    return 1
+  fi
+  if [ ! -f "$dir/share/velmux/ffmpeg-capabilities.json" ]; then
+    vwarn "artifact check: missing capability manifest ($dir/share/velmux/ffmpeg-capabilities.json)"
+    return 1
+  fi
+  if [ ! -f "$dir/BUILD-IDENTITY" ]; then
+    vwarn "artifact check: missing BUILD-IDENTITY ($dir/BUILD-IDENTITY)"
+    return 1
+  fi
+  if [ "$(identity_recorded "$dir")" != "$identity" ]; then
+    vwarn "artifact check: identity mismatch for $dir"
+    vwarn "  expected identity: $identity"
+    vwarn "  recorded identity: $(identity_recorded "$dir")"
+    return 1
+  fi
+  return 0
 }
 
 # Restored artifacts (CI artifact download, moved caches) may live at a
