@@ -14,7 +14,20 @@
                 761781BA2CA45674006655F1 /* VelmuxEngineHost.mm in Sources */ = {isa = PBXBuildFile; fileRef = 761781B92CA45674006655F0 /* VelmuxEngineHost.mm */; };
                 761780EF2CA45674006654EF /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EE2CA45674006654EF /* SceneDelegate.swift */; };
                 81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
+                7E5700010000000000000005 /* VelmuxTestMedia.mm in Sources */ = {isa = PBXBuildFile; fileRef = 7E5700010000000000000003 /* VelmuxTestMedia.mm */; };
+                7E5700010000000000000006 /* VelmuxEngineTests.mm in Sources */ = {isa = PBXBuildFile; fileRef = 7E5700010000000000000004 /* VelmuxEngineTests.mm */; };
+                7E5700010000000000000007 /* libPods-Velmux.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-Velmux.a */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+                7E570001000000000000000F /* PBXContainerItemProxy */ = {
+                        isa = PBXContainerItemProxy;
+                        containerPortal = 83CBB9F71A601CBA00E9B192 /* Project object */;
+                        proxyType = 1;
+                        remoteGlobalIDString = 13B07F861A680F5B00A75B9A;
+                        remoteInfo = Velmux;
+                };
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
                 13B07F961A680F5B00A75B9A /* Velmux.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Velmux.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -32,6 +45,11 @@
                 761780EE2CA45674006654EF /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SceneDelegate.swift; path = Velmux/SceneDelegate.swift; sourceTree = "<group>"; };
                 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = Velmux/LaunchScreen.storyboard; sourceTree = "<group>"; };
                 ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
+                7E5700010000000000000001 /* VelmuxEngineTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VelmuxEngineTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+                7E5700010000000000000002 /* VelmuxTestMedia.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = VelmuxTestMedia.h; sourceTree = "<group>"; };
+                7E5700010000000000000003 /* VelmuxTestMedia.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = VelmuxTestMedia.mm; sourceTree = "<group>"; };
+                7E5700010000000000000004 /* VelmuxEngineTests.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = VelmuxEngineTests.mm; sourceTree = "<group>"; };
+                7E5700010000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -40,6 +58,14 @@
                         buildActionMask = 2147483647;
                         files = (
                                 0C80B921A6F3F58F76C31292 /* libPods-Velmux.a in Frameworks */,
+                        );
+                        runOnlyForDeploymentPostprocessing = 0;
+                };
+                7E570001000000000000000A /* Frameworks */ = {
+                        isa = PBXFrameworksBuildPhase;
+                        buildActionMask = 2147483647;
+                        files = (
+                                7E5700010000000000000007 /* libPods-Velmux.a in Frameworks */,
                         );
                         runOnlyForDeploymentPostprocessing = 0;
                 };
@@ -83,6 +109,7 @@
                         isa = PBXGroup;
                         children = (
                                 13B07FAE1A68108700A75B9A /* Velmux */,
+                                7E570001000000000000000B /* VelmuxEngineTests */,
                                 832341AE1AAA6A7D00B99B32 /* Libraries */,
                                 83CBBA001A601CBA00E9B192 /* Products */,
                                 2D16E6871FA4F8E400B85C8A /* Frameworks */,
@@ -97,6 +124,7 @@
                         isa = PBXGroup;
                         children = (
                                 13B07F961A680F5B00A75B9A /* Velmux.app */,
+                                7E5700010000000000000001 /* VelmuxEngineTests.xctest */,
                         );
                         name = Products;
                         sourceTree = "<group>";
@@ -108,6 +136,17 @@
                                 5709B34CF0A7D63546082F79 /* Pods-Velmux.release.xcconfig */,
                         );
                         path = Pods;
+                        sourceTree = "<group>";
+                };
+                7E570001000000000000000B /* VelmuxEngineTests */ = {
+                        isa = PBXGroup;
+                        children = (
+                                7E5700010000000000000002 /* VelmuxTestMedia.h */,
+                                7E5700010000000000000003 /* VelmuxTestMedia.mm */,
+                                7E5700010000000000000004 /* VelmuxEngineTests.mm */,
+                                7E5700010000000000000011 /* Info.plist */,
+                        );
+                        path = VelmuxEngineTests;
                         sourceTree = "<group>";
                 };
 /* End PBXGroup section */
@@ -134,6 +173,23 @@
                         productReference = 13B07F961A680F5B00A75B9A /* Velmux.app */;
                         productType = "com.apple.product-type.application";
                 };
+                7E5700010000000000000008 /* VelmuxEngineTests */ = {
+                        isa = PBXNativeTarget;
+                        buildConfigurationList = 7E570001000000000000000C /* Build configuration list for PBXNativeTarget "VelmuxEngineTests" */;
+                        buildPhases = (
+                                7E5700010000000000000009 /* Sources */,
+                                7E570001000000000000000A /* Frameworks */,
+                        );
+                        buildRules = (
+                        );
+                        dependencies = (
+                                7E5700010000000000000010 /* PBXTargetDependency */,
+                        );
+                        name = VelmuxEngineTests;
+                        productName = VelmuxEngineTests;
+                        productReference = 7E5700010000000000000001 /* VelmuxEngineTests.xctest */;
+                        productType = "com.apple.product-type.bundle.unit-test";
+                };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -144,6 +200,9 @@
                                 TargetAttributes = {
                                         13B07F861A680F5B00A75B9A = {
                                                 LastSwiftMigration = 1120;
+                                        };
+                                        7E5700010000000000000008 = {
+                                                TestTargetID = 13B07F861A680F5B00A75B9A;
                                         };
                                 };
                         };
@@ -161,6 +220,7 @@
                         projectRoot = "";
                         targets = (
                                 13B07F861A680F5B00A75B9A /* Velmux */,
+                                7E5700010000000000000008 /* VelmuxEngineTests */,
                         );
                 };
 /* End PBXProject section */
@@ -264,7 +324,24 @@
                         );
                         runOnlyForDeploymentPostprocessing = 0;
                 };
+                7E5700010000000000000009 /* Sources */ = {
+                        isa = PBXSourcesBuildPhase;
+                        buildActionMask = 2147483647;
+                        files = (
+                                7E5700010000000000000005 /* VelmuxTestMedia.mm in Sources */,
+                                7E5700010000000000000006 /* VelmuxEngineTests.mm in Sources */,
+                        );
+                        runOnlyForDeploymentPostprocessing = 0;
+                };
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+                7E5700010000000000000010 /* PBXTargetDependency */ = {
+                        isa = PBXTargetDependency;
+                        target = 13B07F861A680F5B00A75B9A /* Velmux */;
+                        targetProxy = 7E570001000000000000000F /* PBXContainerItemProxy */;
+                };
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
                 13B07F941A680F5B00A75B9A /* Debug */ = {
@@ -474,6 +551,76 @@
                         };
                         name = Release;
                 };
+                7E570001000000000000000D /* Debug */ = {
+                        isa = XCBuildConfiguration;
+                        baseConfigurationReference = 3B4392A12AC88292D35C810B /* Pods-Velmux.debug.xcconfig */;
+                        buildSettings = {
+                                CLANG_CXX_LANGUAGE_STANDARD = "c++20";
+                                CLANG_CXX_LIBRARY = "libc++";
+                                CURRENT_PROJECT_VERSION = 1;
+                                ENABLE_TESTING_SEARCH_PATHS = YES;
+                                HEADER_SEARCH_PATHS = (
+                                        "$(inherited)",
+                                        "$(SRCROOT)/../../../core/include",
+                                        "$(SRCROOT)/../../../bridge/cpp",
+                                        "$(SRCROOT)/../../../backends/contracts/include",
+                                        "$(SRCROOT)/../../../backends/apple/objcpp",
+                                        "$(SRCROOT)/../../../backends/ffmpeg/include",
+                                        "$(SRCROOT)/../../../third_party/sqlite",
+                                        "$(PODS_ROOT)/VelmuxTestConfig",
+                                );
+                                INFOPLIST_FILE = VelmuxEngineTests/Info.plist;
+                                IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+                                LD_RUNPATH_SEARCH_PATHS = (
+                                        "$(inherited)",
+                                        "@executable_path/Frameworks",
+                                        "@loader_path/Frameworks",
+                                );
+                                MARKETING_VERSION = 1.0;
+                                PRODUCT_BUNDLE_IDENTIFIER = "com.velmux.mobile.VelmuxEngineTests";
+                                PRODUCT_NAME = "$(TARGET_NAME)";
+                                SKIP_INSTALL = YES;
+                                SWIFT_EMIT_LOC_STRINGS = NO;
+                                TARGETED_DEVICE_FAMILY = "1,2";
+                                WRAPPER_EXTENSION = xctest;
+                        };
+                        name = Debug;
+                };
+                7E570001000000000000000E /* Release */ = {
+                        isa = XCBuildConfiguration;
+                        baseConfigurationReference = 5709B34CF0A7D63546082F79 /* Pods-Velmux.release.xcconfig */;
+                        buildSettings = {
+                                CLANG_CXX_LANGUAGE_STANDARD = "c++20";
+                                CLANG_CXX_LIBRARY = "libc++";
+                                CURRENT_PROJECT_VERSION = 1;
+                                ENABLE_TESTING_SEARCH_PATHS = YES;
+                                HEADER_SEARCH_PATHS = (
+                                        "$(inherited)",
+                                        "$(SRCROOT)/../../../core/include",
+                                        "$(SRCROOT)/../../../bridge/cpp",
+                                        "$(SRCROOT)/../../../backends/contracts/include",
+                                        "$(SRCROOT)/../../../backends/apple/objcpp",
+                                        "$(SRCROOT)/../../../backends/ffmpeg/include",
+                                        "$(SRCROOT)/../../../third_party/sqlite",
+                                        "$(PODS_ROOT)/VelmuxTestConfig",
+                                );
+                                INFOPLIST_FILE = VelmuxEngineTests/Info.plist;
+                                IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+                                LD_RUNPATH_SEARCH_PATHS = (
+                                        "$(inherited)",
+                                        "@executable_path/Frameworks",
+                                        "@loader_path/Frameworks",
+                                );
+                                MARKETING_VERSION = 1.0;
+                                PRODUCT_BUNDLE_IDENTIFIER = "com.velmux.mobile.VelmuxEngineTests";
+                                PRODUCT_NAME = "$(TARGET_NAME)";
+                                SKIP_INSTALL = YES;
+                                SWIFT_EMIT_LOC_STRINGS = NO;
+                                TARGETED_DEVICE_FAMILY = "1,2";
+                                WRAPPER_EXTENSION = xctest;
+                        };
+                        name = Release;
+                };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -491,6 +638,15 @@
                         buildConfigurations = (
                                 83CBBA201A601CBA00E9B192 /* Debug */,
                                 83CBBA211A601CBA00E9B192 /* Release */,
+                        );
+                        defaultConfigurationIsVisible = 0;
+                        defaultConfigurationName = Release;
+                };
+                7E570001000000000000000C /* Build configuration list for PBXNativeTarget "VelmuxEngineTests" */ = {
+                        isa = XCConfigurationList;
+                        buildConfigurations = (
+                                7E570001000000000000000D /* Debug */,
+                                7E570001000000000000000E /* Release */,
                         );
                         defaultConfigurationIsVisible = 0;
                         defaultConfigurationName = Release;

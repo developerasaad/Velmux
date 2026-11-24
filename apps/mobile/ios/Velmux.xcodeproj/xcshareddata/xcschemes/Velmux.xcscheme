@@ -32,9 +32,9 @@
             skipped = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "00E356ED1AD99517003FC87E"
-               BuildableName = "VelmuxTests.xctest"
-               BlueprintName = "VelmuxTests"
+               BlueprintIdentifier = "7E5700010000000000000008"
+               BuildableName = "VelmuxEngineTests.xctest"
+               BlueprintName = "VelmuxEngineTests"
                ReferencedContainer = "container:Velmux.xcodeproj">
             </BuildableReference>
          </TestableReference>

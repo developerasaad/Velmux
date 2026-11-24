@@ -1,5 +1,8 @@
-# CI for the iOS application: CocoaPods install plus a simulator build with
-# code signing disabled (no certificates needed on CI).
+# CI for the iOS application: CocoaPods install, a simulator build with
+# code signing disabled (no certificates needed on CI), the VelmuxEngine
+# simulator XCTest suite (real engine execution: native, FFmpeg and hybrid
+# paths; FFmpeg-dependent tests skip honestly on builds without the pinned
+# artifacts), and a Release build to keep it green on every push.
 name: iOS build
 
 on:
@@ -34,7 +37,10 @@ jobs:
   build:
     name: iOS simulator build
     runs-on: macos-15
-    timeout-minutes: 60
+    # The Debug + Release builds and the engine test suite (fixtures are
+    # generated and transcoded on-simulator) together need more than the
+    # old 60-minute budget on busy runners.
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -125,6 +131,23 @@ jobs:
         working-directory: apps/mobile/ios
         run: |
           xcodebuild -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator build CODE_SIGNING_ALLOWED=NO
+
+      # Engine test suite (VelmuxEngineTests): real engine execution on the
+      # simulator — native whole-pipeline + FFmpeg transcodes through the
+      # app's exact engine surface, the core HybridExecutor composing the
+      # Apple/FFmpeg stage workers, forced F->N and N->F hybrid routes, and
+      # an honest mid-run-cancel lifecycle check. Fixtures are generated
+      # ON-SIMULATOR (AVAssetWriter H.264+AAC) and outputs are validated by
+      # an independent AVAsset/AVAssetReader probe. FFmpeg-dependent tests
+      # skip honestly when the app was built without the pinned FFmpeg
+      # artifacts (fork pull requests); HEVC-encode tests skip on runtimes
+      # without a VideoToolbox HEVC encoder. The device list is echoed for
+      # diagnosability when a destination is missing.
+      - name: Run engine tests on the iOS simulator
+        working-directory: apps/mobile/ios
+        run: |
+          xcrun simctl list devices available
+          xcodebuild test -workspace Velmux.xcworkspace -scheme Velmux -configuration Debug -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' CODE_SIGNING_ALLOWED=NO
 
       # Release configuration must stay green on every push too: catches
       # optimizer/dead-code issues the Debug build never sees. The full
