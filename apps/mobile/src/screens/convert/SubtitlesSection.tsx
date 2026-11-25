@@ -35,7 +35,10 @@ export function SubtitlesSection() {
       const [picked] = await pick({
         type: [types.allFiles],
         mode: 'open',
-        requestLongTermAccess: true,
+        // No persistable grant: the file is imported into durable app
+        // storage immediately (importPickedFile); the original is never
+        // reopened.
+        requestLongTermAccess: false,
         allowMultiSelection: false,
       });
       if (picked == null) {

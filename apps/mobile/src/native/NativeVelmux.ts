@@ -175,6 +175,14 @@ export interface Spec extends TurboModule {
   isJobActive(jobId: string): Promise<boolean>;
   listJobs(): Promise<JobSnapshot[]>;
   describeBackends(): Promise<string[]>;
+  // Durable import of a picked file: copies the source (content:// URI on
+  // Android, security-scoped file:// URL on iOS — scope held by the
+  // picker during the call) into the app's durable storage WITHOUT
+  // touching the original, and resolves the imported file's absolute
+  // path. The engine's backends only read local files; this is the
+  // platform half of that contract. Never destructive: originals are
+  // preserved on both platforms.
+  importFile(uri: string, fileName: string): Promise<string>;
   // Android-only: hand an output file to the system share sheet through a
   // FileProvider content URI (RN core's Share cannot share files on
   // Android). Resolves false on iOS, where the core Share API already

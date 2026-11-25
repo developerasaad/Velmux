@@ -575,21 +575,26 @@ class NativeConversionTest {
     val fixture = generateMp4(2)
     val handle = engineHandle()
     val engineDir = File(context.filesDir, "velmux-test-engine")
-    val imported = File(File(context.filesDir, "imports"), "saf-import-${System.nanoTime()}.mp4")
-    imported.parentFile!!.mkdirs()
+    // The PROVIDER-COVERED tree (filesDir/velmux/** — the production
+    // engine's data directory, the only files-path the provider exposes).
+    // The test engine uses a different directory (velmux-test-engine) on
+    // purpose: job outputs there must NOT be reachable through the
+    // provider, so the "picked document" served behind a content URI has
+    // to live under the real covered tree.
+    val served = File(File(File(context.filesDir, "velmux"), "outputs"),
+        "saf-source-${System.nanoTime()}.mp4")
+    var importedDir: File? = null
     try {
-      // Serve the fixture through a REAL content URI: the provider covers
-      // filesDir/velmux/**, so the fixture is moved into that tree first.
-      val served = File(File(engineDir, "outputs"), "saf-source-${System.nanoTime()}.mp4")
       served.parentFile!!.mkdirs()
       File(fixture.path).copyTo(served, overwrite = true)
       val authority = "${context.packageName}.fileprovider"
       val uri = androidx.core.content.FileProvider.getUriForFile(context, authority, served)
 
-      // The keepLocalCopy primitive: content URI -> durable local file.
-      context.contentResolver.openInputStream(uri)!!.use { input ->
-        imported.outputStream().use { output -> input.copyTo(output) }
-      }
+      // The PRODUCTION import path (FileImport — what the module's
+      // importFile runs at pick time): content URI -> durable local file.
+      val importedPath = FileImport.importFileInto(context, uri.toString(), "imported.mp4")
+      val imported = File(importedPath)
+      importedDir = imported.parentFile
       assertTrue("imported copy is empty", imported.length() > 1024)
       // The engine must be able to open the imported copy directly.
       VelmuxJni.nativeInspect(handle, imported.absolutePath, "imported.mp4").let { raw ->
@@ -632,7 +637,8 @@ class NativeConversionTest {
               leftovers.joinToString { it.name },
           leftovers.isEmpty())
     } finally {
-      imported.delete()
+      served.delete()
+      importedDir?.deleteRecursively()
       VelmuxJni.nativeDestroyEngine(handle)
     }
   }

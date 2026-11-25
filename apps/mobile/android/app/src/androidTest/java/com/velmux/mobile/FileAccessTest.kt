@@ -70,17 +70,24 @@ class FileAccessTest {
 
       // Scope: a file OUTSIDE the velmux tree must not be servable — the
       // provider is the app's only storage surface and must stay minimal.
+      // FileProvider enforces this AT URI-CREATION TIME:
+      // getUriForFile throws IllegalArgumentException ("Failed to find
+      // configured root") for any file outside the configured roots, so a
+      // URI for foreign storage can never even be minted (observed on the
+      // API 34 emulator, run 45553834138).
       val outside = File(context.filesDir, "outside-${System.nanoTime()}.txt")
       outside.writeBytes(byteArrayOf(1, 2, 3))
       try {
-        val outsideUri = FileProvider.getUriForFile(context, authority, outside)
-        val readable = try {
-          context.contentResolver.openInputStream(outsideUri)?.close()
-          true
-        } catch (expected: SecurityException) {
+        val refusedAtUriCreation = try {
+          FileProvider.getUriForFile(context, authority, outside)
+          // A URI was minted for a foreign file: the scope is too broad.
           false
+        } catch (expected: IllegalArgumentException) {
+          true
         }
-        assertTrue("provider must not serve files outside the velmux tree", !readable)
+        assertTrue(
+            "provider must refuse to mint URIs for files outside the velmux tree",
+            refusedAtUriCreation)
       } finally {
         outside.delete()
       }
@@ -90,15 +97,14 @@ class FileAccessTest {
   }
 
   /**
-   * The durable-import contract: a content URI (what the document picker
-   * returns on Android and what the engine's backends cannot open) must be
-   * copyable into app-durable storage through the ContentResolver with the
-   * exact bytes — the primitive keepLocalCopy performs at pick time. This
-   * exercises the same resolver path with a REAL content URI from the app's
-   * own provider.
+   * The PRODUCTION import path (FileImport.importFileInto — what
+   * VelmuxEngineModule.importFile runs for every pick): a content URI
+   * (what the document picker returns on Android and what the engine's
+   * backends cannot open) must land in DURABLE app storage with the exact
+   * bytes, and the ORIGINAL must be preserved — a copy, never a move.
    */
   @Test
-  fun contentUriImportsByteIdenticallyIntoDurableStorage() {
+  fun productionImportCopiesByteIdenticallyAndPreservesTheOriginal() {
     val sourceDir = File(File(context.filesDir, "velmux"), "outputs")
     sourceDir.mkdirs()
     val original = File(sourceDir, "import-source-${System.nanoTime()}.mp4")
@@ -106,26 +112,29 @@ class FileAccessTest {
     original.writeBytes(payload)
     val authority = "${context.packageName}.fileprovider"
     val uri = FileProvider.getUriForFile(context, authority, original)
+    var importedDir: File? = null
     try {
-      // The durable import destination (same policy as keepLocalCopy's
-      // documentDirectory destination: filesDir, never the OS-purgeable
-      // cache).
-      val imports = File(context.filesDir, "imports")
-      imports.mkdirs()
-      val imported = File(imports, "imported-${System.nanoTime()}.mp4")
+      val importedPath = FileImport.importFileInto(context, uri.toString(), original.name)
+      val imported = File(importedPath)
+      importedDir = imported.parentFile
 
-      context.contentResolver.openInputStream(uri)!!.use { input ->
-        imported.outputStream().use { output -> input.copyTo(output) }
-      }
-
+      // Durable destination: filesDir/imports/**, never the cache.
+      val importsRoot = File(context.filesDir, "imports").absolutePath
+      assertTrue("import must land in the durable imports tree (got $importedPath)",
+          importedPath.startsWith(importsRoot))
       assertTrue("imported copy must exist", imported.isFile)
       assertEquals("imported copy must be the same size", payload.size.toLong(), imported.length())
       val digest = MessageDigest.getInstance("SHA-256")
       val originalHash = digest.digest(original.readBytes())
       val importedHash = digest.digest(imported.readBytes())
       assertArrayEquals("imported copy must be byte-identical (hash)", originalHash, importedHash)
-      imported.delete()
+
+      // ORIGINALS ARE PRESERVED (copy, not move): the source must be
+      // untouched after the import.
+      assertTrue("the original must still exist after the import", original.isFile)
+      assertEquals("the original must be unmodified", payload.size.toLong(), original.length())
     } finally {
+      importedDir?.deleteRecursively()
       original.delete()
     }
   }

@@ -164,9 +164,12 @@ export function HomeScreen() {
         const picked = await pick({
           type: [types.video, types.audio],
           mode: 'open',
-          // Persistable source access where the platform offers it
-          // (Android URI permission; iOS scoped access during the copy).
-          requestLongTermAccess: true,
+          // No persistable URI grants: every pick is imported into
+          // durable app storage IMMEDIATELY (importPickedFiles), so the
+          // original never needs to be reopened — recovery and retry read
+          // the imported copy. Grants we never use would just exhaust the
+          // platform's per-app limit.
+          requestLongTermAccess: false,
           allowMultiSelection: true,
         });
         if (picked.length === 0) {
@@ -176,7 +179,7 @@ export function HomeScreen() {
         // (content:// URIs and scoped in-place URLs are not readable by
         // the backends), so every pick is copied into app-durable storage
         // once, here. Failures are reported honestly per file.
-        const {sources, failures} = await importPickedFiles(picked);
+        const {sources, sizes, failures} = await importPickedFiles(picked);
         if (failures.length > 0) {
           const lines = failures
             .map(failure => `${failure.name}: ${failure.reason}`)
@@ -202,10 +205,10 @@ export function HomeScreen() {
         }
         setSelection({
           intent,
-          files: sources.map(source => ({
+          files: sources.map((source, index) => ({
             uri: source.uri,
             name: source.displayName,
-            sizeBytes: null,
+            sizeBytes: sizes[index] ?? null,
           })),
         });
       } catch (error) {

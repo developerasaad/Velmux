@@ -139,6 +139,17 @@ export function describeBackends(): Promise<string[]> {
 }
 
 /**
+ * Durable, non-destructive import of a picked file: copies the source
+ * (content:// URI on Android, security-scoped file:// URL on iOS) into
+ * app-durable storage and resolves the imported file's absolute path.
+ * Originals are preserved on both platforms. Throws with the platform's
+ * reason on failure (revoked access, unreadable source, full disk).
+ */
+export function importFile(uri: string, fileName: string): Promise<string> {
+  return requireModule().importFile(uri, fileName);
+}
+
+/**
  * Android: shares an output file through the system sheet (FileProvider
  * content URI — core Share cannot share files on Android). Resolves false
  * on iOS or when no activity could handle the share; never throws.

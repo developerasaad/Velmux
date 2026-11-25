@@ -1,9 +1,8 @@
 import {Platform, Share} from 'react-native';
 import {
-  keepLocalCopy,
+  releaseSecureAccess,
   saveDocuments,
   type DocumentPickerResponse,
-  type FileToCopy,
 } from '@react-native-documents/picker';
 
 import type {MediaSource} from './NativeVelmux';
@@ -24,11 +23,15 @@ import * as engineClient from './engineClient';
  *    AVFoundation cannot open them) and security-scoped in-place `file://`
  *    URLs (iOS; valid only while the app holds scope, which does not
  *    survive restarts). `importPickedFiles` copies each picked file into
- *    the app's DURABLE storage once, at pick time, and returns local
- *    sources. Copies live next to the engine's own data (documentDirectory
- *    / filesDir, NOT the OS-purgeable cache), so inspection, samples,
+ *    the app's DURABLE storage once, at pick time, through the engine
+ *    module's native import (a COPY on both platforms — the picker
+ *    library's own keepLocalCopy MOVES the file on iOS, which would
+ *    delete the user's original), and returns local sources. Copies live
+ *    in the app's durable tree (Documents/imports on iOS, filesDir/imports
+ *    on Android — never the OS-purgeable cache), so inspection, samples,
  *    jobs, recovery, retry and "re-use settings" all read the same durable
- *    file across process deaths. Originals are never modified.
+ *    file across process deaths. Originals are never modified. On iOS the
+ *    picker's security scope is released right after the import.
  *
  *  - EXPORT: engine outputs live in app-private storage by design. Users
  *    reach them through the system's own destinations — `saveOutput`
@@ -54,6 +57,8 @@ export interface ImportFailure {
 /** Result of importing a whole pick: sources plus honest per-file failures. */
 export interface ImportResult {
   sources: MediaSource[];
+  /** Aligned with [sources]: the picked file's size in bytes, when known. */
+  sizes: (number | null)[];
   failures: ImportFailure[];
 }
 
@@ -62,44 +67,58 @@ export interface ImportResult {
  * local sources. Never throws for per-file copy errors — they are reported
  * through `failures` so callers can proceed with the successes and surface
  * the rest (the same honest partial-failure posture as batch start).
+ *
+ * On iOS the picker's security scope (held by the picker library since the
+ * pick) is released right after the imports complete — the copies are
+ * done, and held scopes are a finite per-process resource.
  */
 export async function importPickedFiles(
   picked: readonly DocumentPickerResponse[],
 ): Promise<ImportResult> {
   if (picked.length === 0) {
-    return {sources: [], failures: []};
+    return {sources: [], sizes: [], failures: []};
   }
-  const filesToCopy = picked.map(file => ({
-    uri: file.uri,
-    fileName: file.name ?? `picked-${file.size ?? 0}`,
-  }));
-  const responses = await keepLocalCopy({
-    // Non-empty by the early return above; the library's type demands a
-    // first element, and .map() alone cannot express that.
-    files: filesToCopy as [FileToCopy, ...FileToCopy[]],
-    // Durable by design: the app's document directory (iOS) / filesDir
-    // (Android). The cache directory is OS-purgeable and would break
-    // recovery, retry and history re-runs.
-    destination: 'documentDirectory',
-  });
-  const sources: MediaSource[] = [];
-  const failures: ImportFailure[] = [];
-  picked.forEach((file, index) => {
-    const name = file.name ?? 'Untitled media';
-    const copy = responses[index];
-    const localUri =
-      copy != null && copy.status === 'success' ? copy.localUri : null;
-    if (localUri == null || localUri.length === 0) {
-      const reason =
-        copy != null && copy.status === 'error'
-          ? copy.copyError
-          : 'the copy did not complete';
-      failures.push({name, reason});
-      return;
+  const settled = await Promise.all(
+    picked.map(async file => {
+      const name = file.name ?? 'Untitled media';
+      try {
+        const localPath = await engineClient.importFile(
+          file.uri,
+          file.name ?? `picked-${file.size ?? 0}`,
+        );
+        return {ok: true as const, name, localPath, size: file.size};
+      } catch (error) {
+        return {
+          ok: false as const,
+          name,
+          reason:
+            error instanceof Error ? error.message : 'the copy did not complete',
+        };
+      }
+    }),
+  );
+  if (Platform.OS === 'ios') {
+    // The copies are complete; release the picker's held security scopes.
+    // Best-effort: a release failure never fails the import.
+    try {
+      await releaseSecureAccess(picked.map(file => file.uri));
+    } catch {
+      // Ignore.
     }
-    sources.push({uri: localUri, displayName: name});
-  });
-  return {sources, failures};
+  }
+  const sources: MediaSource[] = [];
+  const sizes: (number | null)[] = [];
+  const failures: ImportFailure[] = [];
+  for (const outcome of settled) {
+    if (outcome.ok && outcome.localPath.length > 0) {
+      sources.push({uri: outcome.localPath, displayName: outcome.name});
+      sizes.push(outcome.size);
+    } else {
+      const reason = outcome.ok ? 'the copy did not complete' : outcome.reason;
+      failures.push({name: outcome.name, reason});
+    }
+  }
+  return {sources, sizes, failures};
 }
 
 /** Single-file convenience wrapper around [importPickedFiles]. */

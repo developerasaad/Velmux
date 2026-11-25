@@ -208,6 +208,19 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
   }
 
   /**
+   * Durable, non-destructive import of a picked file (spec: file access).
+   * The logic lives in [FileImport] (shared with the instrumented tests);
+   * this wrapper only maps outcomes to the promise contract.
+   */
+  override fun importFile(uri: String, fileName: String, promise: Promise) {
+    try {
+      promise.resolve(FileImport.importFileInto(appContext, uri, fileName))
+    } catch (error: Exception) {
+      promise.reject("E_IMPORT", error.message ?: "the import failed", error)
+    }
+  }
+
+  /**
    * Shares one engine output through the system sheet. The engine's
    * outputs live in app-private storage (filesDir/velmux/outputs), which
    * other apps cannot read; the FileProvider exposes exactly that tree as

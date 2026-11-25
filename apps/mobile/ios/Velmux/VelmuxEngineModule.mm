@@ -505,6 +505,71 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   resolve(@(NO));
 }
 
+// Durable, non-destructive import of a picked file (spec: file access).
+//
+// The document picker (open mode) returns security-scoped in-place
+// file:// URLs; the picker library holds the scope from the pick until
+// releaseSecureAccess, which covers this copy. The file is COPIED —
+// never moved — into the app's durable Documents/imports tree, so the
+// original stays where the user put it and the engine gets a local file
+// that survives process death (the engine's backends read local paths
+// only). The document-picker library's own keepLocalCopy MOVES the
+// source on iOS (FileManager.moveItem), which would silently delete the
+// user's original — the reason this method exists.
+- (void)importFile:(NSString *)uri
+          fileName:(NSString *)fileName
+            resolve:(RCTPromiseResolveBlock)resolve
+             reject:(RCTPromiseRejectBlock)reject {
+  dispatch_async(_sampleQueue, ^{
+    // Sanitize the destination name: last path component only.
+    NSString *safeName = fileName.lastPathComponent;
+    if (safeName.length == 0) {
+      safeName = [NSString stringWithFormat:@"imported-%f", [NSDate timeIntervalSinceReferenceDate]];
+    }
+    NSURL *sourceURL = [NSURL URLWithString:uri];
+    if (sourceURL == nil || ![sourceURL isFileURL]) {
+      reject(@"E_IMPORT", @"the source is not a file URL", nil);
+      return;
+    }
+    NSURL *documents = [NSFileManager.defaultManager
+        URLForDirectory:NSDocumentDirectory
+               inDomain:NSUserDomainMask
+      appropriateForURL:nil
+                 create:YES
+                  error:nil];
+    if (documents == nil) {
+      reject(@"E_IMPORT", @"cannot locate the app's document directory", nil);
+      return;
+    }
+    NSURL *destDir = [documents URLByAppendingPathComponent:
+                             [@"imports" stringByAppendingPathComponent:
+                                  [[NSUUID UUID] UUIDString]]
+                                    isDirectory:YES];
+    NSError *error = nil;
+    if (![NSFileManager.defaultManager createDirectoryAtURL:destDir
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:&error]) {
+      reject(@"E_IMPORT",
+             [NSString stringWithFormat:@"cannot create the import directory: %@",
+                                       error.localizedDescription],
+             error);
+      return;
+    }
+    NSURL *destURL = [destDir URLByAppendingPathComponent:safeName];
+    if (![NSFileManager.defaultManager copyItemAtURL:sourceURL
+                                                toURL:destURL
+                                                error:&error]) {
+      reject(@"E_IMPORT",
+             [NSString stringWithFormat:@"cannot copy the source: %@",
+                                       error.localizedDescription],
+             error);
+      return;
+    }
+    resolve(destURL.path);
+  });
+}
+
 - (void)addListener:(NSString *)eventName
             resolve:(RCTPromiseResolveBlock)resolve
              reject:(RCTPromiseRejectBlock)reject {
