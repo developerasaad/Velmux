@@ -28,11 +28,22 @@ namespace {
 
 // Backpressure wait: bounded spin so a wedged writer fails the test instead
 // of hanging the CI run (the same "never deadlock" posture as the engine's
-// Apple mux stage).
+// Apple mux stage). While waiting on the main thread (XCTest runs test
+// methods there), the main run loop is pumped instead of a plain sleep:
+// AVFoundation's writer session setup can be waiting to deliver through
+// the main queue, and a blocked main thread would deadlock the first
+// append — the first CI executions stalled exactly there (every fixture
+// failed after the ~30 s readiness budget; run 45528452313).
 bool waitForReady(AVAssetWriterInput *input) {
   for (int round = 0; round < 6000 && !input.isReadyForMoreMediaData;
        ++round) {
-    [NSThread sleepForTimeInterval:0.005];
+    if ([NSThread isMainThread]) {
+      [[NSRunLoop mainRunLoop]
+          runMode:NSDefaultRunLoopMode
+          beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
+    } else {
+      [NSThread sleepForTimeInterval:0.005];
+    }
   }
   return input.isReadyForMoreMediaData;
 }

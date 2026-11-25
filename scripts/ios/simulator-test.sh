@@ -169,10 +169,17 @@ verify_launch "cold-launch"
 # ---------------------------------------------------------------------------
 # 5. Engine XCTest suite (real engine execution on the simulator)
 # ---------------------------------------------------------------------------
+# Release configuration for the test run too: the HOST application must be
+# the embedded-bundle Release product. A Debug host has no JS bundle and no
+# packager in CI, and React Native ABORTS the process when the script URL
+# is missing — the first XCTest executions (run 45528452313) had test
+# processes die mid-run ("Restarting after unexpected exit, crash, or test
+# timeout") because of exactly that. The Release host is also the exact
+# product artifact the cold-launch phase verified.
 vlog "running VelmuxEngineTests"
 run_in "$IOS_DIR" xcodebuild test \
   -workspace Velmux.xcworkspace -scheme Velmux \
-  -configuration Debug \
+  -configuration Release \
   -destination "platform=iOS Simulator,id=$UDID" \
   -derivedDataPath build \
   CODE_SIGNING_ALLOWED=NO \

@@ -468,14 +468,19 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
 
 - (void)testFFtoF_engineTranscode {
   NSString *dir = [VLMXTestMedia freshWorkDirectory:@"fftof"];
+  NSError *fixtureError = nil;
   VLMXGeneratedMedia *fixture = [VLMXTestMedia
       generateH264AacMp4AtPath:[dir stringByAppendingPathComponent:@"fixture.mp4"]
                          width:640
                         height:480
                      frameRate:24.0
                     frameCount:300
-                         error:nil];
-  XCTAssertNotNil(fixture, @"fixture generation failed");
+                         error:&fixtureError];
+  XCTAssertNotNil(fixture, @"fixture generation failed: %@",
+                  fixtureError.localizedDescription);
+  if (fixture == nil) {
+    return;
+  }
 
   VelmuxEngineHandle *engine = vlmxCreateFacadeEngine(@"fftof-engine");
   // XCTAssertNotNil takes id (an ObjC object reference); the engine
@@ -557,14 +562,19 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   }
 
   NSString *dir = [VLMXTestMedia freshWorkDirectory:@"nton"];
+  NSError *fixtureError = nil;
   VLMXGeneratedMedia *fixture = [VLMXTestMedia
       generateH264AacMp4AtPath:[dir stringByAppendingPathComponent:@"fixture.mp4"]
                          width:320
                         height:240
                      frameRate:24.0
                     frameCount:120
-                         error:nil];
-  XCTAssertNotNil(fixture, @"fixture generation failed");
+                         error:&fixtureError];
+  XCTAssertNotNil(fixture, @"fixture generation failed: %@",
+                  fixtureError.localizedDescription);
+  if (fixture == nil) {
+    return;
+  }
 
   NSString *outPath = [dir stringByAppendingPathComponent:@"out-nton.mp4"];
 
@@ -670,14 +680,19 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   }
 
   NSString *dir = [VLMXTestMedia freshWorkDirectory:@"fton"];
+  NSError *fixtureError = nil;
   VLMXGeneratedMedia *fixture = [VLMXTestMedia
       generateH264AacMp4AtPath:[dir stringByAppendingPathComponent:@"fixture.mp4"]
                          width:320
                         height:240
                      frameRate:24.0
                     frameCount:240
-                         error:nil];
-  XCTAssertNotNil(fixture, @"fixture generation failed");
+                         error:&fixtureError];
+  XCTAssertNotNil(fixture, @"fixture generation failed: %@",
+                  fixtureError.localizedDescription);
+  if (fixture == nil) {
+    return;
+  }
 
   // ---- Job 1 (real engine, natural path): fixture -> FFV1 in MKV. -----
   // FFmpeg is the only backend that encodes FFV1; Apple cannot, so the
@@ -774,14 +789,19 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
           @"route (Apple decode -> libx264 encode) cannot exist");
 #else
   NSString *dir = [VLMXTestMedia freshWorkDirectory:@"ntof"];
+  NSError *fixtureError = nil;
   VLMXGeneratedMedia *fixture = [VLMXTestMedia
       generateH264AacMp4AtPath:[dir stringByAppendingPathComponent:@"fixture.mp4"]
                          width:320
                         height:240
                      frameRate:24.0
                     frameCount:120
-                         error:nil];
-  XCTAssertNotNil(fixture, @"fixture generation failed");
+                         error:&fixtureError];
+  XCTAssertNotNil(fixture, @"fixture generation failed: %@",
+                  fixtureError.localizedDescription);
+  if (fixture == nil) {
+    return;
+  }
 
   const VLMXMaskedJob job = vlmxRunMaskedHybridJob(
       fixture.path, VLMXHybridDirection::AppleToFfmpeg,
@@ -828,14 +848,19 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
 - (void)testLifecycle_cancelIsHonest {
   NSString *dir = [VLMXTestMedia freshWorkDirectory:@"cancel"];
   // Long enough that the transcode is still running when the cancel lands.
+  NSError *fixtureError = nil;
   VLMXGeneratedMedia *fixture = [VLMXTestMedia
       generateH264AacMp4AtPath:[dir stringByAppendingPathComponent:@"fixture.mp4"]
                          width:640
                         height:480
                      frameRate:24.0
                     frameCount:300
-                         error:nil];
-  XCTAssertNotNil(fixture, @"fixture generation failed");
+                         error:&fixtureError];
+  XCTAssertNotNil(fixture, @"fixture generation failed: %@",
+                  fixtureError.localizedDescription);
+  if (fixture == nil) {
+    return;
+  }
 
   VelmuxEngineHandle *engine = vlmxCreateFacadeEngine(@"cancel-engine");
   XCTAssertTrue(engine != nullptr, @"engine construction failed");
