@@ -4256,6 +4256,13 @@ bool assembleSegments(const std::vector<std::string> &segments,
         }
       }
       list << "file '" << escaped << "'\n";
+      // inpoint 0: drop codec-priming packets (e.g. the AAC encoder-delay
+      // packet at a negative dts) and rebase each file's timeline to
+      // zero. Pristine sources otherwise collide inside the concat
+      // demuxer: file N+1's priming-shifted first dts lands BEFORE file
+      // N's last packet dts (non-monotonic dts -> the muxer refuses).
+      // Already-zero-based segments (Cut/Split parts) are unaffected.
+      list << "inpoint 0\n";
     }
     if (!list.good()) {
       if (errno == ENOSPC) {
@@ -4317,6 +4324,15 @@ bool assembleSegments(const std::vector<std::string> &segments,
     }
     AVPacket *pkt = av_packet_alloc();
     bool writeFailed = false;
+    // Monotonic dts guard per output stream: the concat demuxer rebases
+    // each file onto the cumulative timeline using container durations,
+    // which include codec priming/padding the actual packets do not span
+    // exactly — the first packet of file N+1 can land one priming-
+    // residue behind the last dts of file N (non-monotonic -> EINVAL).
+    // Nudge such packets one tick forward (the established FfmpegMuxStage
+    // guard pattern); the sub-millisecond jitter is inaudible and every
+    // packet is kept.
+    std::vector<std::int64_t> lastDts(out->nb_streams, AV_NOPTS_VALUE);
     while (!writeFailed && av_read_frame(in, pkt) >= 0) {
       const unsigned inIndex = std::size_t(pkt->stream_index);
       const AVStream *srcStream = in->streams[inIndex];
@@ -4332,6 +4348,17 @@ bool assembleSegments(const std::vector<std::string> &segments,
           av_rescale_q(pkt->duration, srcStream->time_base,
                        dstStream->time_base);
       pkt->pos = -1;
+      const std::int64_t &streamLast = lastDts[std::size_t(dstStream->index)];
+      if (pkt->dts != AV_NOPTS_VALUE && streamLast != AV_NOPTS_VALUE &&
+          pkt->dts <= streamLast) {
+        pkt->dts = streamLast + 1;
+        if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) {
+          pkt->pts = pkt->dts;
+        }
+      }
+      if (pkt->dts != AV_NOPTS_VALUE) {
+        lastDts[std::size_t(dstStream->index)] = pkt->dts;
+      }
       const int frameRc = av_interleaved_write_frame(out, pkt);
       if (frameRc < 0) {
         writeRc = frameRc;
@@ -5933,10 +5960,11 @@ ExecuteResult FfmpegExecutor::executeSplit(const ExecuteParams &params,
     }
   }
   boundaries = valid;
-  if (boundaries.empty()) {
-    // Nothing splittable inside the timeline: one part (the whole file).
-    boundaries.push_back(durationUs > 0 ? durationUs : -1);
-  }
+  // The final part runs to the source end: its END boundary is the
+  // duration itself (open-ended when the duration is unknown). Without
+  // it the part loop below stops at the last interior boundary and
+  // silently drops the timeline tail.
+  boundaries.push_back(durationUs > 0 ? durationUs : -1);
   const std::size_t partCount = boundaries.size();
 
   // Real keyframe timeline for the per-part copy decision.
@@ -7243,6 +7271,7 @@ ExecuteResult FfmpegExecutor::executeMerge(const ExecuteParams &params,
     int asmRc = 0;
     if (!assembleSegments(segmentPaths, params.outputPath,
                           params.pipeline.container, asmRc)) {
+      std::filesystem::remove_all(segDir, ec);
       result.error = outputWriteError(asmRc,
                                       "cannot assemble the merged segments",
                                       params.outputPath);
@@ -8449,6 +8478,32 @@ ExecuteResult FfmpegExecutor::executeExtractFrames(
   }
 
   // Image encoder setup.
+  const int srcW = cleanup.dec->width;
+  const int srcH = cleanup.dec->height;
+  if (srcW <= 0 || srcH <= 0) {
+    return fail(ErrorCode::UnsupportedOperation,
+                "the source video has no dimensions");
+  }
+  // Target dimensions: original by default; custom bounds scale down
+  // preserving the aspect ratio (never stretch, never upscale).
+  int targetW = srcW;
+  int targetH = srcH;
+  if (rules.maxWidth.has_value() || rules.maxHeight.has_value()) {
+    double scale = 1.0;
+    if (rules.maxWidth.has_value() && srcW > *rules.maxWidth) {
+      scale = std::min(scale, double(*rules.maxWidth) / double(srcW));
+    }
+    if (rules.maxHeight.has_value() && srcH > *rules.maxHeight) {
+      scale = std::min(scale, double(*rules.maxHeight) / double(srcH));
+    }
+    targetW = std::max(2, int(double(srcW) * scale) / 2 * 2);
+    targetH = std::max(2, int(double(srcH) * scale) / 2 * 2);
+  }
+  // Rotation swaps the written image's axis for quarter turns.
+  const bool rotatedQuarter = rotation == 90 || rotation == 270;
+  const int imgW = rotatedQuarter ? targetH : targetW;
+  const int imgH = rotatedQuarter ? targetW : targetH;
+
   const char *encoderName = rules.format == ImageOutputRules::Format::Jpeg
                                 ? "mjpeg"
                                 : (rules.format == ImageOutputRules::Format::Png
@@ -8490,36 +8545,14 @@ ExecuteResult FfmpegExecutor::executeExtractFrames(
     cleanup.imgEnc->flags |= AV_CODEC_FLAG_QSCALE;
   }
   cleanup.imgEnc->time_base = AVRational{1, 1000000};
+  // Image encoders validate their dimensions at open time: the target
+  // geometry (rotation-aware) must be set on the context BEFORE the open.
+  cleanup.imgEnc->width = imgW;
+  cleanup.imgEnc->height = imgH;
   if (avcodec_open2(cleanup.imgEnc, imgCodec, nullptr) < 0) {
     return fail(ErrorCode::EncoderUnavailable, "cannot open the image "
                                                "encoder");
   }
-
-  const int srcW = cleanup.dec->width;
-  const int srcH = cleanup.dec->height;
-  if (srcW <= 0 || srcH <= 0) {
-    return fail(ErrorCode::UnsupportedOperation,
-                "the source video has no dimensions");
-  }
-  // Target dimensions: original by default; custom bounds scale down
-  // preserving the aspect ratio (never stretch, never upscale).
-  int targetW = srcW;
-  int targetH = srcH;
-  if (rules.maxWidth.has_value() || rules.maxHeight.has_value()) {
-    double scale = 1.0;
-    if (rules.maxWidth.has_value() && srcW > *rules.maxWidth) {
-      scale = std::min(scale, double(*rules.maxWidth) / double(srcW));
-    }
-    if (rules.maxHeight.has_value() && srcH > *rules.maxHeight) {
-      scale = std::min(scale, double(*rules.maxHeight) / double(srcH));
-    }
-    targetW = std::max(2, int(double(srcW) * scale) / 2 * 2);
-    targetH = std::max(2, int(double(srcH) * scale) / 2 * 2);
-  }
-  // Rotation swaps the written image's axis for quarter turns.
-  const bool rotatedQuarter = rotation == 90 || rotation == 270;
-  const int imgW = rotatedQuarter ? targetH : targetW;
-  const int imgH = rotatedQuarter ? targetW : targetH;
 
   // Persistent conversion buffers.
   const int rgbaLinesize = imgW * 4;

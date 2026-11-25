@@ -373,7 +373,8 @@ Result<SampleResult> JobManager::generateSample(
   // streams, geometry, minimum size. Duration stays unchecked — a trimmed
   // window legitimately differs from the source.
   if (validator_ != nullptr) {
-    ValidationExpectation expect = expectationFor(request, info, pipeline);
+    ValidationExpectation expect =
+        expectationFor(request, {info}, pipeline);
     expect.expectedDurationSec = 0.0; // a window, not the whole timeline
     if (request.payload.index() == 1) {
       // AudioConvert payload: audio-only sample.
@@ -1115,6 +1116,24 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     return ExecuteOutcome::Finished;
   }
 
+  // Multi-output operations (Split / ExtractFrames): the primary artifact
+  // is the executor's first manifest entry (the JobSnapshot contract:
+  // "primary output (first manifest entry)") — the planned path only
+  // served as those artifacts' naming stem. Point outputPath at the real
+  // primary BEFORE validation so the validator reads the finished
+  // artifact, not the never-written planned name.
+  if (!execResult.outputs.empty()) {
+    record->outputPath = execResult.outputs.front().path;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!runStillCurrent(jobId, generation)) {
+        return ExecuteOutcome::Finished; // superseded; the newer run owns
+                                         // finalization
+      }
+      running_[jobId].record.outputPath = record->outputPath;
+    }
+  }
+
   // Execution finished: the artifacts are finalized (segment scratch
   // removed by the executor) before output validation reads them.
   {
@@ -1152,6 +1171,12 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
+    // The executor confirms the actually-taken strategy in its runtime
+    // summary (keyframe-safe copy vs normalized transcode, actual part
+    // count, dropped lanes...); the planned summary was only a prediction.
+    if (!execResult.pipelineSummary.empty()) {
+      running.record.pipeline.summary = execResult.pipelineSummary;
+    }
     if (execResult.outputs.empty()) {
       if (!record->outputPath.empty()) {
         JobOutput primary;
@@ -1233,10 +1258,8 @@ bool JobManager::validateOutput(JobRecord &record, const Pipeline &pipeline,
     finishFailure(running.record);
     return false;
   }
-  const MediaInfo &source =
-      record.sourceInfo.empty() ? MediaInfo{} : record.sourceInfo.front();
   const ValidationExpectation expect =
-      expectationFor(record.request, source, pipeline);
+      expectationFor(record.request, record.sourceInfo, pipeline);
   const ValidationReport report =
       validator_->validate(record.outputPath, expect);
   if (report.ok) {

@@ -51,6 +51,10 @@ struct ValidationExpectation {
   // Subtitle-extraction jobs: the output is a text sidecar (SRT/VTT/ASS),
   // not a media container. Validation checks cue structure instead.
   bool subtitleSidecar = false;
+  // Frame-extraction jobs: the output is the frames manifest (JSON) and
+  // the images it references. Validation checks the manifest structure
+  // and that every referenced image exists with real content.
+  bool framesManifest = false;
   // Metadata Set intentions read back from the output container tags
   // (mandate §33): key + expected value. Checked when the inspector can
   // read tags; skipped honestly otherwise.
@@ -69,11 +73,12 @@ private:
 };
 
 // Derives the per-operation expectation from the accepted request, the
-// inspected source and the planned pipeline. Geometry is
+// inspected sources (all of them: Merge sums durations across sources)
+// and the planned pipeline. Geometry is
 // transform-aware (crop -> rotation -> scale), durations are
 // trim/speed/silence-aware, audio presence follows the track rules.
 ValidationExpectation expectationFor(const JobRequest &request,
-                                     const MediaInfo &source,
+                                     const std::vector<MediaInfo> &sources,
                                      const Pipeline &pipeline);
 
 } // namespace velmux::core

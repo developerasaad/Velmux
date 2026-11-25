@@ -99,14 +99,70 @@ void applyTrimDuration(ValidationExpectation &expect,
   }
 }
 
+// Retained intervals = the complement of the removed ranges over the
+// source timeline (the Cut payload's view; normalized the same way the
+// planner normalizes before the timeTrim gate).
+std::vector<TimeRange> retainedRangesOf(const std::vector<TimeRange> &removed,
+                                       std::int64_t totalUs) {
+  std::vector<TimeRange> sorted = removed;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const TimeRange &a, const TimeRange &b) {
+              return a.startUs < b.startUs;
+            });
+  std::vector<TimeRange> merged;
+  for (const TimeRange &range : sorted) {
+    if (!merged.empty() &&
+        (range.startUs <= merged.back().endUs ||
+         (merged.back().endUs < 0 && range.startUs <= totalUs))) {
+      if (merged.back().endUs < 0 || range.endUs < 0) {
+        merged.back().endUs = -1; // extends to the end
+      } else {
+        merged.back().endUs = std::max(merged.back().endUs, range.endUs);
+      }
+    } else {
+      merged.push_back(range);
+    }
+  }
+  std::vector<TimeRange> retained;
+  std::int64_t cursor = 0;
+  for (const TimeRange &range : merged) {
+    const std::int64_t start = std::max<std::int64_t>(range.startUs, 0);
+    const std::int64_t end = range.endUs < 0 ? totalUs : range.endUs;
+    if (start > cursor) {
+      retained.push_back(TimeRange{cursor, std::min(start, totalUs)});
+    }
+    cursor = std::max(cursor, end);
+    if (cursor >= totalUs) {
+      cursor = totalUs;
+      break;
+    }
+  }
+  if (cursor < totalUs) {
+    retained.push_back(TimeRange{cursor, -1}); // to the end
+  }
+  return retained;
+}
+
 } // namespace
 
 ValidationExpectation expectationFor(const JobRequest &request,
-                                    const MediaInfo &source,
-                                    const Pipeline &pipeline) {
+                                     const std::vector<MediaInfo> &sources,
+                                     const Pipeline &pipeline) {
+  const MediaInfo source = sources.empty() ? MediaInfo{} : sources.front();
   ValidationExpectation expect;
   expect.container = pipeline.container;
   if (!pipeline.sidecarExtension.empty()) {
+    if (pipeline.sidecarExtension == "json") {
+      // Frame-extraction job: the artifact is the frames manifest; every
+      // image it references must exist on disk (the manifest is the index
+      // the UI renders from — dangling entries are a broken artifact).
+      expect.framesManifest = true;
+      expect.expectVideo = false;
+      expect.expectAudio = false;
+      expect.expectedDurationSec = 0.0;
+      expect.minimumBytes = 32;
+      return expect;
+    }
     // Extraction job: the artifact is a text sidecar; validate cues.
     // The container-oriented 1 KiB floor would reject valid short
     // sidecars (a two-cue SRT is ~100 bytes); one cue line is the floor.
@@ -232,6 +288,92 @@ ValidationExpectation expectationFor(const JobRequest &request,
       }
       break;
     }
+    case 4: { // Cut: retained timeline (complement of the removed ranges).
+      const auto &r = std::get<job::Cut>(request.payload);
+      expect.expectVideo = source.hasVideo();
+      expect.expectAudio = source.hasAudio();
+      expect.videoCodec = pipeline.videoCodec;
+      expect.audioCodec = pipeline.audioCodec;
+      if (!source.video.empty()) {
+        expect.expectedHeight = source.video.front().height;
+      }
+      expect.expectedDurationSec = source.durationSec;
+      if (!r.removed.empty()) {
+        const std::int64_t totalUs =
+            source.durationSec > 0.0
+                ? std::int64_t(source.durationSec * 1'000'000.0)
+                : INT64_MAX / 4;
+        applyTrimDuration(expect, retainedRangesOf(r.removed, totalUs),
+                          source);
+      }
+      break;
+    }
+    case 5: { // Split: the primary artifact is the first PART; part
+      // durations vary by boundary strategy (equal/custom/chapters/
+      // scenes), so no single duration expectation is honest — the parts
+      // are validated structurally and cross-checked per part.
+      expect.expectVideo = source.hasVideo();
+      expect.expectAudio = source.hasAudio();
+      expect.videoCodec = pipeline.videoCodec;
+      expect.audioCodec = pipeline.audioCodec;
+      if (!source.video.empty()) {
+        expect.expectedHeight = source.video.front().height;
+      }
+      expect.expectedDurationSec = 0.0; // per-part; no single expectation
+      break;
+    }
+    case 6: { // Merge: sequential = the sum; spatial = the duration policy.
+      const auto &r = std::get<job::Merge>(request.payload);
+      expect.expectVideo = source.hasVideo();
+      if (r.rules.layout == MergeLayout::Sequential) {
+        // Sequential keeps the first source's characteristics (copy when
+        // compatible, else normalized to it): geometry from source 0;
+        // audio when ANY source carries it (normalization fills silence).
+        expect.expectAudio = std::any_of(sources.begin(), sources.end(),
+                                         [](const MediaInfo &s) {
+                                           return s.hasAudio();
+                                         });
+        expect.videoCodec = pipeline.videoCodec;
+        expect.audioCodec = pipeline.audioCodec;
+        if (!source.video.empty()) {
+          expect.expectedHeight = source.video.front().height;
+        }
+        double sum = 0.0;
+        bool known = !sources.empty();
+        for (const MediaInfo &info : sources) {
+          if (info.durationSec <= 0.0) {
+            known = false;
+            break;
+          }
+          sum += info.durationSec;
+        }
+        expect.expectedDurationSec = known ? sum : 0.0;
+      } else {
+        // Spatial composition: slot geometry is aspect-fitted per layout
+        // (side-by-side stacks widths at a common height, top-bottom
+        // stacks heights at a common width) — honest no-expectation on
+        // geometry; the duration follows the explicit longer/shorter
+        // policy; the audio lane follows the selection.
+        expect.expectedHeight = 0;
+        expect.videoCodec = pipeline.videoCodec;
+        if (r.rules.audio == MergeAudioSelection::None) {
+          expect.expectAudio = false;
+        } else {
+          expect.expectAudio = true;
+          expect.audioCodec = pipeline.audioCodec;
+        }
+        if (sources.size() == 2 && sources[0].durationSec > 0.0 &&
+            sources[1].durationSec > 0.0) {
+          expect.expectedDurationSec =
+              r.rules.longerDuration
+                  ? std::max(sources[0].durationSec, sources[1].durationSec)
+                  : std::min(sources[0].durationSec, sources[1].durationSec);
+        } else {
+          expect.expectedDurationSec = 0.0;
+        }
+      }
+      break;
+    }
     case 7: { // ExtractAudio: valid standalone audio.
       const auto &r = std::get<job::ExtractAudio>(request.payload);
       expect.expectVideo = false;
@@ -278,6 +420,49 @@ ValidationReport OutputValidator::validate(const std::string &outputPath,
     return report;
   }
   report.outputBytes = bytes;
+
+  // Frame-extraction jobs: the output is the frames manifest. Validate it
+  // as an index (independent of the executor that wrote it): every image
+  // file it references must exist with real content — a dangling manifest
+  // entry is a broken artifact the UI would render as a hole.
+  if (expect.framesManifest) {
+    if (bytes < expect.minimumBytes) {
+      report.problems.push_back("Frames manifest is suspiciously small (" +
+                                std::to_string(bytes) + " bytes).");
+    }
+    std::ifstream in(outputPath, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    if (text.find("\"frames\":[") == std::string::npos) {
+      report.problems.push_back("Frames manifest carries no frame array.");
+    } else {
+      std::size_t images = 0;
+      for (std::size_t pos = text.find("\"file\":\"");
+           pos != std::string::npos;
+           pos = text.find("\"file\":\"", pos + 1)) {
+        pos += 8; // skip "file":"
+        std::string file;
+        for (std::size_t i = pos; i < text.size() && text[i] != '"'; ++i) {
+          if (text[i] == '\\' && i + 1 < text.size()) {
+            ++i; // unescape \" and \\ (the manifest's only escapes)
+          }
+          file += text[i];
+        }
+        std::int64_t imageBytes = 0;
+        if (file.empty() || !fileExists(file, &imageBytes) ||
+            imageBytes <= 0) {
+          report.problems.push_back("Manifest image missing: " + file);
+        } else {
+          ++images;
+        }
+      }
+      if (images == 0) {
+        report.problems.push_back("Manifest references no images.");
+      }
+    }
+    report.ok = report.problems.empty();
+    return report;
+  }
 
   // Subtitle-extraction jobs: the output is a text sidecar. Validate the
   // cue structure directly (independent of the code that wrote it) — the

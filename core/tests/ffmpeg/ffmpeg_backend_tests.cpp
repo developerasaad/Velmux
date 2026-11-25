@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -2741,4 +2742,800 @@ TEST_CASE("CEA probe: sources without closed captions report none") {
   // report the absence honestly (the field feeds the planner's
   // "transcoding drops captions" advisory).
   CHECK_FALSE(info.value().video.front().hasClosedCaptions);
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Timeline operations (spec §27 multi-range Cut / §27.3 Split / §27.4+§27.5
+// Merge / §29 Extract Frames): REAL runs through the engine with
+// independent ffprobe cross-validation of every produced artifact.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Multi-range Cut: remove the given [startUs, endUs) windows (the
+// retained timeline is their complement).
+JobRequest cutRequest(const std::string &sourcePath,
+                      const std::string &displayName, Container outContainer,
+                      const std::vector<TimeRange> &removed) {
+  JobRequest request;
+  request.operation = Operation::VideoCutMerge;
+  auto &cut = request.payload.emplace<job::Cut>();
+  cut.source.uri = sourcePath;
+  cut.source.displayName = displayName;
+  cut.output.container = outContainer;
+  cut.removed = removed;
+  return request;
+}
+
+// Split: boundary strategy rules carried verbatim (part count, duration,
+// size, custom timestamps, chapters, scenes).
+JobRequest splitRequest(const std::string &sourcePath,
+                        const std::string &displayName,
+                        Container outContainer, const SplitRules &rules) {
+  JobRequest request;
+  request.operation = Operation::VideoCutMerge;
+  auto &split = request.payload.emplace<job::Split>();
+  split.source.uri = sourcePath;
+  split.source.displayName = displayName;
+  split.output.container = outContainer;
+  split.rules = rules;
+  return request;
+}
+
+// Merge: ordered sources plus composition rules (layout, audio policy).
+JobRequest mergeRequest(const std::vector<MediaSource> &sources,
+                        Container outContainer, const MergeRules &rules) {
+  JobRequest request;
+  request.operation = Operation::VideoCutMerge;
+  auto &merge = request.payload.emplace<job::Merge>();
+  merge.sources = sources;
+  merge.output.container = outContainer;
+  merge.rules = rules;
+  return request;
+}
+
+// Frame extraction: the selection window defaults to the whole timeline;
+// tests tune mode/count/interval/format on the returned request.
+JobRequest extractFramesRequest(const std::string &sourcePath,
+                                const std::string &displayName) {
+  JobRequest request;
+  request.operation = Operation::ExtractFrames;
+  auto &frames = request.payload.emplace<job::ExtractFrames>();
+  frames.source.uri = sourcePath;
+  frames.source.displayName = displayName;
+  return request;
+}
+
+TimeRange rangeUs(std::int64_t startUs, std::int64_t endUs) {
+  TimeRange range;
+  range.startUs = startUs;
+  range.endUs = endUs;
+  return range;
+}
+
+// Runs one job to a terminal state and returns its snapshot (jobs are
+// addressed by id: listJobs is newest-first and order is not a contract).
+const JobSnapshot runJobToTerminal(VelmuxEngine &engine,
+                                   const JobRequest &request,
+                                   std::chrono::seconds timeout) {
+  EventWaiter waiter(engine.events());
+  const Result<std::string> jobId = engine.submitJob(request);
+  REQUIRE(jobId.ok());
+  const auto terminal = waiter.waitForTerminal(timeout);
+  REQUIRE(terminal.has_value());
+  INFO("terminal state: " << jobStateName(terminal->state)
+                          << " error: " << terminal->error);
+  if (getenv("VELMUX_TEST_DEBUG") != nullptr) {
+    fprintf(stderr, "[test-debug] terminal state: %s error: %s\n",
+            jobStateName(terminal->state), terminal->error.c_str());
+  }
+  const auto snap = engine.getJob(jobId.value());
+  REQUIRE(snap.has_value());
+  return *snap;
+}
+
+// Deterministic H.264+AAC MP4 fixture with a KNOWN closed GOP (keyframe
+// every `gopFrames` frames, scene detection disabled): the keyframe-mode
+// oracle. generateFixture cannot express encoder GOP controls, so this
+// builds its own ffmpeg command (the HDR fixture's pattern).
+std::string generateGopFixture(const std::filesystem::path &path,
+                               double seconds, int gopFrames, int fps) {
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error "
+      "-filter_complex \"testsrc2=size=320x240:rate=" +
+      std::to_string(fps) + "[v];"
+      "sine=frequency=440:sample_rate=44100[a]\" -map \"[v]\" -map \"[a]\" " +
+      "-c:v libx264 -preset ultrafast -crf 35 -g " + std::to_string(gopFrames) +
+      " -keyint_min " + std::to_string(gopFrames) +
+      " -sc_threshold 0 -c:a aac -b:a 96k -pix_fmt yuv420p -t " +
+      std::to_string(seconds) + " " + path.string();
+  REQUIRE(std::system(cmd.c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(path) > 1024);
+  return path.string();
+}
+
+// An MKV fixture carrying REAL chapter markers (ffmetadata chapters muxed
+// with -map_metadata 1): the chapter-split oracle.
+std::string generateChaptersMkv(const std::filesystem::path &path,
+                                double seconds,
+                                const std::vector<double> &chapterStartsSec) {
+  const std::string av =
+      generateFixture(path.parent_path() / "av.mp4",
+                      "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", seconds);
+  const auto metaPath = path.parent_path() / "chapters.ffmeta";
+  {
+    std::ofstream meta(metaPath, std::ios::trunc);
+    meta << ";FFMETADATA1\n";
+    for (std::size_t i = 0; i < chapterStartsSec.size(); ++i) {
+      const double start = chapterStartsSec[i];
+      const double end = i + 1 < chapterStartsSec.size()
+                             ? chapterStartsSec[i + 1]
+                             : seconds;
+      meta << "[CHAPTER]\nTIMEBASE=1/1000\nSTART="
+           << std::int64_t(start * 1000.0) << "\nEND="
+           << std::int64_t(end * 1000.0) << "\ntitle=Chapter "
+           << std::to_string(i + 1) << "\n";
+    }
+    REQUIRE(meta.good());
+  }
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error -i \"" + av +
+      "\" -i \"" + metaPath.string() +
+      "\" -map 0 -map_metadata 1 -c copy \"" + path.string() + "\"";
+  REQUIRE(std::system(cmd.c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(path) > 1024);
+  return path.string();
+}
+
+// Counts the container's chapter markers with ffprobe (independent of the
+// backend's own AVFormatContext->chapters read).
+int countChapters(const std::string &path) {
+  const std::string cmd =
+      ffprobeBin() + " -v error -show_chapters -of csv=p=0 \"" + path +
+      "\" 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  int chapters = 0;
+  char line[512];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    ++chapters; // one csv row per [CHAPTER] block
+  }
+  ::pclose(pipe);
+  return chapters;
+}
+
+// A video with REAL scene cuts: three hard color switches encoded in one
+// pass (each switch is a genuine content discontinuity, not a motion
+// ramp). Scene detection must fire exactly at the switches.
+std::string generateSceneCutFixture(const std::filesystem::path &path,
+                                    double secondsPerColor) {
+  // The audio lane needs its own duration: the color sources are bounded
+  // but sine is not, and an unbounded lane would run the encode forever.
+  const double total = 3.0 * secondsPerColor;
+  const std::string cmd =
+      ffmpegBin() + " -y -hide_banner -loglevel error "
+      "-filter_complex \"color=c=black:size=320x240:rate=10:duration=" +
+      std::to_string(secondsPerColor) +
+      "[b];color=c=white:size=320x240:rate=10:duration=" +
+      std::to_string(secondsPerColor) +
+      "[w];color=c=red:size=320x240:rate=10:duration=" +
+      std::to_string(secondsPerColor) +
+      "[r];[b][w][r]concat=n=3:v=1:a=0[v];"
+      "sine=frequency=440:sample_rate=44100:duration=" +
+      std::to_string(total) +
+      "[a]\" -map \"[v]\" -map \"[a]\" "
+      "-t " + std::to_string(total) + " "
+      "-c:v libx264 -preset ultrafast -crf 35 -c:a aac -b:a 96k "
+      "-pix_fmt yuv420p " +
+      path.string();
+  REQUIRE(std::system(cmd.c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(path) > 1024);
+  return path.string();
+}
+
+// Counts the video keyframe PACKETS with ffprobe (packet flags carry the
+// random-access marks the keyframes mode reads at the demux level).
+int countKeyframePackets(const std::string &path) {
+  const std::string cmd =
+      ffprobeBin() + " -v error -select_streams v:0 "
+                     "-show_entries packet=flags -of csv=p=0 \"" +
+      path + "\" 2>&1";
+  FILE *pipe = ::popen(cmd.c_str(), "r");
+  REQUIRE(pipe != nullptr);
+  int keyframes = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), pipe) != nullptr) {
+    if (std::strchr(line, 'K') != nullptr) {
+      ++keyframes;
+    }
+  }
+  ::pclose(pipe);
+  return keyframes;
+}
+
+// The frames manifest the executor writes beside the images: the count
+// field plus every referenced image, parsed at scan level (the manifest
+// is cross-validated here, never trusted as proof of itself).
+struct FramesManifest {
+  int count = -1;
+  std::vector<std::string> files;
+};
+
+FramesManifest readFramesManifest(const std::string &path) {
+  REQUIRE(std::filesystem::exists(path));
+  const std::string text = readFile(path);
+  FramesManifest manifest;
+  const auto countAt = text.find("\"count\":");
+  REQUIRE(countAt != std::string::npos);
+  manifest.count = std::atoi(text.c_str() + countAt + 8);
+  for (std::size_t pos = text.find("\"file\":\"");
+       pos != std::string::npos;
+       pos = text.find("\"file\":\"", pos + 1)) {
+    pos += 8;
+    std::string file;
+    for (std::size_t i = pos; i < text.size() && text[i] != '"'; ++i) {
+      if (text[i] == '\\' && i + 1 < text.size()) {
+        ++i;
+      }
+      file += text[i];
+    }
+    REQUIRE_FALSE(file.empty());
+    manifest.files.push_back(file);
+  }
+  return manifest;
+}
+
+// True when the file starts with the given magic bytes: the independent
+// image-format signature check (JPEG FFD8, PNG 89504E47, WebP RIFF/WEBP).
+bool fileHasMagic(const std::string &path,
+                  const std::vector<unsigned char> &magic) {
+  std::ifstream in(path, std::ios::binary);
+  std::vector<unsigned char> head(magic.size());
+  in.read(reinterpret_cast<char *>(head.data()),
+          std::streamsize(magic.size()));
+  return static_cast<std::size_t>(in.gcount()) == magic.size() &&
+         head == magic;
+}
+
+} // namespace
+
+TEST_CASE("REAL cut: remove two ranges, keep a continuous timeline") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 10.0);
+  // Remove [2s, 4s) and [7s, 9s): retained = [0,2)+[4,7)+[9,10) = 6s.
+  const JobSnapshot job =
+      runJobToTerminal(*env.engine,
+                       cutRequest(fixture, "in.mp4", Container::Mp4,
+                                  {rangeUs(2'000'000, 4'000'000),
+                                   rangeUs(7'000'000, 9'000'000)}),
+                       std::chrono::seconds(120));
+  REQUIRE(job.state == JobState::Completed);
+  REQUIRE(std::filesystem::exists(job.outputPath));
+  CHECK(job.pipelineSummary.find("cut") != std::string::npos);
+
+  // INDEPENDENT cross-check: the output is a real, playable file of the
+  // same codecs whose duration is exactly the retained timeline.
+  const ProbeResult probe = probeWith(job.outputPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.audioCodec == "aac");
+  CHECK(countStreams(job.outputPath, "v") == 1);
+  CHECK(countStreams(job.outputPath, "a") == 1);
+  INFO("duration: " << probe.durationSec << " (retained 6.0)");
+  CHECK(probe.durationSec > 5.6);
+  CHECK(probe.durationSec < 6.4);
+  CHECK(std::filesystem::file_size(job.outputPath) > 8192);
+}
+
+TEST_CASE("REAL split: equal parts produce independently playable parts") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 12.0);
+  SplitRules rules;
+  rules.mode = SplitMode::EqualParts;
+  rules.partCount = 3;
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine, splitRequest(fixture, "eq.mp4", Container::Mp4, rules),
+      std::chrono::seconds(180));
+  REQUIRE(job.state == JobState::Completed);
+
+  // The outputs manifest carries one entry per part; the primary output
+  // IS the first part (the JobSnapshot contract).
+  REQUIRE(job.outputs.size() == 3);
+  CHECK(job.outputPath == job.outputs.front().path);
+  for (std::size_t i = 0; i < job.outputs.size(); ++i) {
+    const JobOutput &part = job.outputs[i];
+    CHECK(part.kind == "media");
+    // Naming convention: <stem>_part_NNN.<ext> beside the primary
+    // (001-based, zero-padded to three digits).
+    char num[8];
+    std::snprintf(num, sizeof(num), "%03zu", i + 1);
+    const std::string want = "_part_" + std::string(num);
+    CHECK(part.path.find(want) != std::string::npos);
+    REQUIRE(std::filesystem::exists(part.path));
+    REQUIRE(std::filesystem::file_size(part.path) > 8192);
+    // Every part is independently playable media of ~1/3 the source.
+    const ProbeResult probe = probeWith(part.path);
+    CHECK(probe.videoCodec == "h264");
+    CHECK(probe.audioCodec == "aac");
+    INFO("part " << i << " duration: " << probe.durationSec
+                << " (expected ~4.0)");
+    CHECK(probe.durationSec > 3.4);
+    CHECK(probe.durationSec < 4.6);
+  }
+}
+
+TEST_CASE("REAL split: custom timestamps land on the requested marks") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 10.0);
+  SplitRules rules;
+  rules.mode = SplitMode::CustomTimestamps;
+  rules.boundaryUs = {3'000'000, 7'000'000};
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine, splitRequest(fixture, "custom.mp4", Container::Mp4, rules),
+      std::chrono::seconds(180));
+  REQUIRE(job.state == JobState::Completed);
+  REQUIRE(job.outputs.size() == 3);
+  // Boundaries [3s, 7s] over 10s: part durations 3 / 4 / 3.
+  const double expected[3] = {3.0, 4.0, 3.0};
+  for (std::size_t i = 0; i < job.outputs.size(); ++i) {
+    const JobOutput &part = job.outputs[i];
+    REQUIRE(std::filesystem::exists(part.path));
+    const ProbeResult probe = probeWith(part.path);
+    CHECK(probe.videoCodec == "h264");
+    CHECK(probe.audioCodec == "aac");
+    INFO("part " << i << " duration: " << probe.durationSec
+                << " (expected " << expected[i] << ")");
+    CHECK(probe.durationSec > expected[i] - 0.5);
+    CHECK(probe.durationSec < expected[i] + 0.5);
+  }
+}
+
+TEST_CASE("REAL split: chapter boundaries and the honest chapter-less refusal") {
+  TestEnv env;
+  // 9s Matroska with chapters starting at 2s and 5s: parts 2 / 3 / 4
+  // (a chapter START strictly inside the timeline is a boundary; the
+  // chapter ENDs only close the ffmetadata blocks).
+  const std::string withChapters =
+      generateChaptersMkv(env.dir / "chapters.mkv", 9.0, {2.0, 5.0});
+  // Fixture honesty: the container really carries the markers.
+  REQUIRE(countChapters(withChapters) == 2);
+
+  SplitRules rules;
+  rules.mode = SplitMode::Chapters;
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine, splitRequest(withChapters, "chapters.mkv",
+                                Container::Mkv, rules),
+      std::chrono::seconds(180));
+  REQUIRE(job.state == JobState::Completed);
+  REQUIRE(job.outputs.size() == 3);
+  const double expected[3] = {2.0, 3.0, 4.0};
+  for (std::size_t i = 0; i < job.outputs.size(); ++i) {
+    REQUIRE(std::filesystem::exists(job.outputs[i].path));
+    const ProbeResult probe = probeWith(job.outputs[i].path);
+    CHECK(probe.videoCodec == "h264");
+    INFO("chapter part " << i << " duration: " << probe.durationSec
+                         << " (expected " << expected[i] << ")");
+    CHECK(probe.durationSec > expected[i] - 0.6);
+    CHECK(probe.durationSec < expected[i] + 0.6);
+  }
+
+  // Honest failure: a chapter-less source has nothing to split on. The
+  // job must FAIL with the real reason, never a silent one-part "split".
+  const std::string plain =
+      generateFixture(env.dir / "plain.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  REQUIRE(countChapters(plain) == 0);
+  const JobSnapshot chapterless = runJobToTerminal(
+      *env.engine, splitRequest(plain, "plain.mp4", Container::Mp4, rules),
+      std::chrono::seconds(60));
+  REQUIRE(chapterless.state == JobState::Failed);
+  CHECK(chapterless.error.find("chapter") != std::string::npos);
+}
+
+TEST_CASE("REAL split: scene-change boundaries") {
+  TestEnv env;
+  // Black -> white -> red, 2s each: two hard content cuts at 2s and 4s.
+  const std::string fixture =
+      generateSceneCutFixture(env.dir / "scenes.mp4", 2.0);
+  SplitRules rules;
+  rules.mode = SplitMode::Scenes;
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine, splitRequest(fixture, "scenes.mp4", Container::Mp4, rules),
+      std::chrono::seconds(180));
+  REQUIRE(job.state == JobState::Completed);
+  // Two detected scene changes -> three parts of ~2s each.
+  REQUIRE(job.outputs.size() >= 2);
+  INFO("parts: " << job.outputs.size() << ", summary: "
+                << job.pipelineSummary);
+  CHECK(job.outputs.size() == 3);
+  double total = 0.0;
+  for (const JobOutput &part : job.outputs) {
+    REQUIRE(std::filesystem::exists(part.path));
+    const ProbeResult probe = probeWith(part.path);
+    CHECK(probe.videoCodec == "h264");
+    total += probe.durationSec;
+  }
+  // The parts cover the whole 6s source at the cut marks.
+  INFO("total part duration: " << total << " (source 6.0)");
+  CHECK(total > 5.3);
+  CHECK(total < 6.7);
+}
+
+TEST_CASE("REAL merge: compatible sources concatenate by stream copy") {
+  TestEnv env;
+  // Two same-shape fixtures (identical encoder settings): compatible for
+  // packet-level concat, no re-encoding.
+  const std::string first =
+      generateFixture(env.dir / "a.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 3.0);
+  const std::string second =
+      generateFixture(env.dir / "b.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=880:sample_rate=44100", 4.0);
+  MergeRules rules; // default: Sequential, audio First
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine,
+      mergeRequest({MediaSource{first, "a.mp4"}, MediaSource{second, "b.mp4"}},
+                   Container::Mp4, rules),
+      std::chrono::seconds(180));
+  REQUIRE(job.state == JobState::Completed);
+  REQUIRE(std::filesystem::exists(job.outputPath));
+
+  // The actually-taken route is reported in the pipeline summary: the
+  // concat stream-copy semantics, not a normalized re-encode.
+  INFO("summary: " << job.pipelineSummary);
+  CHECK(job.pipelineSummary.find("concat") != std::string::npos);
+  CHECK(job.pipelineSummary.find("copy") != std::string::npos);
+
+  // INDEPENDENT cross-check: one continuous timeline of the summed
+  // duration, same codecs, same geometry.
+  const ProbeResult probe = probeWith(job.outputPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.audioCodec == "aac");
+  CHECK(probe.width == 320);
+  CHECK(probe.height == 240);
+  CHECK(countStreams(job.outputPath, "v") == 1);
+  CHECK(countStreams(job.outputPath, "a") == 1);
+  INFO("duration: " << probe.durationSec << " (3.0 + 4.0)");
+  CHECK(probe.durationSec > 6.4);
+  CHECK(probe.durationSec < 7.6);
+}
+
+TEST_CASE("REAL merge: incompatible sources normalize to the first") {
+  TestEnv env;
+  // 640x360 (16:9) + 320x240 (4:3): incompatible shapes force the
+  // normalized route; the output follows the FIRST source's geometry.
+  const std::string first =
+      generateFixture(env.dir / "wide.mp4", "testsrc2=size=640x360:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 3.0);
+  const std::string second =
+      generateFixture(env.dir / "small.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=880:sample_rate=44100", 4.0);
+  MergeRules rules;
+  const JobSnapshot job = runJobToTerminal(
+      *env.engine,
+      mergeRequest({MediaSource{first, "wide.mp4"},
+                    MediaSource{second, "small.mp4"}},
+                   Container::Mp4, rules),
+      std::chrono::seconds(240));
+  REQUIRE(job.state == JobState::Completed);
+  REQUIRE(std::filesystem::exists(job.outputPath));
+  INFO("summary: " << job.pipelineSummary);
+  CHECK(job.pipelineSummary.find("normalized") != std::string::npos);
+
+  // Output geometry is exactly the FIRST source's (aspect-preserving
+  // scale+pad of the 4:3 source into 16:9 — never a stretch).
+  const ProbeResult probe = probeWith(job.outputPath);
+  CHECK(probe.videoCodec == "h264");
+  CHECK(probe.audioCodec == "aac");
+  CHECK(probe.width == 640);
+  CHECK(probe.height == 360);
+  INFO("duration: " << probe.durationSec << " (3.0 + 4.0)");
+  CHECK(probe.durationSec > 6.4);
+  CHECK(probe.durationSec < 7.6);
+}
+
+TEST_CASE("REAL merge spatial: side-by-side and top-bottom composition") {
+  TestEnv env;
+  const std::string first =
+      generateFixture(env.dir / "left.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 3.0);
+  const std::string second =
+      generateFixture(env.dir / "right.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=880:sample_rate=44100", 4.0);
+  const MediaSource left{first, "left.mp4"};
+  const MediaSource right{second, "right.mp4"};
+
+  // Side-by-side: widths stack at the common (equal) height; the
+  // timeline follows the longer source (4s) with a black-padded tail.
+  {
+    MergeRules rules;
+    rules.layout = MergeLayout::SideBySide;
+    rules.audio = MergeAudioSelection::First;
+    const JobSnapshot job = runJobToTerminal(
+        *env.engine, mergeRequest({left, right}, Container::Mp4, rules),
+        std::chrono::seconds(240));
+    REQUIRE(job.state == JobState::Completed);
+    REQUIRE(std::filesystem::exists(job.outputPath));
+    const ProbeResult probe = probeWith(job.outputPath);
+    CHECK(probe.videoCodec == "h264");
+    INFO("sbs geometry: " << probe.width << "x" << probe.height
+                          << " duration " << probe.durationSec);
+    CHECK(probe.width == 640); // 320 + 320 at the common height
+    CHECK(probe.height == 240);
+    // Longer-source duration policy.
+    CHECK(probe.durationSec > 3.4);
+    CHECK(probe.durationSec < 4.6);
+    // Audio selection First: exactly one audio lane.
+    CHECK(countStreams(job.outputPath, "a") == 1);
+    CHECK(probe.audioCodec == "aac");
+  }
+
+  // Top-bottom: heights stack at the common (equal) width.
+  {
+    MergeRules rules;
+    rules.layout = MergeLayout::TopBottom;
+    rules.audio = MergeAudioSelection::First;
+    const JobSnapshot job = runJobToTerminal(
+        *env.engine, mergeRequest({left, right}, Container::Mp4, rules),
+        std::chrono::seconds(240));
+    REQUIRE(job.state == JobState::Completed);
+    REQUIRE(std::filesystem::exists(job.outputPath));
+    const ProbeResult probe = probeWith(job.outputPath);
+    CHECK(probe.videoCodec == "h264");
+    INFO("tb geometry: " << probe.width << "x" << probe.height
+                         << " duration " << probe.durationSec);
+    CHECK(probe.width == 320);
+    CHECK(probe.height == 480); // 240 + 240 at the common width
+    CHECK(probe.durationSec > 3.4);
+    CHECK(probe.durationSec < 4.6);
+    CHECK(countStreams(job.outputPath, "a") == 1);
+  }
+}
+
+TEST_CASE("REAL extract frames: AllInRange writes every frame plus a manifest") {
+  TestEnv env;
+  // 2s at 10fps: exactly 20 frames in [0, 2s).
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+  JobRequest request = extractFramesRequest(fixture, "all.mp4");
+  auto &frames = std::get<job::ExtractFrames>(request.payload);
+  frames.selection.mode = FrameSelectionMode::AllInRange;
+  frames.selection.range = rangeUs(0, 2'000'000);
+
+  const JobSnapshot job =
+      runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+  REQUIRE(job.state == JobState::Completed);
+
+  // The primary output IS the manifest; the outputs manifest lists the
+  // manifest entry first, then every image.
+  REQUIRE(job.outputs.size() >= 2);
+  CHECK(job.outputs.front().kind == "manifest");
+  CHECK(job.outputPath == job.outputs.front().path);
+  const std::string &manifestPath = job.outputs.front().path;
+  CHECK(manifestPath.find("_manifest.json") != std::string::npos);
+  REQUIRE(std::filesystem::exists(manifestPath));
+
+  const FramesManifest manifest = readFramesManifest(manifestPath);
+  INFO("manifest count: " << manifest.count << " files: "
+                          << manifest.files.size());
+  // Every actual frame in range (20): VFR/priming honesty allows ±2.
+  CHECK(manifest.count >= 18);
+  CHECK(manifest.count <= 22);
+  CHECK(manifest.files.size() == std::size_t(manifest.count));
+
+  // Every image exists, is a REAL JPEG (magic bytes), and the outputs
+  // manifest carries it.
+  std::size_t imageOutputs = 0;
+  for (const JobOutput &out : job.outputs) {
+    if (out.kind == "image") {
+      ++imageOutputs;
+      CHECK(out.path.rfind(".jpg") == out.path.size() - 4);
+    }
+  }
+  CHECK(imageOutputs == manifest.files.size());
+  for (const std::string &file : manifest.files) {
+    REQUIRE(std::filesystem::exists(file));
+    CHECK(std::filesystem::file_size(file) > 1024);
+    CHECK(fileHasMagic(file, {0xFF, 0xD8, 0xFF}));
+  }
+  // Sequential naming convention: <stem>_NNNNN.jpg (10-char suffix).
+  CHECK(manifest.files.front().size() >= 10);
+  CHECK(manifest.files.front().compare(
+            manifest.files.front().size() - 10, 10, "_00001.jpg") == 0);
+}
+
+TEST_CASE("REAL extract frames: Count, Interval and Keyframes modes") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+
+  // Count: 5 evenly-spread frames over a 20-frame source — exactly 5
+  // distinct images (dedup only shrinks counts the source cannot serve).
+  {
+    JobRequest request = extractFramesRequest(fixture, "count.mp4");
+    auto &frames = std::get<job::ExtractFrames>(request.payload);
+    frames.selection.mode = FrameSelectionMode::Count;
+    frames.selection.count = 5;
+    frames.selection.range = rangeUs(0, 2'000'000);
+    const JobSnapshot job =
+        runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+    REQUIRE(job.state == JobState::Completed);
+    const FramesManifest manifest =
+        readFramesManifest(job.outputs.front().path);
+    INFO("count mode: " << manifest.count << " images");
+    CHECK(manifest.count == 5);
+    // Distinct files (frame identity, never fabricated duplicates).
+    std::vector<std::string> names = manifest.files;
+    std::sort(names.begin(), names.end());
+    CHECK(std::adjacent_find(names.begin(), names.end()) == names.end());
+  }
+
+  // Interval: every 500ms over 2s -> 0.0 / 0.5 / 1.0 / 1.5 -> 4 images.
+  {
+    JobRequest request = extractFramesRequest(fixture, "interval.mp4");
+    auto &frames = std::get<job::ExtractFrames>(request.payload);
+    frames.selection.mode = FrameSelectionMode::Interval;
+    frames.selection.intervalUs = 500'000;
+    frames.selection.range = rangeUs(0, 2'000'000);
+    const JobSnapshot job =
+        runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+    REQUIRE(job.state == JobState::Completed);
+    const FramesManifest manifest =
+        readFramesManifest(job.outputs.front().path);
+    INFO("interval mode: " << manifest.count << " images");
+    CHECK(manifest.count == 4);
+  }
+
+  // Keyframes: a source with a known closed GOP (keyframe every 1s at
+  // 10fps) — the extracted count must equal the REAL random-access count
+  // measured independently by ffprobe's packet flags.
+  {
+    const std::string gop = generateGopFixture(env.dir / "gop.mp4", 2.0, 10, 10);
+    const int realKeyframes = countKeyframePackets(gop);
+    INFO("ffprobe keyframe packets: " << realKeyframes);
+    REQUIRE(realKeyframes >= 1);
+    JobRequest request = extractFramesRequest(gop, "gop.mp4");
+    auto &frames = std::get<job::ExtractFrames>(request.payload);
+    frames.selection.mode = FrameSelectionMode::Keyframes;
+    frames.selection.range = rangeUs(0, 2'000'000);
+    const JobSnapshot job =
+        runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+    REQUIRE(job.state == JobState::Completed);
+    const FramesManifest manifest =
+        readFramesManifest(job.outputs.front().path);
+    INFO("keyframes mode: " << manifest.count << " images");
+    CHECK(manifest.count >= 1);
+    CHECK(manifest.count == realKeyframes);
+  }
+}
+
+TEST_CASE("REAL extract frames: PNG and WebP image formats") {
+  TestEnv env;
+  const std::string fixture =
+      generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=10",
+                      "sine=frequency=440:sample_rate=44100", 2.0);
+
+  // PNG: lossless still-image signature + real dimensions.
+  {
+    JobRequest request = extractFramesRequest(fixture, "png.mp4");
+    auto &frames = std::get<job::ExtractFrames>(request.payload);
+    frames.selection.mode = FrameSelectionMode::Count;
+    frames.selection.count = 2;
+    frames.selection.range = rangeUs(0, 2'000'000);
+    frames.image.format = ImageOutputRules::Format::Png;
+    const JobSnapshot job =
+        runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+    REQUIRE(job.state == JobState::Completed);
+    const FramesManifest manifest =
+        readFramesManifest(job.outputs.front().path);
+    CHECK(manifest.count == 2);
+    for (const std::string &file : manifest.files) {
+      REQUIRE(std::filesystem::exists(file));
+      CHECK(fileHasMagic(file, {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}));
+      CHECK(file.rfind(".png") == file.size() - 4);
+      // A real PNG decodes at the source frame geometry.
+      const std::string probeCmd =
+          ffprobeBin() + " -v error -show_entries stream=width,height "
+                         "-of csv=p=0 \"" +
+          file + "\"";
+      FILE *pipe = ::popen(probeCmd.c_str(), "r");
+      REQUIRE(pipe != nullptr);
+      char buf[128] = {0};
+      const char *got = std::fgets(buf, sizeof(buf), pipe);
+      ::pclose(pipe);
+      REQUIRE(got != nullptr);
+      CHECK(std::string(buf).find("320,240") == 0);
+    }
+  }
+
+  // WebP: RIFF container signature with the WEBP marker.
+  {
+    JobRequest request = extractFramesRequest(fixture, "webp.mp4");
+    auto &frames = std::get<job::ExtractFrames>(request.payload);
+    frames.selection.mode = FrameSelectionMode::Count;
+    frames.selection.count = 2;
+    frames.selection.range = rangeUs(0, 2'000'000);
+    frames.image.format = ImageOutputRules::Format::WebP;
+    const JobSnapshot job =
+        runJobToTerminal(*env.engine, request, std::chrono::seconds(120));
+    REQUIRE(job.state == JobState::Completed);
+    const FramesManifest manifest =
+        readFramesManifest(job.outputs.front().path);
+    CHECK(manifest.count == 2);
+    for (const std::string &file : manifest.files) {
+      REQUIRE(std::filesystem::exists(file));
+      CHECK(fileHasMagic(file, {'R', 'I', 'F', 'F'}));
+      // Bytes 8..11 of a WebP: the format tag itself.
+      std::ifstream in(file, std::ios::binary);
+      char tag[5] = {0};
+      in.seekg(8);
+      in.read(tag, 4);
+      CHECK(std::string(tag) == "WEBP");
+      CHECK(file.rfind(".webp") == file.size() - 5);
+    }
+  }
+}
+
+TEST_CASE("extract frames refuses an audio-only source honestly") {
+  TestEnv env;
+  // Audio-only fixture (no timed video stream).
+  const std::string audioOnly = (env.dir / "audio.m4a").string();
+  REQUIRE(std::system((ffmpegBin() + " -y -hide_banner -loglevel error "
+                                     "-filter_complex "
+                                     "\"sine=frequency=440:sample_rate=44100"
+                                     "[a]\" -map \"[a]\" -c:a aac -b:a 96k "
+                                     "-t 2 \"" +
+                       audioOnly + "\"")
+                          .c_str()) == 0);
+  REQUIRE(std::filesystem::file_size(audioOnly) > 1024);
+
+  // The EXECUTOR's own honesty: invoked directly (the planner would
+  // refuse the request earlier with its own message — both layers are
+  // honest, this one pins the executor's contract).
+  JobRequest request = extractFramesRequest(audioOnly, "audio.m4a");
+  auto &frames = std::get<job::ExtractFrames>(request.payload);
+  frames.selection.mode = FrameSelectionMode::AllInRange;
+  frames.selection.range = rangeUs(0, 2'000'000);
+  Pipeline pipeline;
+  const auto assign = [&pipeline](StageId stage) {
+    pipeline.stages.push_back({stage, BackendId::Ffmpeg});
+  };
+  assign(StageId::Demux);
+  assign(StageId::Decode);
+  assign(StageId::VideoProcessing);
+  assign(StageId::Encode);
+  pipeline.videoCodec = VideoCodec::H264;
+  pipeline.audioCodec = AudioCodec::Aac;
+  pipeline.container = Container::Mp4;
+  pipeline.sidecarExtension = "json"; // the frames-manifest pipeline
+  velmux::backend::ExecuteParams params;
+  params.pipeline = pipeline;
+  params.request = request;
+  params.outputPath = (env.dir / "frames.json").string();
+  params.jobId = "frames-honesty";
+  params.cancel = std::make_shared<velmux::backend::CancelToken>();
+  const velmux::backend::ExecuteResult result =
+      env.backend->executor()->execute(params);
+  REQUIRE_FALSE(result.success);
+  INFO("executor error: " << result.error.message);
+  CHECK(result.error.message.find("no timed video stream") !=
+        std::string::npos);
+  // No artifacts from the refused run.
+  CHECK_FALSE(std::filesystem::exists(env.dir / "frames_manifest.json"));
+
+  // The ENGINE layer refuses honestly too (the planner's own message).
+  const JobSnapshot job =
+      runJobToTerminal(*env.engine, request, std::chrono::seconds(60));
+  REQUIRE(job.state == JobState::Failed);
+  CHECK_FALSE(job.error.empty());
 }
