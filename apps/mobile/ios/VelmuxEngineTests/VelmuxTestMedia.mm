@@ -26,26 +26,56 @@
 
 namespace {
 
-// Backpressure wait: bounded spin so a wedged writer fails the test instead
-// of hanging the CI run (the same "never deadlock" posture as the engine's
-// Apple mux stage). While waiting on the main thread (XCTest runs test
-// methods there), the main run loop is pumped instead of a plain sleep:
-// AVFoundation's writer session setup can be waiting to deliver through
-// the main queue, and a blocked main thread would deadlock the first
-// append — the first CI executions stalled exactly there (every fixture
-// failed after the ~30 s readiness budget; run 45528452313).
-bool waitForReady(AVAssetWriterInput *input) {
+// The queue that drives fixture generation. AVAssetWriter appends are
+// polled from a dedicated serial background queue — the canonical
+// pattern — because the FIRST executions ran the writer from the XCTest
+// MAIN thread and every input stalled for its whole 30 s readiness
+// budget with no writer error anywhere in the unified log (runs
+// 45528452313/45535840965/45556729129; the run-loop-pumping variant
+// tried in between did not change it). Off the main thread, a plain
+// bounded sleep poll is exactly the shape Apple's own sample code uses.
+dispatch_queue_t vlmxGenerationQueue() {
+  static dispatch_queue_t queue = dispatch_queue_create(
+      "velmux-test-fixture-generation", DISPATCH_QUEUE_SERIAL);
+  return queue;
+}
+
+// Backpressure wait: bounded spin so a wedged writer fails the test
+// instead of hanging the CI run (the same "never deadlock" posture as
+// the engine's Apple mux stage). Distinguishes the two failure shapes
+// honestly: a FAILED writer reports its error; a never-ready input
+// reports the writer status it stalled in.
+bool waitForReady(AVAssetWriter *writer, AVAssetWriterInput *input,
+                  std::string &failure) {
   for (int round = 0; round < 6000 && !input.isReadyForMoreMediaData;
        ++round) {
-    if ([NSThread isMainThread]) {
-      [[NSRunLoop mainRunLoop]
-          runMode:NSDefaultRunLoopMode
-          beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
-    } else {
-      [NSThread sleepForTimeInterval:0.005];
+    [NSThread sleepForTimeInterval:0.005];
+    if (writer.status == AVAssetWriterStatusFailed) {
+      failure = "writer failed: ";
+      failure += writer.error != nil
+                     ? writer.error.localizedDescription.UTF8String
+                     : "(no error reported)";
+      return false;
     }
   }
-  return input.isReadyForMoreMediaData;
+  if (input.isReadyForMoreMediaData) {
+    return true;
+  }
+  if (writer.status == AVAssetWriterStatusFailed) {
+    failure = "writer failed while waiting: ";
+    failure += writer.error != nil
+                   ? writer.error.localizedDescription.UTF8String
+                   : "(no error reported)";
+  } else {
+    failure = "input never became ready (writer status: ";
+    failure += std::to_string(int(writer.status));
+    failure += ", error: ";
+    failure += writer.error != nil
+                   ? writer.error.localizedDescription.UTF8String
+                   : "(none)";
+    failure += ")";
+  }
+  return false;
 }
 
 // Fills one biplanar (420YpCbCr8BiPlanarVideoRange) pixel buffer with a
@@ -313,82 +343,125 @@ NSString *vlmxFourCharString(FourCharCode code) {
     return nil;
   }
 
-  [writer startWriting];
-  [writer startSessionAtSourceTime:kCMTimeZero];
-
-  bool failed = false;
-  NSString *failure = @"";
-
-  // Video pass: one gradient frame per tick, appended as produced (the
-  // adaptor encodes through VideoToolbox on append).
-  {
-    CVPixelBufferRef pixels = nullptr;
-    const OSStatus status = CVPixelBufferCreate(
-        kCFAllocatorDefault, width, height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixels);
-    if (status != noErr || pixels == nullptr) {
+  // The whole write-driving (start, appends, finish) runs on the dedicated
+  // generation queue; the calling test thread blocks here (see
+  // vlmxGenerationQueue for why the writer must not be driven from the
+  // XCTest main thread).
+  __block bool failed = false;
+  __block NSString *failure = @"";
+  dispatch_sync(vlmxGenerationQueue(), ^{
+    [writer startWriting];
+    [writer startSessionAtSourceTime:kCMTimeZero];
+    if (writer.status == AVAssetWriterStatusFailed) {
       failed = true;
-      failure = @"cannot create pixel buffer";
+      failure = writer.error != nil
+                    ? writer.error.localizedDescription
+                    : @"startWriting failed (no error reported)";
+      return;
     }
-    for (int frame = 0; pixels != nullptr && frame < frameCount; ++frame) {
-      @autoreleasepool {
-        if (!waitForReady(videoInput)) {
+
+    // Video pass: one gradient frame per tick, appended as produced (the
+    // adaptor encodes through VideoToolbox on append).
+    {
+      CVPixelBufferRef pixels = nullptr;
+      const OSStatus status = CVPixelBufferCreate(
+          kCFAllocatorDefault, width, height,
+          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixels);
+      if (status != noErr || pixels == nullptr) {
+        failed = true;
+        failure = @"cannot create pixel buffer";
+      }
+      for (int frame = 0; pixels != nullptr && frame < frameCount; ++frame) {
+        @autoreleasepool {
+          std::string stall;
+          if (!waitForReady(writer, videoInput, stall)) {
+            failed = true;
+            failure = [NSString
+                stringWithFormat:@"video input stalled: %s", stall.c_str()];
+            break;
+          }
+          fillGradientFrame(pixels, frame);
+          const CMTime pts = CMTimeMake(int64_t(frame) * 1000000,
+                                        int32_t(frameRate * 1000000));
+          if (![adaptor appendPixelBuffer:pixels
+                    withPresentationTime:pts]) {
+            failed = true;
+            failure = writer.error != nil
+                          ? writer.error.localizedDescription
+                          : @"video append failed";
+            break;
+          }
+        }
+      }
+      if (pixels != nullptr) {
+        CVPixelBufferRelease(pixels);
+      }
+      [videoInput markAsFinished];
+    }
+
+    if (failed) {
+      return;
+    }
+
+    // Audio pass: 1024-frame PCM chunks until the video duration is
+    // covered.
+    {
+      const int64_t totalAudioFrames =
+          int64_t(double(frameCount) / frameRate * sampleRate);
+      const int64_t chunkFrames = 1024;
+      for (int64_t at = 0; at < totalAudioFrames; at += chunkFrames) {
+        const int frames =
+            int(std::min<int64_t>(chunkFrames, totalAudioFrames - at));
+        CMSampleBufferRef sample =
+            makeAudioSampleBuffer(asbd, audioFormat, at, frames);
+        if (sample == nullptr) {
           failed = true;
-          failure = @"video input stalled";
+          failure = @"cannot build audio sample";
           break;
         }
-        fillGradientFrame(pixels, frame);
-        const CMTime pts = CMTimeMake(int64_t(frame) * 1000000,
-                                      int32_t(frameRate * 1000000));
-        if (![adaptor appendPixelBuffer:pixels
-                  withPresentationTime:pts]) {
+        std::string stall;
+        if (!waitForReady(writer, audioInput, stall)) {
+          CFRelease(sample);
+          failed = true;
+          failure = [NSString
+              stringWithFormat:@"audio input stalled: %s", stall.c_str()];
+          break;
+        }
+        if (![audioInput appendSampleBuffer:sample]) {
+          CFRelease(sample);
           failed = true;
           failure = writer.error != nil
                         ? writer.error.localizedDescription
-                        : @"video append failed";
+                        : @"audio append failed";
           break;
         }
+        CFRelease(sample);
       }
+      [audioInput markAsFinished];
     }
-    if (pixels != nullptr) {
-      CVPixelBufferRelease(pixels);
-    }
-    [videoInput markAsFinished];
-  }
 
-  // Audio pass: 1024-frame PCM chunks until the video duration is covered.
-  if (!failed) {
-    const int64_t totalAudioFrames =
-        int64_t(double(frameCount) / frameRate * sampleRate);
-    const int64_t chunkFrames = 1024;
-    for (int64_t at = 0; at < totalAudioFrames; at += chunkFrames) {
-      const int frames =
-          int(std::min<int64_t>(chunkFrames, totalAudioFrames - at));
-      CMSampleBufferRef sample =
-          makeAudioSampleBuffer(asbd, audioFormat, at, frames);
-      if (sample == nullptr) {
-        failed = true;
-        failure = @"cannot build audio sample";
-        break;
-      }
-      if (!waitForReady(audioInput)) {
-        CFRelease(sample);
-        failed = true;
-        failure = @"audio input stalled";
-        break;
-      }
-      if (![audioInput appendSampleBuffer:sample]) {
-        CFRelease(sample);
-        failed = true;
-        failure = writer.error != nil
-                      ? writer.error.localizedDescription
-                      : @"audio append failed";
-        break;
-      }
-      CFRelease(sample);
+    if (failed) {
+      return;
     }
-    [audioInput markAsFinished];
-  }
+
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block BOOL finished = NO;
+    [writer finishWritingWithCompletionHandler:^{
+      finished = YES;
+      dispatch_semaphore_signal(done);
+    }];
+    dispatch_semaphore_wait(
+        done, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));
+    if (writer.status != AVAssetWriterStatusCompleted || !finished) {
+      failed = true;
+      failure = [NSString
+          stringWithFormat:@"writer did not complete (status: %d, error: %@)",
+                           int(writer.status),
+                           writer.error != nil
+                               ? writer.error.localizedDescription
+                               : @"(none)"];
+    }
+  });
   CFRelease(audioFormat);
 
   if (failed) {
@@ -403,34 +476,6 @@ NSString *vlmxFourCharString(FourCharCode code) {
                                userInfo:@{
                                  NSLocalizedDescriptionKey : failure
                                }];
-    }
-    return nil;
-  }
-
-  dispatch_semaphore_t done = dispatch_semaphore_create(0);
-  __block BOOL finished = NO;
-  [writer finishWritingWithCompletionHandler:^{
-    finished = YES;
-    dispatch_semaphore_signal(done);
-  }];
-  dispatch_semaphore_wait(
-      done, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));
-  if (writer.status != AVAssetWriterStatusCompleted || !finished) {
-    @try {
-      [writer cancelWriting];
-    } @catch (NSException *) {
-      // Teardown must never throw.
-    }
-    if (error != nil) {
-      *error = [NSError
-          errorWithDomain:@"VelmuxEngineTests"
-                     code:5
-                 userInfo:@{
-                   NSLocalizedDescriptionKey :
-                       writer.error != nil
-                           ? writer.error.localizedDescription
-                           : @"writer did not complete"
-                 }];
     }
     return nil;
   }
