@@ -234,7 +234,7 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
       val chooser = Intent.createChooser(send, title).apply {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
       }
-      val activity = currentActivity ?: reactApplicationContext.currentActivity
+      val activity = reactApplicationContext.currentActivity
       if (activity == null) {
         promise.resolve(false)
         return
