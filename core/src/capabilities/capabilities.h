@@ -86,6 +86,14 @@ struct BackendCapabilities {
   bool coverArt = false;
   // Can the backend tone-map HDR sources to SDR during a transcode?
   bool hdrToneMapping = false;
+  // Can the backend execute the timeline operations (multi-range Cut,
+  // Split with boundary strategies, sequential/spatial Merge) and frame
+  // extraction? These need the FFmpeg-specific machinery (keyframe
+  // timeline analysis, real scene detection, per-part checkpoints,
+  // multi-output manifests); executors without it report false and the
+  // planner never routes such requests to them (honest capability
+  // reporting, not a stub).
+  bool timelineOps = false;
   // Free-form implementation label, e.g. "ffmpeg 7.1.1 (static, feature
   // selected)" or "MediaCodec (OMX.qcom.video.encoder.avc)".
   std::string implementation;

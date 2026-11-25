@@ -117,6 +117,15 @@ struct Shape {
   bool burnIn = false;           // a burn-in rule exists
   bool keepSubtitles = false;    // a preserved/embedded source track remains
   bool stripMetadata = false;    // the all-Clear intention
+  // Timeline operations (mandate §27/§29): routed only to backends whose
+  // executor implements the timeline machinery.
+  bool timelineOp = false;       // Cut / Split / Merge / ExtractFrames
+  bool windowedTimeline = false; // Cut / Split: per-window work (timeTrim)
+  bool framesExtract = false;    // ExtractFrames: dedicated image pipeline
+  bool mergeSpatial = false;     // spatial merge: never a stream copy
+  // Extra containers the candidate must be able to READ (Merge: every
+  // source's container, not just the first).
+  std::vector<Container> readAlso;
   CompressionIntent compression;
   BudgetInputs budget;
 };
@@ -479,7 +488,6 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
 
   // ----- Normalize the typed payload into the conversion shape ----------
   Shape shape;
-  bool deferred = false;
   switch (request.payload.index()) {
     case 0: { // VideoConvert
       if (request.operation != Operation::VideoConvert) {
@@ -532,16 +540,19 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
       }
       break;
     }
-    case 4: { // Cut: retained = complement of removed.
+    case 4: { // Cut: retained = complement of removed (mandate §27.2).
       const auto &cut = std::get<job::Cut>(request.payload);
       shape.source = cut.source;
       shape.outputContainer = cut.output.container.value_or(source.container);
+      shape.timelineOp = true;
+      shape.windowedTimeline = true;
+      shape.allSourceAudioTracks = true;
+      shape.keepSubtitles = source.hasSubtitles();
       if (cut.removed.empty()) {
         // Removing nothing = the whole timeline: a pure remux.
         break;
       }
-      // Validate the removal intervals; execution of multi-range cuts
-      // lands with the timeline executor phase.
+      // Validate the removal intervals.
       for (const TimeRange &range : cut.removed) {
         if (!range.valid()) {
           result.feasible = false;
@@ -551,60 +562,210 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
           return Result<PlanResult>(std::move(result));
         }
       }
-      deferred = true;
+      // Retained intervals = complement of the removed ranges over the
+      // source timeline (normalized: sorted, merged, clamped). The
+      // executor re-normalizes defensively; the planner needs the
+      // complement for the timeTrim gate and the duration expectation.
+      const std::int64_t totalUs =
+          source.durationSec > 0.0
+              ? std::int64_t(source.durationSec * 1000000.0)
+              : INT64_MAX / 4;
+      std::vector<TimeRange> removed = cut.removed;
+      std::sort(removed.begin(), removed.end(),
+                [](const TimeRange &a, const TimeRange &b) {
+                  return a.startUs < b.startUs;
+                });
+      std::vector<TimeRange> merged;
+      for (const TimeRange &range : removed) {
+        if (!merged.empty() &&
+            (range.startUs <= merged.back().endUs ||
+             (merged.back().endUs < 0 && range.startUs <= totalUs))) {
+          if (merged.back().endUs < 0 || range.endUs < 0) {
+            merged.back().endUs = -1; // extends to the end
+          } else {
+            merged.back().endUs =
+                std::max(merged.back().endUs, range.endUs);
+          }
+        } else {
+          merged.push_back(range);
+        }
+      }
+      std::int64_t cursor = 0;
+      for (const TimeRange &range : merged) {
+        const std::int64_t start = std::max<std::int64_t>(range.startUs, 0);
+        const std::int64_t end = range.endUs < 0 ? totalUs : range.endUs;
+        if (start > cursor) {
+          shape.trimRanges.push_back(
+              TimeRange{cursor, std::min(start, totalUs)});
+        }
+        cursor = std::max(cursor, end);
+        if (cursor >= totalUs) {
+          cursor = totalUs;
+          break;
+        }
+      }
+      if (cursor < totalUs) {
+        shape.trimRanges.push_back(TimeRange{cursor, -1}); // to the end
+      }
+      if (shape.trimRanges.empty()) {
+        // Never remove the complete source (mandate §27.2): an empty
+        // complement is a request error, never a zero-length output.
+        result.feasible = false;
+        result.message = "cannot remove the entire timeline: at least one "
+                         "frame must remain";
+        result.errorCode = ErrorCode::InvalidTimeRange;
+        return Result<PlanResult>(std::move(result));
+      }
       break;
     }
-    case 5:   // Split
-    case 6: { // Merge
-      // Planning-level validation only in this phase; execution of the
-      // multi-output (Split) and N-source (Merge) shapes lands with the
-      // timeline executor phase.
-      if (request.payload.index() == 5) {
-        const auto &split = std::get<job::Split>(request.payload);
-        shape.source = split.source;
-        shape.outputContainer =
-            split.output.container.value_or(source.container);
-        // Resolvability check (spec §2): unresolvable boundary strategies
-        // are infeasible with a specific message, before the deferral.
-        if (split.rules.mode == SplitMode::MaxSize &&
-            source.overallBitRate() <= 0.0 && source.sizeBytes <= 0) {
-          result.feasible = false;
-          result.message =
-              "Cannot estimate part sizes: the source bitrate is unknown. "
-              "Choose a different split strategy.";
-          return Result<PlanResult>(std::move(result));
+    case 5: { // Split: boundary strategies (mandate §27.3).
+      const auto &split = std::get<job::Split>(request.payload);
+      shape.source = split.source;
+      shape.outputContainer =
+          split.output.container.value_or(source.container);
+      shape.timelineOp = true;
+      shape.windowedTimeline = true;
+      shape.allSourceAudioTracks = true;
+      shape.keepSubtitles = source.hasSubtitles();
+      const std::int64_t durationUs =
+          source.durationSec > 0.0
+              ? std::int64_t(source.durationSec * 1000000.0)
+              : 0;
+      const bool durationKnown = durationUs > 0;
+      // Duration-based boundary math needs the source duration; the
+      // content-based strategies (Chapters/Scenes) read it at execution.
+      switch (split.rules.mode) {
+        case SplitMode::EqualParts:
+          if (split.rules.partCount < 2) {
+            result.feasible = false;
+            result.message = "split needs at least two parts.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          if (!durationKnown) {
+            result.feasible = false;
+            result.message = "Cannot split into equal parts: the source "
+                             "duration is unknown.";
+            result.errorCode = ErrorCode::InspectionFailed;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case SplitMode::Duration:
+          if (split.rules.partDurationUs <= 0) {
+            result.feasible = false;
+            result.message = "split part duration must be positive.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          if (!durationKnown) {
+            result.feasible = false;
+            result.message = "Cannot split by duration: the source duration "
+                             "is unknown.";
+            result.errorCode = ErrorCode::InspectionFailed;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case SplitMode::MaxSize:
+          if (split.rules.maxSizeBytes <= 0) {
+            result.feasible = false;
+            result.message = "split maximum part size must be positive.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          // Resolvability check (spec §2): unresolvable boundary
+          // strategies are infeasible with a specific message.
+          if (source.overallBitRate() <= 0.0 && source.sizeBytes <= 0) {
+            result.feasible = false;
+            result.message =
+                "Cannot estimate part sizes: the source bitrate is unknown. "
+                "Choose a different split strategy.";
+            return Result<PlanResult>(std::move(result));
+          }
+          if (!durationKnown) {
+            result.feasible = false;
+            result.message = "Cannot split by size: the source duration is "
+                             "unknown.";
+            result.errorCode = ErrorCode::InspectionFailed;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case SplitMode::CustomTimestamps: {
+          if (split.rules.boundaryUs.empty()) {
+            result.feasible = false;
+            result.message = "custom split boundaries are missing.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          std::int64_t previous = 0;
+          for (std::int64_t boundary : split.rules.boundaryUs) {
+            if (boundary <= previous) {
+              result.feasible = false;
+              result.message =
+                  "custom split boundaries must be strictly ascending.";
+              result.errorCode = ErrorCode::InvalidArgument;
+              return Result<PlanResult>(std::move(result));
+            }
+            if (durationKnown && boundary >= durationUs) {
+              result.feasible = false;
+              result.message = "custom split boundary at " +
+                               std::to_string(boundary / 1000) +
+                               " ms is outside the source timeline.";
+              result.errorCode = ErrorCode::InvalidTimeRange;
+              return Result<PlanResult>(std::move(result));
+            }
+            previous = boundary;
+          }
+          break;
         }
-      } else {
-        const auto &merge = std::get<job::Merge>(request.payload);
-        shape.source =
-            merge.sources.empty() ? MediaSource{} : merge.sources.front();
-        shape.outputContainer =
-            merge.output.container.value_or(
-                sources.empty() ? Container::Mp4 : sources.front().container);
-        if (merge.sources.size() < 2) {
-          result.feasible = false;
-          result.message = "Merge needs at least two sources.";
-          result.errorCode = ErrorCode::InvalidArgument;
-          return Result<PlanResult>(std::move(result));
-        }
-        if (merge.rules.layout != MergeLayout::Sequential &&
-            merge.sources.size() != 2) {
+        case SplitMode::Chapters:
+        case SplitMode::Scenes:
+          // Read/analyzed at execution (real chapter markers, real scene
+          // detection); honest failure there when nothing is found.
+          break;
+      }
+      break;
+    }
+    case 6: { // Merge: sequential + spatial composition (mandate §27.4/§27.5).
+      const auto &merge = std::get<job::Merge>(request.payload);
+      shape.source =
+          merge.sources.empty() ? MediaSource{} : merge.sources.front();
+      shape.outputContainer =
+          merge.output.container.value_or(
+              sources.empty() ? Container::Mp4 : sources.front().container);
+      shape.timelineOp = true;
+      shape.allSourceAudioTracks = true;
+      // Merge audio/subtitle lanes are composition-specific; the executor
+      // owns their layout (silence fill / cue offsets / first-source shape).
+      shape.keepSubtitles = false;
+      // Every source must be readable by the candidate backend, not just
+      // the first (concat reads them all).
+      for (std::size_t i = 1; i < sources.size(); ++i) {
+        shape.readAlso.push_back(sources[i].container);
+      }
+      if (merge.sources.size() < 2) {
+        result.feasible = false;
+        result.message = "Merge needs at least two sources.";
+        result.errorCode = ErrorCode::InvalidArgument;
+        return Result<PlanResult>(std::move(result));
+      }
+      if (merge.rules.layout != MergeLayout::Sequential) {
+        shape.mergeSpatial = true;
+        if (merge.sources.size() != 2) {
           result.feasible = false;
           result.message = "Spatial merge requires exactly two sources.";
           result.errorCode = ErrorCode::InvalidArgument;
           return Result<PlanResult>(std::move(result));
         }
-        for (const MediaInfo &info : sources) {
-          if (!info.hasVideo() && merge.rules.layout != MergeLayout::Sequential) {
-            result.feasible = false;
-            result.message = "Spatial merge requires decodable video in "
-                             "every source.";
-            result.errorCode = ErrorCode::InvalidArgument;
-            return Result<PlanResult>(std::move(result));
-          }
+      }
+      for (const MediaInfo &info : sources) {
+        if (!info.hasVideo() && merge.rules.layout != MergeLayout::Sequential) {
+          result.feasible = false;
+          result.message = "Spatial merge requires decodable video in "
+                           "every source.";
+          result.errorCode = ErrorCode::InvalidArgument;
+          return Result<PlanResult>(std::move(result));
         }
       }
-      deferred = true;
       break;
     }
     case 7: { // ExtractAudio
@@ -622,6 +783,8 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
     case 8: { // ExtractFrames: gate on a decoder for the source video codec.
       const auto &frames = std::get<job::ExtractFrames>(request.payload);
       shape.source = frames.source;
+      shape.timelineOp = true;
+      shape.framesExtract = true;
       if (!source.hasVideo()) {
         result.feasible = false;
         result.message = "Frame extraction needs a video source.";
@@ -636,7 +799,47 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
         result.errorCode = ErrorCode::DecoderUnavailable;
         return Result<PlanResult>(std::move(result));
       }
-      deferred = true;
+      switch (frames.selection.mode) {
+        case FrameSelectionMode::Interval:
+          if (frames.selection.intervalUs <= 0) {
+            result.feasible = false;
+            result.message = "frame extraction interval must be positive.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case FrameSelectionMode::FrameRate:
+          if (frames.selection.frameRate.num <= 0 ||
+              frames.selection.frameRate.den <= 0) {
+            result.feasible = false;
+            result.message = "frame-rate sampling needs a positive rational "
+                             "rate.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case FrameSelectionMode::Count:
+          if (frames.selection.count <= 0) {
+            result.feasible = false;
+            result.message = "frame count must be positive.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case FrameSelectionMode::Selected:
+        case FrameSelectionMode::Current:
+          if (frames.selection.timestampsUs.empty()) {
+            result.feasible = false;
+            result.message = "explicit frame timestamps are missing.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+          break;
+        case FrameSelectionMode::AllInRange:
+        case FrameSelectionMode::Keyframes:
+        case FrameSelectionMode::SceneChanges:
+          break;
+      }
       break;
     }
     case 9: { // ExtractSubtitles: standalone sidecar extraction.
@@ -690,16 +893,9 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
                                             "unknown request payload"));
   }
 
-  // ----- Deferred operations: honest refusal ------------------------------
-  // Split, Merge, multi-range Cut and ExtractFrames are not executable in
-  // this build; the planner says so instead of planning a route that would
-  // fail mid-execution.
-  if (deferred) {
-    result.feasible = false;
-    result.errorCode = ErrorCode::UnsupportedOperation;
-    result.message = "operation not yet implemented in this build";
-    return Result<PlanResult>(std::move(result));
-  }
+  // The deferred refusals are retired: Cut / Split / Merge / ExtractFrames
+  // route for real now (timelineOps capability gate inside addCandidate;
+  // dedicated image pipelines for frame extraction below).
 
   // ----- Resolve requested output shape -------------------------------------
   const Container outContainer = shape.outputContainer;
@@ -952,6 +1148,22 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
     if (caps == nullptr) {
       return;
     }
+    // Timeline operations (Cut/Split/Merge) need the executor machinery
+    // (keyframe windows, checkpoints, multi-output composition); only
+    // backends that report it ever see such requests.
+    if (shape.timelineOp && !caps->timelineOps) {
+      return;
+    }
+    // Cut/Split carve per-window work: an executor that cannot honor
+    // windows would silently ignore them (the timeTrim contract).
+    if (shape.windowedTimeline && !caps->timeTrim) {
+      return;
+    }
+    // Spatial merges re-encode by construction (filter composition): never
+    // a stream-copy pipeline, whatever the codec intersection says.
+    if (shape.mergeSpatial && streamCopy) {
+      return;
+    }
     if (std::find(caps->writableContainers.begin(),
                   caps->writableContainers.end(),
                   outContainer) == caps->writableContainers.end()) {
@@ -961,6 +1173,15 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
                   caps->readableContainers.end(),
                   source.container) == caps->readableContainers.end()) {
       return;
+    }
+    // Merge reads every source, not just the first: the concat path
+    // demuxes them all.
+    for (Container extra : shape.readAlso) {
+      if (std::find(caps->readableContainers.begin(),
+                    caps->readableContainers.end(),
+                    extra) == caps->readableContainers.end()) {
+        return;
+      }
     }
     if (wantsVideo) {
       if (streamCopy) {
@@ -1216,8 +1437,9 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
 
   // Stream-copy first (never re-encode unnecessarily), then transcodes.
   // Extraction jobs already have their candidates; generating transcode
-  // candidates for a subtitle-only request would be meaningless.
-  if (!shape.subtitleExtract) {
+  // candidates for a subtitle-only or frame-extraction request would be
+  // meaningless.
+  if (!shape.subtitleExtract && !shape.framesExtract) {
     if (streamCopyIsValid &&
         (sameContainer ||
          features_.containerAccepts(outContainer, outVideoCodec))) {
@@ -1227,6 +1449,113 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
     }
     for (BackendId backend : caps_.registeredBackends()) {
       addCandidate(backend, false);
+    }
+  }
+
+  // ----- Frame-extraction candidates (mandate §29) --------------------------
+  // Dedicated image pipelines: demux + decode + process + image encode on
+  // a backend that implements the frame-identity machinery. The artifact
+  // set is a manifest + image files, never a media container: the
+  // sidecarExtension carries the manifest extension for output naming and
+  // validation switches to manifest-level checks.
+  if (shape.framesExtract) {
+    const auto &frames = std::get<job::ExtractFrames>(request.payload);
+    const char *formatName = "jpeg";
+    switch (frames.image.format) {
+      case ImageOutputRules::Format::Jpeg:
+        formatName = "jpeg";
+        break;
+      case ImageOutputRules::Format::Png:
+        formatName = "png";
+        break;
+      case ImageOutputRules::Format::WebP:
+        formatName = "webp";
+        break;
+    }
+    // Honest expected-count phrasing where the request fixes it.
+    std::string selection;
+    switch (frames.selection.mode) {
+      case FrameSelectionMode::AllInRange:
+        selection = std::string("all frames in range");
+        break;
+      case FrameSelectionMode::Interval:
+        selection = "every " + std::to_string(frames.selection.intervalUs / 1000) +
+                    " ms";
+        break;
+      case FrameSelectionMode::FrameRate:
+        selection = "at " +
+                    std::to_string(double(frames.selection.frameRate.num) /
+                                   double(frames.selection.frameRate.den)) +
+                    " fps";
+        break;
+      case FrameSelectionMode::Count:
+        selection = std::to_string(frames.selection.count) + " images";
+        break;
+      case FrameSelectionMode::Selected:
+      case FrameSelectionMode::Current:
+        selection = std::to_string(frames.selection.timestampsUs.size()) +
+                    " selected timestamps";
+        break;
+      case FrameSelectionMode::Keyframes:
+        selection = "keyframes only";
+        break;
+      case FrameSelectionMode::SceneChanges:
+        selection = "detected scene changes";
+        break;
+    }
+    for (BackendId backend : caps_.registeredBackends()) {
+      const auto *caps = caps_.capabilitiesOf(backend);
+      if (caps == nullptr || !caps->timelineOps) {
+        continue;
+      }
+      if (std::find(caps->readableContainers.begin(),
+                    caps->readableContainers.end(),
+                    source.container) == caps->readableContainers.end()) {
+        continue;
+      }
+      const auto decoders =
+          caps_.backendsFor(source.video.front().codec, CodecOp::Decode);
+      if (std::find(decoders.begin(), decoders.end(), backend) ==
+          decoders.end()) {
+        continue;
+      }
+      if (caps_.hasFailed(failedConfigKeyFor(backend, source, request,
+                                             outVideoCodec))) {
+        blockedByFailureRecord = true;
+        continue;
+      }
+      Candidate candidate;
+      Pipeline &pipeline = candidate.pipeline;
+      pipeline.stages.push_back({StageId::Demux, backend});
+      pipeline.stages.push_back({StageId::Decode, backend});
+      pipeline.stages.push_back({StageId::VideoProcessing, backend});
+      pipeline.stages.push_back({StageId::Encode, backend});
+      pipeline.videoCodec = outVideoCodec;
+      pipeline.audioCodec = AudioCodec::Aac; // unused lane (no audio output)
+      pipeline.container = outContainer;
+      pipeline.sidecarExtension = "json"; // the frames manifest
+      pipeline.sourceFrameRate =
+          source.hasVideo() && source.video.front().frameRate > 0.0
+              ? source.video.front().frameRate
+              : 0.0;
+      pipeline.videoStreamCopy = false;
+      pipeline.audioStreamCopy = false;
+      pipeline.subtitleStreamCopy = false;
+      const BackendPrior &prior = priorFor(backend);
+      candidate.throughput = prior.softwareFps; // decode-dominated
+      candidate.setupMs = prior.setupMs;
+      candidate.transferMs = prior.transferMsPerFrame;
+      candidate.usesHardware = false;
+      candidate.preferenceScore = 0.0;
+      pipeline.summary = std::string("extract frames: ") + selection + " (" +
+                         formatName + " images)";
+      candidates.push_back(std::move(candidate));
+    }
+    if (candidates.empty()) {
+      result.feasible = false;
+      result.message =
+          "No registered backend can extract frames from this source.";
+      return Result<PlanResult>(std::move(result));
     }
   }
 
@@ -1286,7 +1615,10 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
       });
   if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim &&
       !wantsTransform && !wantsAudioDsp && !wantsAdvancedAudio &&
-      !wantsGeometryChange && !(hdrSource && !anyStageDecoderToneMaps)) {
+      !wantsGeometryChange && !(hdrSource && !anyStageDecoderToneMaps) &&
+      // Timeline operations never compose across backends (v1): the
+      // keyframe-window / composition machinery is whole-pipeline only.
+      !shape.timelineOp) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&
@@ -1456,14 +1788,78 @@ Result<PlanResult> Planner::plan(const JobRequest &request,
       resolveRatePolicy(source, shape.compression, shape.budget);
 
   for (auto &candidate : candidates) {
+    // Timeline-operation summaries: the generic copy/transcode text is
+    // replaced with the operation's own (the executor later confirms the
+    // actually-taken strategy in the durable job summary).
+    if (shape.timelineOp && !shape.framesExtract) {
+      std::string opSummary;
+      const bool copy = candidate.pipeline.videoStreamCopy;
+      if (request.payload.index() == 4) { // Cut
+        opSummary = "cut " + std::to_string(shape.trimRanges.size()) +
+                    " ranges" +
+                    (copy ? " (keyframe-safe copy)" : " (exact transcode)");
+      } else if (request.payload.index() == 5) { // Split
+        std::string parts;
+        const auto &splitRules =
+            std::get<job::Split>(request.payload).rules;
+        switch (splitRules.mode) {
+          case SplitMode::EqualParts:
+            parts = std::to_string(splitRules.partCount) + " parts";
+            break;
+          case SplitMode::Duration: {
+            const std::int64_t durUs =
+                std::int64_t(source.durationSec * 1000000.0);
+            parts = std::to_string(
+                        std::max<std::int64_t>(1, (durUs + splitRules.partDurationUs - 1) /
+                                       splitRules.partDurationUs)) +
+                    " parts";
+            break;
+          }
+          case SplitMode::MaxSize: {
+            const std::int64_t partCount = std::max<std::int64_t>(
+                1, (source.sizeBytes + splitRules.maxSizeBytes - 1) /
+                       splitRules.maxSizeBytes);
+            parts = "~" + std::to_string(partCount) + " parts by size";
+            break;
+          }
+          case SplitMode::CustomTimestamps:
+            parts = std::to_string(splitRules.boundaryUs.size() + 1) +
+                    " parts at custom boundaries";
+            break;
+          case SplitMode::Chapters:
+            parts = "parts at chapter boundaries";
+            break;
+          case SplitMode::Scenes:
+            parts = "parts at detected scene changes";
+            break;
+        }
+        opSummary = "split into " + parts +
+                    (copy ? " (keyframe-safe copy)" : " (transcode)");
+      } else { // Merge
+        if (shape.mergeSpatial) {
+          opSummary = std::get<job::Merge>(request.payload).rules.layout ==
+                          MergeLayout::SideBySide
+                      ? "merge side-by-side (2 sources, transcode)"
+                      : "merge top-bottom (2 sources, transcode)";
+        } else {
+          opSummary = "merge " +
+                      std::to_string(
+                          std::get<job::Merge>(request.payload).sources.size()) +
+                      " sources" +
+                      (copy ? " (stream copy when compatible)"
+                            : " (normalized transcode)");
+        }
+      }
+      candidate.pipeline.summary = std::move(opSummary);
+    }
     PlannedPipeline planned;
     planned.pipeline = std::move(candidate.pipeline);
     planned.cost = scoreCandidate(candidate);
     planned.expectedThroughput = candidate.throughput;
     planned.setupLatencyMs = candidate.setupMs;
     planned.transferCostMs = candidate.transferMs;
-    if (shape.subtitleExtract) {
-      planned.estimatedOutputBytes = std::nullopt; // sidecar: unknown, honest
+    if (shape.subtitleExtract || shape.framesExtract) {
+      planned.estimatedOutputBytes = std::nullopt; // images: unknown, honest
     } else {
       planned.estimatedOutputBytes =
           estimateOutputBytes(source, planned.pipeline, shape.budget, rate);

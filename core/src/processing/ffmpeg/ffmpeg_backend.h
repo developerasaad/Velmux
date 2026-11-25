@@ -71,6 +71,29 @@ private:
   velmux::backend::ExecuteResult
   executeTranscodeSegmented(const velmux::backend::ExecuteParams &params,
                             const ExecutionIntent &intent);
+  // Timeline operations (mandate §27/§29).
+  // Multi-range Cut: retained intervals as keyframe-safe copy windows or
+  // exact transcode windows, assembled into ONE continuous output.
+  velmux::backend::ExecuteResult
+  executeCut(const velmux::backend::ExecuteParams &params,
+             const ExecutionIntent &intent);
+  // Split: six boundary strategies, per-part artifacts with checkpoints.
+  velmux::backend::ExecuteResult
+  executeSplit(const velmux::backend::ExecuteParams &params,
+               const ExecutionIntent &intent);
+  // Merge: sequential (compatibility-verified concat / normalization) and
+  // spatial (side-by-side / top-bottom composition).
+  velmux::backend::ExecuteResult
+  executeMerge(const velmux::backend::ExecuteParams &params,
+               const ExecutionIntent &intent);
+  // Spatial composition (mandate §27.5): exactly two sources.
+  velmux::backend::ExecuteResult
+  executeMergeSpatial(const velmux::backend::ExecuteParams &params,
+                      const ExecutionIntent &intent);
+  // Extract Frames: eight selection modes, JPEG/PNG/WebP images + manifest.
+  velmux::backend::ExecuteResult
+  executeExtractFrames(const velmux::backend::ExecuteParams &params,
+                       const ExecutionIntent &intent);
 };
 
 class FfmpegBackend final : public velmux::backend::IBackend {

@@ -1,0 +1,139 @@
+// Velmux — shared Kotlin Multiplatform / Compose Multiplatform UI module (UI-1).
+//
+// Physical layout (mandate §11.1):
+//   ui/mobile/src          commonMain Kotlin (ALL shared code, package com.velmux.mobile)
+//   ui/mobile/tests        commonTest Kotlin (JSON codecs, engine client with a fake
+//                          transport, jobs state mapping — executed through jvmTest)
+//   ui/mobile/src/jvmMain  JVM actuals: the headless "dev" transport (honest
+//                          engine-unavailable errors) — host verification target
+//   platform/android/host/ui-shared   androidMain actuals (JNI transport, SAF picker,
+//                          FileProvider share/open). Kept under platform/android per
+//                          the physical-ownership mandate; wired as an srcDir below.
+//   platform/ios/mobile    iosMain actuals (C interop transport via the frozen ABI,
+//                          document picker, platform services)
+//   platform/ios/interop/velmux.def  cinterop definition pointing at
+//                          core/include/velmux/abi.h (the frozen ABI v2 header)
+//
+// Targets:
+//   jvm()                  host verification: `./gradlew :ui:mobile:jvmTest` MUST pass
+//                          without an Android SDK.
+//   iosArm64/iosSimulatorArm64  klib compilation works on Linux; framework LINKING
+//                          (the Xcode product build, scripts/build.sh --ios) requires
+//                          Xcode. Do not attempt to link them here.
+//   androidTarget          created ONLY when an Android SDK is present
+//                          (`velmux.androidSdkAvailable`, set by settings.gradle.kts
+//                          from ANDROID_HOME/ANDROID_SDK_ROOT). The Android assembly
+//                          is a product build (scripts/build.sh --android resolves
+//                          the mandatory FFmpeg artifacts); host verification uses
+//                          the JVM target.
+import com.android.build.gradle.LibraryExtension
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    id("org.jetbrains.kotlin.multiplatform")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
+    id("org.jetbrains.compose")
+
+    // Android-side plugins are applied conditionally (see below): without an
+    // SDK the module configures as pure common/jvm/native code.
+    id("com.android.library") apply false
+    id("org.jetbrains.kotlin.android") apply false
+}
+
+val androidSdkAvailable: Boolean =
+    (extensions.extraProperties.get("velmux.androidSdkAvailable") as? Boolean)
+        ?: (System.getenv("ANDROID_HOME") != null ||
+            System.getenv("ANDROID_SDK_ROOT") != null)
+
+if (androidSdkAvailable) {
+    // KMP: the android target needs the Kotlin Android plugin plus an AGP
+    // library so :platform:android:host can consume this module as a project
+    // dependency (the shared code's Android compilation happens through the
+    // host app, never as a standalone Android build here).
+    apply(plugin = "org.jetbrains.kotlin.android")
+    apply(plugin = "com.android.library")
+}
+
+kotlin {
+    jvm()
+
+    // iOS: klib compilation only on Linux (linking needs Xcode).
+    val iosTargets = listOf(iosArm64(), iosSimulatorArm64())
+    iosTargets.forEach { target ->
+        target.compilations.getByName("main").cinterops.create("velmux") {
+            defFile(rootProject.layout.projectDirectory.file("platform/ios/interop/velmux.def"))
+        }
+    }
+
+    if (androidSdkAvailable) {
+        androidTarget {
+            compilations.all {
+                compilerOptions.configure {
+                    jvmTarget.set(JvmTarget.JVM_17)
+                }
+            }
+        }
+    }
+
+    sourceSets {
+        commonMain {
+            // Shared code root: ui/mobile/src (spec structure) in addition to
+            // the conventional src/commonMain/kotlin.
+            kotlin.srcDir("src")
+            dependencies {
+                implementation(compose.runtime)
+                implementation(compose.foundation)
+                implementation(compose.material3)
+                implementation(compose.ui)
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+            }
+        }
+        commonTest {
+            kotlin.srcDir("tests")
+            dependencies {
+                implementation(kotlin("test"))
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+            }
+        }
+        jvmMain.dependencies {
+            // The JVM "dev" transport needs nothing beyond the common deps.
+        }
+        iosMain {
+            // Physical ownership: the iOS actuals live under platform/ios.
+            kotlin.srcDir(rootProject.layout.projectDirectory.dir("platform/ios/mobile"))
+        }
+        if (androidSdkAvailable) {
+            androidMain {
+                // Physical ownership: the Android actuals live under
+                // platform/android (inside the host tree, which owns the
+                // Android platform sources of the shared UI).
+                kotlin.srcDir(
+                    rootProject.layout.projectDirectory
+                        .dir("platform/android/host/ui-shared")
+                )
+                dependencies {
+                    // rememberFilePicker (SAF document picker) and the
+                    // FileProvider share/open actuals.
+                    implementation("androidx.activity:activity-compose:1.9.3")
+                    implementation("androidx.core:core-ktx:1.15.0")
+                }
+            }
+        }
+    }
+}
+
+if (androidSdkAvailable) {
+    configure<LibraryExtension> {
+        namespace = "com.velmux.mobile.shared"
+        compileSdk = 35
+        defaultConfig {
+            minSdk = 26
+        }
+        compileOptions {
+            sourceCompatibility = JavaVersion.VERSION_17
+            targetCompatibility = JavaVersion.VERSION_17
+        }
+    }
+}

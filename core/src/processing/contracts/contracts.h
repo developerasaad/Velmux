@@ -201,6 +201,11 @@ struct ExecuteResult {
   // this). Conversion executors leave it empty; the job manager fills the
   // primary output entry from outputPath.
   std::vector<core::JobOutput> outputs;
+  // Runtime-composed pipeline summary (empty = keep the planned summary).
+  // Timeline operations fill it when the actually-taken strategy only
+  // becomes known during execution (keyframe-safe copy vs normalized
+  // transcode, actual part count, dropped subtitle lanes...).
+  std::string pipelineSummary;
 };
 
 // Whole-pipeline executor: runs every stage of `pipeline` that is assigned

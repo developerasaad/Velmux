@@ -25,6 +25,8 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/display.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
@@ -34,8 +36,10 @@ extern "C" {
 namespace velmux::ffmpeg {
 
 using namespace velmux::core;
+using velmux::backend::CancelToken;
 using velmux::backend::ExecuteParams;
 using velmux::backend::ExecuteResult;
+using velmux::backend::ProgressCallback;
 using velmux::backend::ProgressReport;
 
 // ---------------------------------------------------------------------------
@@ -133,6 +137,11 @@ struct AudioTrack {
   // Output side.
   int out = -1;
   std::int64_t samplesOut = 0; // pts bookkeeping in output samples
+  // Stream-copy lanes in RANGE runs rebase onto the window-local timeline;
+  // these hold the first written packet's rescaled pts/dts (the rebase
+  // origin, AV_NOPTS_VALUE until the first packet lands).
+  std::int64_t copyBasePts = AV_NOPTS_VALUE;
+  std::int64_t copyBaseDts = AV_NOPTS_VALUE;
 };
 
 struct CodecCleanup {
@@ -1165,24 +1174,22 @@ bool FfmpegExecutor::canExecute(const Pipeline &pipeline,
   }
   // Conversion-family operations the execution paths serve: VideoConvert,
   // AudioConvert, Crop, Trim (the trim payload of video-cutmerge),
-  // ExtractAudio and ExtractSubtitles. The four deferred operations
-  // (multi-range Cut, Split, Merge, ExtractFrames) have no executor in
-  // this build — the planner already refuses them with
-  // UnsupportedOperation; canExecute agrees honestly so no route is ever
-  // composed onto this backend.
+  // ExtractAudio and ExtractSubtitles — plus the timeline operations
+  // (multi-range Cut, Split, Merge, ExtractFrames) this executor now
+  // implements for real (keyframe-window copy, boundary strategies,
+  // compatibility-verified merge, frame identity).
   switch (request.payload.index()) {
     case 0: // VideoConvert
     case 1: // AudioConvert
     case 2: // Crop
     case 3: // Trim
+    case 4: // Cut (multi-range)
+    case 5: // Split
+    case 6: // Merge (sequential + spatial)
     case 7: // ExtractAudio
+    case 8: // ExtractFrames
     case 9: // ExtractSubtitles
       return true;
-    case 4: // Cut (multi-range): deferred
-    case 5: // Split: deferred
-    case 6: // Merge: deferred
-    case 8: // ExtractFrames: deferred
-      return false;
     default:
       return false;
   }
@@ -1203,13 +1210,8 @@ ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
         using Payload = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<Payload, job::Merge>) {
           return payload.sources.empty() ? nullptr : &payload.sources.front();
-        } else if constexpr (!std::is_same_v<Payload, job::Cut> &&
-                             !std::is_same_v<Payload, job::Split> &&
-                             !std::is_same_v<Payload, job::Merge> &&
-                             !std::is_same_v<Payload, job::ExtractFrames>) {
-          return &payload.source;
         } else {
-          return nullptr;
+          return &payload.source;
         }
       },
       params.request.payload);
@@ -1238,6 +1240,24 @@ ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
     return result;
   }
   const ExecutionIntent &intent = built.value();
+
+  // Timeline operations (mandate §27/§29): dedicated executors consume the
+  // intent plus their payload rules. They dispatch BEFORE the remux/
+  // transcode split — the per-window strategy (keyframe-safe copy vs exact
+  // transcode) is decided per range/part inside them, not by the planned
+  // pipeline's copy flags.
+  if (std::holds_alternative<job::Cut>(params.request.payload)) {
+    return executeCut(params, intent);
+  }
+  if (std::holds_alternative<job::Split>(params.request.payload)) {
+    return executeSplit(params, intent);
+  }
+  if (std::holds_alternative<job::ExtractFrames>(params.request.payload)) {
+    return executeExtractFrames(params, intent);
+  }
+  if (std::holds_alternative<job::Merge>(params.request.payload)) {
+    return executeMerge(params, intent);
+  }
 
   if (params.pipeline.videoStreamCopy && params.pipeline.audioStreamCopy) {
     // Burn-in rewrites video pixels; a copy pipeline can never serve it
@@ -3705,6 +3725,20 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       }
     }
     const bool isAudio = audioTrack != nullptr;
+    // Presentation time of this packet in µs (the range gates and the
+    // copy-lane rebase consume it; -1 when no usable timestamp exists).
+    std::int64_t pktUs = -1;
+    {
+      const AVStream *pktStream =
+          cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
+      if (cleanup.packet->pts != AV_NOPTS_VALUE) {
+        pktUs = av_rescale_q(cleanup.packet->pts, pktStream->time_base,
+                             AVRational{1, 1000000});
+      } else if (cleanup.packet->dts != AV_NOPTS_VALUE) {
+        pktUs = av_rescale_q(cleanup.packet->dts, pktStream->time_base,
+                             AVRational{1, 1000000});
+      }
+    }
     // Range gate on the demux side: packets at/after the end stop the run
     // (their content belongs to the next segment). Packets BEFORE the
     // start are NOT skipped here: after the backward seek they begin at
@@ -3714,14 +3748,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     // frames. The decoded frames before the boundary are discarded by the
     // frame-level gates below (they exist for exactly this).
     if (rangeBounded) {
-      const AVStream *pktStream =
-          cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
-      const std::int64_t pktUs =
-          cleanup.packet->pts == AV_NOPTS_VALUE
-              ? -1
-              : av_rescale_q(cleanup.packet->pts, pktStream->time_base,
-                             AVRational{1, 1000000});
-      if (pktUs >= rangeEndUs && (isVideo || isAudio)) {
+      if (pktUs >= 0 && pktUs >= rangeEndUs && (isVideo || isAudio)) {
         rangeDone = true;
         av_packet_unref(cleanup.packet);
         break;
@@ -3884,20 +3911,52 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     } else if (isAudio && audioTrack->copy) {
       // Stream-copy lane: packets pass straight to the output stream.
       // Ownership follows the remux path's move_ref discipline.
+      //
+      // Range runs rebase onto the window-local timeline (mirroring the
+      // video/encode lanes): packets before the range start belong to an
+      // earlier window — dropped here, within one audio frame's tolerance
+      // so the priming edge survives — and kept packets are rebased by the
+      // first one that lands. Whole-file runs keep source timestamps.
+      if (rangeBounded && pktUs >= 0 && pktUs < rangeStartUs - 25000) {
+        av_packet_unref(cleanup.packet);
+        continue;
+      }
       AVPacket *outPacket = av_packet_alloc();
       av_packet_move_ref(outPacket, cleanup.packet);
       const AVStream *srcStream =
           cleanup.in->streams[std::size_t(outPacket->stream_index)];
+      const AVStream *dstStream =
+          cleanup.out->streams[std::size_t(audioTrack->out)];
       const AVRounding rounding = static_cast<AVRounding>(
           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
-      outPacket->pts = av_rescale_q_rnd(
-          outPacket->pts, srcStream->time_base,
-          cleanup.out->streams[std::size_t(audioTrack->out)]->time_base,
-          rounding);
-      outPacket->dts = av_rescale_q_rnd(
-          outPacket->dts, srcStream->time_base,
-          cleanup.out->streams[std::size_t(audioTrack->out)]->time_base,
-          rounding);
+      if (outPacket->pts != AV_NOPTS_VALUE) {
+        outPacket->pts = av_rescale_q_rnd(
+            outPacket->pts, srcStream->time_base, dstStream->time_base,
+            rounding);
+        if (rangeBounded) {
+          if (audioTrack->copyBasePts == AV_NOPTS_VALUE) {
+            audioTrack->copyBasePts = outPacket->pts;
+          }
+          outPacket->pts -= audioTrack->copyBasePts;
+          if (outPacket->pts < 0) {
+            outPacket->pts = 0;
+          }
+        }
+      }
+      if (outPacket->dts != AV_NOPTS_VALUE) {
+        outPacket->dts = av_rescale_q_rnd(
+            outPacket->dts, srcStream->time_base, dstStream->time_base,
+            rounding);
+        if (rangeBounded) {
+          if (audioTrack->copyBaseDts == AV_NOPTS_VALUE) {
+            audioTrack->copyBaseDts = outPacket->dts;
+          }
+          outPacket->dts -= audioTrack->copyBaseDts;
+          if (outPacket->dts < 0) {
+            outPacket->dts = 0;
+          }
+        }
+      }
       outPacket->duration = av_rescale_q(
           outPacket->duration, srcStream->time_base,
           cleanup.out->streams[std::size_t(audioTrack->out)]->time_base);
@@ -4672,8 +4731,4402 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
 }
 
 // ---------------------------------------------------------------------------
+// Timeline operations (mandate §27 Cut & Split, §27.4/§27.5 Merge, §29
+// Extract Frames). The helpers below build on the remux/transcode/segment
+// machinery above: real keyframe-timeline analysis (packet flags, no
+// decode), keyframe-safe window copies into concat-compatible segments,
+// real scene detection through the select filter, and multi-output
+// manifests.
+// ---------------------------------------------------------------------------
+
+// Tolerance for "boundary lands on a random-access point": below one frame
+// duration at any sane rate, above time-base rounding noise.
+constexpr std::int64_t kBoundaryTolUs = 1000;
+// One audio frame of priming tolerance for window starts (an AAC frame at
+// 44.1 kHz is ~23 ms; keeping one frame's worth of pre-boundary audio
+// avoids dead air at segment heads).
+constexpr std::int64_t kAudioPrimingTolUs = 25000;
+
+// One demux pass over the video stream: keyframe presentation times
+// (AV_PKT_FLAG_KEY — REAL random-access flags, never assumed), the last
+// packet time and the container duration. Memory is bounded: only
+// keyframe timestamps are retained (a whole-video frame list would violate
+// the streaming requirement; this is packet metadata).
+struct VideoTimeline {
+  std::vector<std::int64_t> keyframeUs; // ascending
+  std::int64_t lastPacketUs = -1;
+  std::int64_t durationUs = 0;
+  bool hasVideo = false;
+};
+
+bool scanVideoTimeline(const std::string &path, const CancelToken *cancel,
+                       VideoTimeline &out, std::string &reason) {
+  AVFormatContext *in = nullptr;
+  if (avformat_open_input(&in, path.c_str(), nullptr, nullptr) != 0) {
+    reason = "cannot open the source";
+    return false;
+  }
+  if (avformat_find_stream_info(in, nullptr) < 0) {
+    avformat_close_input(&in);
+    reason = "cannot read stream info";
+    return false;
+  }
+  if (in->duration != AV_NOPTS_VALUE && in->duration > 0) {
+    out.durationUs = av_rescale_q(in->duration, AVRational{1, AV_TIME_BASE},
+                                  AVRational{1, 1000000});
+  }
+  int videoStream = -1;
+  for (unsigned i = 0; i < in->nb_streams; ++i) {
+    if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      videoStream = int(i);
+      break;
+    }
+  }
+  out.hasVideo = videoStream >= 0;
+  if (videoStream >= 0) {
+    const AVRational tb = in->streams[std::size_t(videoStream)]->time_base;
+    AVPacket *pkt = av_packet_alloc();
+    while (av_read_frame(in, pkt) >= 0) {
+      if (cancel != nullptr && cancel->isCancelled()) {
+        av_packet_unref(pkt);
+        av_packet_free(&pkt);
+        avformat_close_input(&in);
+        reason = "cancelled";
+        return false;
+      }
+      if (pkt->stream_index == videoStream && pkt->pts != AV_NOPTS_VALUE) {
+        const std::int64_t us =
+            av_rescale_q(pkt->pts, tb, AVRational{1, 1000000});
+        out.lastPacketUs = std::max(out.lastPacketUs, us);
+        if ((pkt->flags & AV_PKT_FLAG_KEY) != 0) {
+          out.keyframeUs.push_back(us);
+        }
+      }
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+  }
+  avformat_close_input(&in);
+  return true;
+}
+
+// A boundary time lands on a random-access point (within rounding
+// tolerance).
+bool boundaryOnKeyframe(const VideoTimeline &timeline, std::int64_t us) {
+  const auto it = std::lower_bound(timeline.keyframeUs.begin(),
+                                   timeline.keyframeUs.end(),
+                                   us - kBoundaryTolUs);
+  return it != timeline.keyframeUs.end() && *it <= us + kBoundaryTolUs;
+}
+
+// A window START is copy-safe when the backward seek lands exactly on it:
+// a keyframe exists at the boundary (the demuxer then begins AT the
+// window, so no content before it leaks in — the honest exact start).
+bool windowStartCopySafe(const VideoTimeline &timeline, std::int64_t us) {
+  return timeline.hasVideo && boundaryOnKeyframe(timeline, us);
+}
+
+// A window END is copy-safe when the first packet at/after it is a
+// keyframe (everything before it forms complete GOPs — no dangling
+// references into the removed range) or no content exists at/after it
+// (EOF: the window runs to the natural end).
+bool windowEndCopySafe(const VideoTimeline &timeline, std::int64_t us) {
+  if (!timeline.hasVideo) {
+    return false;
+  }
+  if (boundaryOnKeyframe(timeline, us)) {
+    return true;
+  }
+  return timeline.lastPacketUs >= 0 &&
+         us > timeline.lastPacketUs + kBoundaryTolUs;
+}
+
+// Retained intervals = complement of the removed ranges over
+// [0, durationUs] (normalized defensively here, exactly like the session
+// manager and planner do; durationUs < 0 treats the tail as open-ended).
+// Empty result = the removal covers the whole timeline.
+std::vector<TimeRange> retainedRangesOf(const std::vector<TimeRange> &removed,
+                                        std::int64_t durationUs) {
+  std::vector<TimeRange> sorted = removed;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const TimeRange &a, const TimeRange &b) {
+              return a.startUs < b.startUs;
+            });
+  const std::int64_t totalUs =
+      durationUs > 0 ? durationUs : (std::int64_t(1) << 40);
+  std::vector<TimeRange> merged;
+  for (const TimeRange &range : sorted) {
+    if (!merged.empty() &&
+        (range.startUs <= merged.back().endUs ||
+         (merged.back().endUs < 0 && range.startUs <= totalUs))) {
+      if (merged.back().endUs < 0 || range.endUs < 0) {
+        merged.back().endUs = -1;
+      } else {
+        merged.back().endUs = std::max(merged.back().endUs, range.endUs);
+      }
+    } else {
+      merged.push_back(range);
+    }
+  }
+  std::vector<TimeRange> retained;
+  std::int64_t cursor = 0;
+  for (const TimeRange &range : merged) {
+    const std::int64_t start = std::max<std::int64_t>(range.startUs, 0);
+    const std::int64_t end = range.endUs < 0 ? totalUs : range.endUs;
+    if (start > cursor) {
+      retained.push_back(
+          TimeRange{cursor, durationUs > 0 ? std::min(start, totalUs) : start});
+    }
+    cursor = std::max(cursor, end);
+    if (cursor >= totalUs) {
+      cursor = totalUs;
+      break;
+    }
+  }
+  if (cursor < totalUs) {
+    retained.push_back(TimeRange{cursor, -1});
+  }
+  return retained;
+}
+
+// Packet-copies [startUs, endUs) (endUs < 0 = open-ended) into its own file
+// with a REBASED, per-stream-zero timeline (concat-demuxer compatible:
+// each segment starts at pts 0). Mirrors executeRemux's stream selection,
+// BSF, metadata and write-error discipline; adds the window gates and the
+// rebasing. Only called for keyframe-safe windows.
+bool copyWindowSegment(const ExecuteParams &params,
+                       const ExecutionIntent &intent,
+                       const std::string &inPath, std::int64_t startUs,
+                       std::int64_t endUs, const std::string &outPath,
+                       bool includeAttachedPics, int &writeRc) {
+  writeRc = 0;
+  AVFormatContext *in = nullptr;
+  AVFormatContext *out = nullptr;
+  std::vector<AVBSFContext *> bitstreamFilters;
+  AVPacket *pkt = av_packet_alloc();
+  // Per output stream: rebase origins (first written packet's rescaled
+  // pts/dts in the OUTPUT stream's time base).
+  std::unordered_map<int, std::int64_t> basePts;
+  std::unordered_map<int, std::int64_t> baseDts;
+  bool cancelled = false;
+  bool writeFailed = false;
+  bool ok = false;
+  do {
+    if (avformat_open_input(&in, inPath.c_str(), nullptr, nullptr) != 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      break;
+    }
+    if (avformat_alloc_output_context2(
+            &out, nullptr, avFormatNameFor(params.pipeline.container),
+            outPath.c_str()) < 0 ||
+        out == nullptr) {
+      break;
+    }
+
+    // Stream selection (the same policy as executeRemux: video when
+    // wanted; the intent's audio ordinals; subtitles when preserved;
+    // attached pictures only on window zero).
+    std::vector<int> inIndexOfOut;
+    int audioOrdinal = 0;
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      const AVStream *inStream = in->streams[i];
+      const AVMediaType type = inStream->codecpar->codec_type;
+      bool keep = false;
+      if (type == AVMEDIA_TYPE_VIDEO) {
+        const bool isPic =
+            (inStream->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0;
+        keep = isPic ? (includeAttachedPics && intent.preserveCoverArt)
+                     : intent.wantsVideo;
+      } else if (type == AVMEDIA_TYPE_AUDIO) {
+        if (audioCodecFromAv(inStream->codecpar->codec_id).has_value()) {
+          keep = intent.wantsAudio &&
+                 std::find(intent.audioSourceOrdinals.begin(),
+                           intent.audioSourceOrdinals.end(),
+                           audioOrdinal) !=
+                     intent.audioSourceOrdinals.end();
+          ++audioOrdinal;
+        }
+      } else if (type == AVMEDIA_TYPE_SUBTITLE) {
+        keep = intent.subtitles.keepSubtitles;
+      }
+      if (!keep) {
+        continue;
+      }
+      AVStream *outStream = avformat_new_stream(out, nullptr);
+      if (outStream == nullptr) {
+        continue;
+      }
+      avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
+      outStream->codecpar->codec_tag = 0;
+      // Container-mandated bitstream transformation (spec §31).
+      const AVCodecID cid = inStream->codecpar->codec_id;
+      const bool isTs = strcmp(out->oformat->name, "mpegts") == 0;
+      if ((cid == AV_CODEC_ID_H264 || cid == AV_CODEC_ID_HEVC) && isTs) {
+        const char *bsfName =
+            cid == AV_CODEC_ID_H264 ? "h264_mp4toannexb" : "hevc_mp4toannexb";
+        const AVBitStreamFilter *bsf = av_bsf_get_by_name(bsfName);
+        AVBSFContext *bsfCtx = nullptr;
+        if (bsf != nullptr && av_bsf_alloc(bsf, &bsfCtx) == 0) {
+          avcodec_parameters_copy(bsfCtx->par_in, inStream->codecpar);
+          bsfCtx->time_base_in = inStream->time_base;
+          if (av_bsf_init(bsfCtx) == 0) {
+            bitstreamFilters.push_back(bsfCtx);
+          } else {
+            av_bsf_free(&bsfCtx);
+          }
+        }
+      }
+      inIndexOfOut.push_back(int(i));
+    }
+    if (inIndexOfOut.empty()) {
+      break;
+    }
+
+    // Metadata copies through, then the familiar-field intentions apply.
+    av_dict_copy(&out->metadata, in->metadata, AV_DICT_DONT_OVERWRITE);
+    for (std::size_t k = 0;
+         k < inIndexOfOut.size() && k < out->nb_streams; ++k) {
+      av_dict_copy(&out->streams[k]->metadata,
+                   in->streams[std::size_t(inIndexOfOut[k])]->metadata,
+                   AV_DICT_DONT_OVERWRITE);
+    }
+    applyMetadataIntention(&out->metadata, intent.metadata);
+
+    // Seek to the keyframe AT/BEFORE the window start (the caller verified
+    // the start is keyframe-safe: the seek lands exactly on the boundary).
+    if (startUs > 0) {
+      int seekStream = 0;
+      for (unsigned i = 0; i < in->nb_streams; ++i) {
+        if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+            (in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+          seekStream = int(i);
+          break;
+        }
+      }
+      const std::int64_t target = av_rescale_q(
+          startUs, AVRational{1, 1000000},
+          in->streams[std::size_t(seekStream)]->time_base);
+      if (avformat_seek_file(in, seekStream, INT64_MIN, target, INT64_MAX,
+                             AVSEEK_FLAG_BACKWARD) < 0) {
+        break;
+      }
+    }
+
+    if (!(out->oformat->flags & AVFMT_NOFILE)) {
+      const int ioRc = avio_open(&out->pb, outPath.c_str(), AVIO_FLAG_WRITE);
+      if (ioRc < 0) {
+        writeRc = ioRc;
+        break;
+      }
+    }
+    if (avformat_write_header(out, nullptr) < 0) {
+      writeRc = AVERROR(EIO);
+      break;
+    }
+
+    const std::int64_t totalBytes =
+        in->pb != nullptr ? avio_size(in->pb) : 0;
+    std::int64_t processedPackets = 0;
+    while (av_read_frame(in, pkt) >= 0) {
+      if (params.cancel && params.cancel->isCancelled()) {
+        cancelled = true;
+        av_packet_unref(pkt);
+        break;
+      }
+      int outIndex = -1;
+      for (std::size_t k = 0; k < inIndexOfOut.size(); ++k) {
+        if (inIndexOfOut[k] == pkt->stream_index) {
+          outIndex = int(k);
+          break;
+        }
+      }
+      if (outIndex < 0) {
+        av_packet_unref(pkt);
+        continue;
+      }
+      const AVStream *srcStream = in->streams[std::size_t(pkt->stream_index)];
+      const AVMediaType type = srcStream->codecpar->codec_type;
+      const bool isPic =
+          (srcStream->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0;
+      std::int64_t pktUs = -1;
+      if (pkt->pts != AV_NOPTS_VALUE) {
+        pktUs = av_rescale_q(pkt->pts, srcStream->time_base,
+                             AVRational{1, 1000000});
+      } else if (pkt->dts != AV_NOPTS_VALUE) {
+        pktUs = av_rescale_q(pkt->dts, srcStream->time_base,
+                             AVRational{1, 1000000});
+      }
+      // Window gates. Timeline content: video strictly inside the window
+      // (the start snapped to its keyframe; anything before is seek
+      // overshoot), audio with one frame of priming tolerance, subtitle
+      // cues that START before the end (they continue into the segment,
+      // rebased and clamped to zero — the same policy as the transcode
+      // path's subtitle lane). Attached pictures are metadata: copied
+      // regardless of the window.
+      if (!isPic) {
+        if (type == AVMEDIA_TYPE_VIDEO) {
+          if (pktUs >= 0 && pktUs < startUs - kBoundaryTolUs) {
+            av_packet_unref(pkt);
+            continue;
+          }
+          if (endUs >= 0 && pktUs >= endUs) {
+            av_packet_unref(pkt);
+            break; // past the window: packet copy is done
+          }
+        } else if (type == AVMEDIA_TYPE_AUDIO) {
+          if (pktUs >= 0 && pktUs < startUs - kAudioPrimingTolUs) {
+            av_packet_unref(pkt);
+            continue;
+          }
+          if (endUs >= 0 && pktUs >= endUs) {
+            av_packet_unref(pkt);
+            break;
+          }
+        } else if (type == AVMEDIA_TYPE_SUBTITLE) {
+          if (endUs >= 0 && pktUs >= endUs) {
+            av_packet_unref(pkt);
+            continue; // later windows own this cue
+          }
+        }
+      }
+
+      // BSF (mirrors executeRemux).
+      AVPacket *toWrite = pkt;
+      for (auto *bsfCtx : bitstreamFilters) {
+        if (bsfCtx->par_in->codec_id == srcStream->codecpar->codec_id) {
+          if (av_bsf_send_packet(bsfCtx, pkt) == 0) {
+            AVPacket *filtered = av_packet_alloc();
+            if (av_bsf_receive_packet(bsfCtx, filtered) == 0) {
+              toWrite = filtered;
+              av_packet_unref(pkt);
+            } else {
+              av_packet_free(&filtered);
+            }
+          }
+          break;
+        }
+      }
+
+      AVPacket *outPacket = av_packet_alloc();
+      const int srcStreamIndex = toWrite->stream_index;
+      av_packet_move_ref(outPacket, toWrite);
+      if (toWrite != pkt) {
+        av_packet_free(&toWrite); // filtered shell, now empty
+      }
+      outPacket->stream_index = outIndex;
+      const AVStream *dstStream = out->streams[std::size_t(outIndex)];
+      const AVRounding rounding = static_cast<AVRounding>(
+          AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+      const bool rebase = !isPic;
+      if (outPacket->pts != AV_NOPTS_VALUE) {
+        std::int64_t pts =
+            av_rescale_q_rnd(outPacket->pts, srcStream->time_base,
+                             dstStream->time_base, rounding);
+        if (rebase) {
+          if (type == AVMEDIA_TYPE_SUBTITLE) {
+            // Cue timing rebases by the window start (clamped at zero).
+            const std::int64_t startDst = av_rescale_q(
+                startUs, AVRational{1, 1000000}, dstStream->time_base);
+            pts -= startDst;
+            if (pts < 0) {
+              pts = 0;
+            }
+          } else {
+            const auto it = basePts.find(outIndex);
+            if (it == basePts.end()) {
+              basePts.emplace(outIndex, pts);
+              pts = 0;
+            } else {
+              pts -= it->second;
+              if (pts < 0) {
+                pts = 0;
+              }
+            }
+          }
+        }
+        outPacket->pts = pts;
+      }
+      if (outPacket->dts != AV_NOPTS_VALUE) {
+        std::int64_t dts =
+            av_rescale_q_rnd(outPacket->dts, srcStream->time_base,
+                             dstStream->time_base, rounding);
+        if (rebase && type != AVMEDIA_TYPE_SUBTITLE) {
+          const auto it = baseDts.find(outIndex);
+          if (it == baseDts.end()) {
+            baseDts.emplace(outIndex, dts);
+            dts = 0;
+          } else {
+            dts -= it->second;
+            if (dts < 0) {
+              dts = 0;
+            }
+          }
+        }
+        outPacket->dts = dts;
+      }
+      if (outPacket->duration > 0) {
+        outPacket->duration =
+            av_rescale_q(outPacket->duration, srcStream->time_base,
+                         dstStream->time_base);
+      }
+      outPacket->pos = -1;
+      (void)srcStreamIndex;
+      const int frameRc = av_interleaved_write_frame(out, outPacket);
+      if (frameRc < 0) {
+        writeRc = frameRc;
+        writeFailed = true;
+      }
+      av_packet_free(&outPacket);
+      av_packet_unref(pkt);
+      ++processedPackets;
+      if (writeFailed) {
+        break;
+      }
+      if (params.onProgress && totalBytes > 0 && (processedPackets % 64) == 0) {
+        ProgressReport report;
+        report.totalBytes = totalBytes;
+        report.processedBytes = in->pb != nullptr ? avio_tell(in->pb) : 0;
+        report.fraction = double(report.processedBytes) / double(totalBytes);
+        params.onProgress(report);
+      }
+    }
+    if (writeFailed || cancelled) {
+      break;
+    }
+    av_write_trailer(out);
+    ok = true;
+  } while (false);
+  for (auto *bsfCtx : bitstreamFilters) {
+    av_bsf_free(&bsfCtx);
+  }
+  av_packet_free(&pkt);
+  if (out != nullptr) {
+    if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb != nullptr) {
+      avio_closep(&out->pb);
+    }
+    avformat_free_context(out);
+  }
+  if (in != nullptr) {
+    avformat_close_input(&in);
+  }
+  if (!ok) {
+    std::error_code ec;
+    std::filesystem::remove(outPath, ec);
+  }
+  (void)cancelled; // the caller re-checks the token and maps Cancelled
+  return ok;
+}
+
+// Real scene analysis (mandate §27.3): decode pass through
+// select='gt(scene,THRESHOLD)' — the buffersink emits exactly the selected
+// frames and their pts are the scene boundaries. Bounded memory: only
+// timestamps are collected; frames flow through the graph one at a time.
+bool detectSceneChanges(const std::string &path, double threshold,
+                        const CancelToken *cancel,
+                        std::vector<std::int64_t> &ptsUs, std::string &reason,
+                        const std::function<bool()> *onFrame = nullptr) {
+  AVFormatContext *in = nullptr;
+  AVCodecContext *dec = nullptr;
+  AVFilterGraph *graph = nullptr;
+  AVFilterContext *src = nullptr;
+  AVFilterContext *sink = nullptr;
+  AVPacket *pkt = av_packet_alloc();
+  AVFrame *frame = av_frame_alloc();
+  bool ok = false;
+  do {
+    if (avformat_open_input(&in, path.c_str(), nullptr, nullptr) != 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      reason = "cannot open the source";
+      break;
+    }
+    int videoStream = -1;
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+          (in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+        videoStream = int(i);
+        break;
+      }
+    }
+    if (videoStream < 0) {
+      reason = "the source has no video stream";
+      break;
+    }
+    const AVCodec *decCodec =
+        avcodec_find_decoder(in->streams[std::size_t(videoStream)]->codecpar->codec_id);
+    if (decCodec == nullptr) {
+      reason = "no decoder for the video stream";
+      break;
+    }
+    dec = avcodec_alloc_context3(decCodec);
+    avcodec_parameters_to_context(
+        dec, in->streams[std::size_t(videoStream)]->codecpar);
+    dec->pkt_timebase = in->streams[std::size_t(videoStream)]->time_base;
+    if (dec->time_base.num <= 0 || dec->time_base.den <= 0) {
+      dec->time_base = in->streams[std::size_t(videoStream)]->time_base;
+    }
+    if (avcodec_open2(dec, decCodec, nullptr) < 0) {
+      reason = "cannot open the video decoder";
+      break;
+    }
+
+    graph = avfilter_graph_alloc();
+    const AVFilter *srcFilter = avfilter_get_by_name("buffer");
+    const AVFilter *sinkFilter = avfilter_get_by_name("buffersink");
+    if (graph == nullptr || srcFilter == nullptr || sinkFilter == nullptr) {
+      reason = "cannot allocate the scene filter graph";
+      break;
+    }
+    char srcArgs[512];
+    AVRational sar = dec->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) {
+      sar = AVRational{0, 1};
+    }
+    std::snprintf(srcArgs, sizeof(srcArgs),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  dec->width, dec->height, dec->pix_fmt,
+                  dec->time_base.num, dec->time_base.den, sar.num, sar.den);
+    if (avfilter_graph_create_filter(&src, srcFilter, "in", srcArgs, nullptr,
+                                     graph) < 0 ||
+        avfilter_graph_create_filter(&sink, sinkFilter, "out", nullptr,
+                                     nullptr, graph) < 0) {
+      reason = "cannot create the scene filter endpoints";
+      break;
+    }
+    char expr[64];
+    std::snprintf(expr, sizeof(expr), "gt(scene,%.6f)", threshold);
+    const std::string graphDesc = std::string("select='") + expr + "'";
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+    bool graphOk = outputs != nullptr && inputs != nullptr;
+    if (graphOk) {
+      outputs->name = av_strdup("in");
+      outputs->filter_ctx = src;
+      outputs->pad_idx = 0;
+      outputs->next = nullptr;
+      inputs->name = av_strdup("out");
+      inputs->filter_ctx = sink;
+      inputs->pad_idx = 0;
+      inputs->next = nullptr;
+      graphOk = avfilter_graph_parse_ptr(graph, graphDesc.c_str(), &inputs,
+                                         &outputs, nullptr) >= 0;
+    }
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (graphOk) {
+      graphOk = avfilter_graph_config(graph, nullptr) >= 0;
+    }
+    if (!graphOk) {
+      reason = "cannot configure the scene filter graph";
+      break;
+    }
+
+    // Decode pass: every frame flows through the graph; the sink yields
+    // exactly the scene-change frames.
+    const AVRational sinkTb = av_buffersink_get_time_base(sink);
+    bool cancelled = false;
+    bool eof = false;
+    while (!eof && !cancelled) {
+      if (cancel != nullptr && cancel->isCancelled()) {
+        cancelled = true;
+        break;
+      }
+      int readRc = av_read_frame(in, pkt);
+      if (readRc < 0) {
+        // Demux EOF: drain the decoder, then the graph.
+        eof = true;
+        avcodec_send_packet(dec, nullptr);
+      } else if (pkt->stream_index == videoStream) {
+        if (avcodec_send_packet(dec, pkt) != 0) {
+          av_packet_unref(pkt);
+          continue;
+        }
+      }
+      if (readRc >= 0) {
+        av_packet_unref(pkt);
+      }
+      while (avcodec_receive_frame(dec, frame) == 0) {
+        if (frame->pts != AV_NOPTS_VALUE) {
+          av_buffersrc_add_frame_flags(src, frame,
+                                       AV_BUFFERSRC_FLAG_KEEP_REF);
+        } else {
+          av_buffersrc_add_frame_flags(src, frame,
+                                       AV_BUFFERSRC_FLAG_KEEP_REF);
+        }
+        AVFrame *selected = av_frame_alloc();
+        while (av_buffersink_get_frame(sink, selected) >= 0) {
+          if (selected->pts != AV_NOPTS_VALUE) {
+            ptsUs.push_back(av_rescale_q(selected->pts, sinkTb,
+                                         AVRational{1, 1000000}));
+          }
+          av_frame_unref(selected);
+        }
+        av_frame_free(&selected);
+        av_frame_unref(frame);
+        if (onFrame != nullptr && (*onFrame)()) {
+          cancelled = true;
+          break;
+        }
+      }
+    }
+    if (cancelled) {
+      reason = "cancelled";
+      break;
+    }
+    // Graph tail: the select filter holds one reference frame for the
+    // score comparison; flush it.
+    if (av_buffersrc_add_frame(src, nullptr) >= 0) {
+      AVFrame *selected = av_frame_alloc();
+      while (av_buffersink_get_frame(sink, selected) >= 0) {
+        if (selected->pts != AV_NOPTS_VALUE) {
+          ptsUs.push_back(av_rescale_q(selected->pts, sinkTb,
+                                       AVRational{1, 1000000}));
+        }
+        av_frame_unref(selected);
+      }
+      av_frame_free(&selected);
+    }
+    std::sort(ptsUs.begin(), ptsUs.end());
+    ok = true;
+  } while (false);
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
+  avfilter_graph_free(&graph);
+  avcodec_free_context(&dec);
+  if (in != nullptr) {
+    avformat_close_input(&in);
+  }
+  return ok;
+}
+
+// Chapter starts of a container, in µs (REAL AVFormatContext->chapters;
+// empty when the container carries none).
+std::vector<std::int64_t> chapterStartsUs(const AVFormatContext *fmt) {
+  std::vector<std::int64_t> starts;
+  for (unsigned i = 0; i < fmt->nb_chapters; ++i) {
+    const AVChapter *chapter = fmt->chapters[i];
+    if (chapter->start < 0) {
+      continue;
+    }
+    starts.push_back(av_rescale_q(chapter->start, chapter->time_base,
+                                  AVRational{1, 1000000}));
+  }
+  std::sort(starts.begin(), starts.end());
+  return starts;
+}
+
+// Minimal JSON string escaping for the frames manifest.
+std::string manifestJsonEscape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (const char c : s) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+  return out;
+}
+
+// Writes a file with full-disk mapping (ENOSPC -> the caller maps it to
+// the terminal StorageFull error through writeRc).
+bool writeFileBytes(const std::string &path, const std::string &data,
+                    int &writeRc) {
+  writeRc = 0;
+  std::FILE *f = std::fopen(path.c_str(), "wb");
+  if (f == nullptr) {
+    writeRc = errno == ENOSPC ? AVERROR(ENOSPC) : AVERROR(EIO);
+    return false;
+  }
+  const bool wrote = data.empty() || std::fwrite(data.data(), 1, data.size(), f) == data.size();
+  const bool flushed = std::fflush(f) == 0;
+  std::fclose(f);
+  if (!wrote || !flushed) {
+    if (errno == ENOSPC) {
+      writeRc = AVERROR(ENOSPC);
+    } else {
+      writeRc = AVERROR(EIO);
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return false;
+  }
+  return true;
+}
+
+// Segment scratch directory for a job (stable across runs; unique enough
+// for direct executor invocations without a job id).
+std::string timelineScratchDir(const ExecuteParams &params) {
+  static std::atomic<std::uint64_t> directSeq{0};
+  const std::filesystem::path outFs(params.outputPath);
+  std::string token = params.jobId;
+  if (token.empty()) {
+    token = "direct-" + std::to_string(::getpid()) + "-" +
+            std::to_string(directSeq.fetch_add(1));
+  }
+  return (outFs.parent_path() / ("velmux-seg-" + token)).string();
+}
+
+// Wraps per-window progress into whole-job progress over the retained
+// timeline (the segmented transcode uses the same pattern).
+ProgressCallback windowProgressWrapper(const ExecuteParams &params,
+                                        std::int64_t doneBeforeUs,
+                                        std::int64_t windowLenUs,
+                                        std::int64_t totalUs) {
+  return [params, doneBeforeUs, windowLenUs, totalUs](
+             const ProgressReport &report) {
+    if (!params.onProgress || report.fraction < 0) {
+      return;
+    }
+    ProgressReport global;
+    const double local = std::clamp(report.fraction, 0.0, 1.0);
+    global.processedDurationUs =
+        doneBeforeUs + std::int64_t(local * double(windowLenUs));
+    global.totalDurationUs = totalUs;
+    global.fraction =
+        totalUs > 0
+            ? std::clamp(double(global.processedDurationUs) / double(totalUs),
+                         0.0, 1.0)
+            : -1.0;
+    params.onProgress(global);
+  };
+}
+
+// Commits one timeline checkpoint (Encode stage, presentation-time
+// position, the finalized artifact). Returns the error path (empty = ok).
+std::string commitTimelineCheckpoint(const ExecuteParams &params,
+                                     std::int64_t positionUs,
+                                     const std::string &artifactPath,
+                                     bool &cancelledOut) {
+  cancelledOut = false;
+  if (params.checkpoints == nullptr) {
+    return {};
+  }
+  backend::CheckpointInfo info;
+  info.stage = StageId::Encode;
+  info.position = positionUs;
+  info.artifactPath = artifactPath;
+  if (!params.checkpoints->commit(info)) {
+    cancelledOut = params.cancel != nullptr && params.cancel->isCancelled();
+    return cancelledOut ? "cancelled" : "checkpoint commit failed";
+  }
+  return {};
+}
+
+// Promotes a single finalized segment to the output path (rename with a
+// copy fallback; the full-disk case surfaces as StorageFull).
+Error promoteSingleFile(const std::string &from, const std::string &to) {
+  std::error_code ec;
+  std::filesystem::rename(from, to, ec);
+  if (ec) {
+    std::filesystem::copy_file(from, to, ec);
+    if (ec) {
+      return outputWriteError(
+          ec == std::errc::no_space_on_device ? AVERROR(ENOSPC) : 0,
+          "cannot promote the finished output", to);
+    }
+  }
+  return {};
+}
+
+ExecuteResult FfmpegExecutor::executeCut(const ExecuteParams &params,
+                                         const ExecutionIntent &intent) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  const std::optional<std::string> inPath = localPathFor(intent.source);
+  if (!inPath.has_value()) {
+    result.error = Error::make(ErrorCode::SourceUnavailable,
+                               "unsupported source URI", "ffmpeg");
+    return result;
+  }
+
+  // Removing nothing: the whole timeline, through the standard dispatch.
+  if (intent.cutRemoved.empty()) {
+    if (params.pipeline.videoStreamCopy && params.pipeline.audioStreamCopy) {
+      return executeRemux(params, intent);
+    }
+    return executeTranscode(params, intent);
+  }
+
+  // Real keyframe timeline (packet flags, one demux pass).
+  VideoTimeline timeline;
+  {
+    std::string reason;
+    if (!scanVideoTimeline(*inPath, params.cancel.get(), timeline, reason)) {
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "cannot analyze the source timeline: " +
+                                     reason,
+                                 "ffmpeg");
+      return result;
+    }
+  }
+  const std::int64_t durationUs = timeline.durationUs;
+  const std::vector<TimeRange> retained =
+      retainedRangesOf(intent.cutRemoved, durationUs);
+  if (retained.empty()) {
+    // Never remove the complete source (mandate §27.2; re-checked here
+    // after defensive re-normalization).
+    result.error = Error::make(
+        ErrorCode::InvalidTimeRange,
+        "cannot remove the entire timeline: at least one frame must remain",
+        "ffmpeg");
+    return result;
+  }
+
+  // Copy eligibility: a copy pipeline AND every retained boundary
+  // keyframe-safe. A mixed copy/transcode concatenation would join
+  // differently-parameterized streams (source extradata vs re-encoded
+  // parameters) and produce broken output — the honest strategy is
+  // uniform: all keyframe-safe copy, or all exact transcode.
+  bool allCopy = params.pipeline.videoStreamCopy &&
+                 params.pipeline.audioStreamCopy && timeline.hasVideo;
+  if (allCopy) {
+    for (const TimeRange &range : retained) {
+      const std::int64_t end =
+          range.endUs < 0 ? (durationUs > 0 ? durationUs : INT64_MAX)
+                          : range.endUs;
+      if (!windowStartCopySafe(timeline, range.startUs) ||
+          !windowEndCopySafe(timeline, end)) {
+        allCopy = false;
+        break;
+      }
+    }
+  }
+
+  std::int64_t totalRetainedUs = 0;
+  for (const TimeRange &range : retained) {
+    const std::int64_t end =
+        range.endUs < 0 ? (durationUs > 0 ? durationUs : INT64_MAX)
+                        : range.endUs;
+    totalRetainedUs += std::max<std::int64_t>(end - range.startUs, 0);
+  }
+
+  // Durable scratch + resume: checkpoints whose position matches a
+  // retained boundary and whose artifacts are still valid cover that
+  // range; everything else runs.
+  const std::string segDir = timelineScratchDir(params);
+  std::error_code ec;
+  std::filesystem::create_directories(segDir, ec);
+  const std::filesystem::path outFs(params.outputPath);
+  struct CutSegment {
+    std::int64_t endUs;
+    std::string path;
+  };
+  std::vector<CutSegment> segments;
+  std::vector<TimeRange> pending;
+  {
+    std::vector<backend::CheckpointInfo> reusable = params.resumeFrom;
+    for (const TimeRange &range : retained) {
+      const std::int64_t end =
+          range.endUs < 0
+              ? (durationUs > 0 ? durationUs : INT64_MAX)
+              : std::min(range.endUs, durationUs > 0 ? durationUs : INT64_MAX);
+      const std::string segPath =
+          (std::filesystem::path(segDir) /
+           ("cut-" + std::to_string(segments.size()) +
+            outFs.extension().string()))
+              .string();
+      bool resumed = false;
+      for (const auto &info : reusable) {
+        if (info.position == end && !info.artifactPath.empty() &&
+            segmentArtifactUsable(info.artifactPath)) {
+          segments.push_back({end, info.artifactPath});
+          resumed = true;
+          break;
+        }
+      }
+      if (!resumed) {
+        pending.push_back(range);
+      }
+    }
+  }
+
+  std::int64_t doneUs = 0;
+  for (const TimeRange &range : pending) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      result.error = Error::make(ErrorCode::Cancelled,
+                                 "cut cancelled (segments committed)",
+                                 "ffmpeg");
+      return result;
+    }
+    const std::int64_t start = std::max<std::int64_t>(range.startUs, 0);
+    const std::int64_t end =
+        range.endUs < 0 ? (durationUs > 0 ? durationUs : INT64_MAX)
+                        : range.endUs;
+    const std::int64_t windowLen = std::max<std::int64_t>(end - start, 1);
+    const std::string segPath =
+        (std::filesystem::path(segDir) /
+         ("cut-" + std::to_string(segments.size()) +
+          outFs.extension().string()))
+            .string();
+    ExecuteParams segParams = params;
+    segParams.outputPath = segPath;
+    segParams.onProgress =
+        windowProgressWrapper(params, doneUs, windowLen, totalRetainedUs);
+    ExecuteResult seg;
+    if (allCopy) {
+      int writeRc = 0;
+      if (!copyWindowSegment(segParams, intent, *inPath, start, end, segPath,
+                             start <= 0, writeRc)) {
+        seg.error = writeRc != 0
+                        ? outputWriteError(writeRc, "copy window failed",
+                                           segPath)
+                        : Error::make(ErrorCode::ExecutionFailed,
+                                      "cannot copy the retained window",
+                                      "ffmpeg");
+      } else {
+        seg.success = true;
+      }
+    } else {
+      seg = executeTranscodeRange(segParams, intent, start, end, true, true);
+    }
+    if (!seg.success) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      return seg;
+    }
+    if (!segmentArtifactUsable(segPath)) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "cut segment failed artifact validation",
+                                 "ffmpeg");
+      return result;
+    }
+    bool checkpointCancelled = false;
+    const std::string commitError = commitTimelineCheckpoint(
+        params, end == INT64_MAX ? durationUs : end, segPath,
+        checkpointCancelled);
+    if (!commitError.empty()) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      result.error = Error::make(
+          checkpointCancelled ? ErrorCode::Cancelled
+                              : ErrorCode::ExecutionFailed,
+          checkpointCancelled ? "cut cancelled (segments committed)"
+                              : commitError,
+          "ffmpeg");
+      return result;
+    }
+    segments.push_back({end, segPath});
+    doneUs += windowLen;
+    if (params.onProgress) {
+      ProgressReport report;
+      report.processedDurationUs = doneUs;
+      report.totalDurationUs = totalRetainedUs;
+      report.fraction = totalRetainedUs > 0
+                            ? std::clamp(double(doneUs) /
+                                             double(totalRetainedUs),
+                                         0.0, 1.0)
+                            : -1.0;
+      params.onProgress(report);
+    }
+  }
+
+  // ONE continuous output (assembleSegments / promote a single window).
+  if (segments.size() == 1) {
+    const Error promoteError =
+        promoteSingleFile(segments.front().path, params.outputPath);
+    if (!promoteError.ok()) {
+      result.error = promoteError;
+      return result;
+    }
+  } else {
+    std::vector<std::string> paths;
+    paths.reserve(segments.size());
+    for (const CutSegment &seg : segments) {
+      paths.push_back(seg.path);
+    }
+    int asmRc = 0;
+    if (!assembleSegments(paths, params.outputPath,
+                          params.pipeline.container, asmRc)) {
+      result.error = outputWriteError(asmRc,
+                                      "cannot assemble the cut segments",
+                                      params.outputPath);
+      return result;
+    }
+  }
+  std::filesystem::remove_all(segDir, ec);
+  struct stat st{};
+  if (::stat(params.outputPath.c_str(), &st) == 0) {
+    result.bytesWritten = st.st_size;
+  }
+  result.success = true;
+  result.pipelineSummary =
+      "cut " + std::to_string(retained.size()) + " ranges" +
+      (allCopy ? " (keyframe-safe copy)" : " (exact transcode)");
+  return result;
+}
+
+ExecuteResult FfmpegExecutor::executeSplit(const ExecuteParams &params,
+                                           const ExecutionIntent &intent) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  const std::optional<std::string> inPath = localPathFor(intent.source);
+  if (!inPath.has_value()) {
+    result.error = Error::make(ErrorCode::SourceUnavailable,
+                               "unsupported source URI", "ffmpeg");
+    return result;
+  }
+  const SplitRules &rules = intent.splitRules;
+
+  // Probe: duration, size, chapters (real container markers).
+  std::int64_t durationUs = 0;
+  std::int64_t totalBytes = 0;
+  std::vector<std::int64_t> chapterStarts;
+  {
+    AVFormatContext *probe = nullptr;
+    if (avformat_open_input(&probe, inPath->c_str(), nullptr, nullptr) != 0 ||
+        avformat_find_stream_info(probe, nullptr) < 0) {
+      if (probe != nullptr) {
+        avformat_close_input(&probe);
+      }
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "cannot open the source", "ffmpeg");
+      return result;
+    }
+    if (probe->duration != AV_NOPTS_VALUE && probe->duration > 0) {
+      durationUs = av_rescale_q(probe->duration, AVRational{1, AV_TIME_BASE},
+                                AVRational{1, 1000000});
+    }
+    if (probe->pb != nullptr) {
+      const std::int64_t size = avio_size(probe->pb);
+      if (size > 0) {
+        totalBytes = size;
+      }
+    }
+    if (totalBytes <= 0) {
+      struct stat st{};
+      if (::stat(inPath->c_str(), &st) == 0) {
+        totalBytes = st.st_size;
+      }
+    }
+    chapterStarts = chapterStartsUs(probe);
+    avformat_close_input(&probe);
+  }
+
+  // Boundaries: [0, ...interior..., duration]. Parts between consecutive
+  // boundaries; the final part runs to the source end.
+  std::vector<std::int64_t> boundaries{0};
+  switch (rules.mode) {
+    case SplitMode::EqualParts: {
+      const std::int64_t parts = std::max<std::int64_t>(rules.partCount, 1);
+      for (std::int64_t i = 1; i < parts; ++i) {
+        boundaries.push_back(durationUs * i / parts);
+      }
+      break;
+    }
+    case SplitMode::Duration: {
+      if (rules.partDurationUs > 0 && durationUs > 0) {
+        const std::int64_t maxParts =
+            std::max<std::int64_t>(1, durationUs / rules.partDurationUs + 1);
+        for (std::int64_t t = rules.partDurationUs; t < durationUs; ++t) {
+          boundaries.push_back(t);
+          if (boundaries.size() > 4096) {
+            break; // pathological request guard
+          }
+        }
+        if (maxParts < 0) {
+          result.error = Error::make(ErrorCode::InvalidArgument,
+                                     "split duration too small", "ffmpeg");
+          return result;
+        }
+      }
+      break;
+    }
+    case SplitMode::MaxSize: {
+      if (rules.maxSizeBytes > 0 && totalBytes > 0) {
+        const std::int64_t parts = std::min<std::int64_t>(
+            10000, std::max<std::int64_t>(
+                       1, (totalBytes + rules.maxSizeBytes - 1) /
+                              rules.maxSizeBytes));
+        for (std::int64_t i = 1; i < parts; ++i) {
+          boundaries.push_back(durationUs * i / parts);
+        }
+      }
+      break;
+    }
+    case SplitMode::CustomTimestamps: {
+      std::int64_t previous = 0;
+      for (std::int64_t boundary : rules.boundaryUs) {
+        if (boundary > previous &&
+            (durationUs <= 0 || boundary < durationUs)) {
+          boundaries.push_back(boundary);
+          previous = boundary;
+        }
+      }
+      break;
+    }
+    case SplitMode::Chapters: {
+      if (chapterStarts.empty()) {
+        // Honest infeasibility: nothing to split on.
+        result.error = Error::make(ErrorCode::InvalidArgument,
+                                   "source has no chapter markers", "ffmpeg");
+        return result;
+      }
+      for (std::int64_t start : chapterStarts) {
+        if (start > 0 && (durationUs <= 0 || start < durationUs)) {
+          boundaries.push_back(start);
+        }
+      }
+      break;
+    }
+    case SplitMode::Scenes: {
+      std::vector<std::int64_t> sceneUs;
+      std::string reason;
+      if (!detectSceneChanges(*inPath, 0.3, params.cancel.get(), sceneUs,
+                             reason)) {
+        result.error = Error::make(ErrorCode::ExecutionFailed,
+                                   "scene analysis failed: " + reason,
+                                   "ffmpeg");
+        return result;
+      }
+      for (std::int64_t us : sceneUs) {
+        if (us > 0 && (durationUs <= 0 || us < durationUs)) {
+          boundaries.push_back(us);
+        }
+      }
+      if (boundaries.size() == 1) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "no scene changes detected (threshold 0.3): nothing to split",
+            "ffmpeg");
+        return result;
+      }
+      break;
+    }
+  }
+  if (durationUs > 0) {
+    boundaries.push_back(durationUs);
+  }
+  std::sort(boundaries.begin(), boundaries.end());
+  boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                   boundaries.end());
+  // Drop degenerate boundaries (<= 0 or >= duration).
+  std::vector<std::int64_t> valid;
+  for (std::int64_t b : boundaries) {
+    if (b > 0 && (durationUs <= 0 || b < durationUs)) {
+      valid.push_back(b);
+    }
+  }
+  boundaries = valid;
+  if (boundaries.empty()) {
+    // Nothing splittable inside the timeline: one part (the whole file).
+    boundaries.push_back(durationUs > 0 ? durationUs : -1);
+  }
+  const std::size_t partCount = boundaries.size();
+
+  // Real keyframe timeline for the per-part copy decision.
+  VideoTimeline timeline;
+  {
+    std::string reason;
+    if (!scanVideoTimeline(*inPath, params.cancel.get(), timeline, reason)) {
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "cannot analyze the source timeline: " +
+                                     reason,
+                                 "ffmpeg");
+      return result;
+    }
+  }
+
+  // Part paths: <stem>_part_001.<ext> ... next to the planned output.
+  const std::filesystem::path outFs(params.outputPath);
+  const std::string stem = outFs.stem().string();
+  const std::string ext = outFs.extension().string();
+  const auto partPath = [&](std::size_t index) {
+    char num[16];
+    std::snprintf(num, sizeof(num), "%03zu", index + 1);
+    return (outFs.parent_path() /
+            (stem + "_part_" + num + ext))
+        .string();
+  };
+
+  // Per-part copy decision + resume: a part whose checkpoint artifact is
+  // still valid is not redone.
+  const bool pipelineCopy = params.pipeline.videoStreamCopy &&
+                            params.pipeline.audioStreamCopy;
+  std::vector<std::pair<std::int64_t, std::string>> reusable = [](
+      const ExecuteParams &p) {
+    std::vector<std::pair<std::int64_t, std::string>> out;
+    for (const auto &info : p.resumeFrom) {
+      if (!info.artifactPath.empty()) {
+        out.emplace_back(info.position, info.artifactPath);
+      }
+    }
+    return out;
+  }(params);
+
+  std::vector<JobOutput> outputs;
+  outputs.reserve(partCount);
+  std::int64_t doneUs = 0;
+  const std::int64_t totalUs = durationUs > 0 ? durationUs : 0;
+  for (std::size_t i = 0; i < partCount; ++i) {
+    const std::int64_t start = i == 0 ? 0 : boundaries[i - 1];
+    const std::int64_t end = boundaries[i];
+    const std::int64_t endForRun =
+        end < 0 ? (durationUs > 0 ? durationUs : INT64_MAX) : end;
+    const std::string path = partPath(i);
+    const std::int64_t windowLen =
+        std::max<std::int64_t>(endForRun - start, 1);
+
+    // Resume: this part's artifact is already finalized and valid.
+    bool resumed = false;
+    for (const auto &[position, artifact] : reusable) {
+      if (position == (end < 0 ? durationUs : end) &&
+          segmentArtifactUsable(artifact)) {
+        JobOutput out;
+        out.path = artifact;
+        struct stat st{};
+        if (::stat(artifact.c_str(), &st) == 0) {
+          out.sizeBytes = st.st_size;
+        }
+        out.kind = "media";
+        outputs.push_back(std::move(out));
+        resumed = true;
+        break;
+      }
+    }
+    if (resumed) {
+      doneUs += windowLen;
+      continue;
+    }
+
+    if (params.cancel && params.cancel->isCancelled()) {
+      result.error = Error::make(ErrorCode::Cancelled,
+                                 "split cancelled (parts committed)",
+                                 "ffmpeg");
+      return result;
+    }
+
+    // Per-part strategy: keyframe-safe copy window (independently
+    // playable, own header) or exact transcode window.
+    const bool partCopy = pipelineCopy &&
+                          windowStartCopySafe(timeline, start) &&
+                          windowEndCopySafe(timeline, endForRun);
+    ExecuteParams partParams = params;
+    partParams.outputPath = path;
+    partParams.onProgress =
+        windowProgressWrapper(params, doneUs, windowLen, totalUs);
+    ExecuteResult part;
+    if (partCopy) {
+      int writeRc = 0;
+      if (!copyWindowSegment(partParams, intent, *inPath, start, endForRun,
+                             path, start <= 0, writeRc)) {
+        part.error =
+            writeRc != 0 ? outputWriteError(writeRc, "copy part failed", path)
+                         : Error::make(ErrorCode::ExecutionFailed,
+                                       "cannot copy the split part", "ffmpeg");
+      } else {
+        part.success = true;
+      }
+    } else {
+      part = executeTranscodeRange(partParams, intent, start, endForRun, true,
+                                   true);
+    }
+    if (!part.success) {
+      std::error_code removeEc;
+      std::filesystem::remove(path, removeEc);
+      return part;
+    }
+    if (!segmentArtifactUsable(path)) {
+      std::error_code removeEc;
+      std::filesystem::remove(path, removeEc);
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "split part failed artifact validation",
+                                 "ffmpeg");
+      return result;
+    }
+    bool checkpointCancelled = false;
+    const std::string commitError = commitTimelineCheckpoint(
+        params, end < 0 ? durationUs : end, path, checkpointCancelled);
+    if (!commitError.empty()) {
+      std::error_code removeEc;
+      std::filesystem::remove(path, removeEc);
+      result.error = Error::make(
+          checkpointCancelled ? ErrorCode::Cancelled
+                              : ErrorCode::ExecutionFailed,
+          checkpointCancelled ? "split cancelled (parts committed)"
+                              : commitError,
+          "ffmpeg");
+      return result;
+    }
+    JobOutput out;
+    out.path = path;
+    struct stat st{};
+    if (::stat(path.c_str(), &st) == 0) {
+      out.sizeBytes = st.st_size;
+    }
+    out.kind = "media";
+    outputs.push_back(std::move(out));
+    doneUs += windowLen;
+    if (params.onProgress) {
+      ProgressReport report;
+      report.processedDurationUs = doneUs;
+      report.totalDurationUs = totalUs;
+      report.fraction = totalUs > 0
+                            ? std::clamp(double(doneUs) / double(totalUs),
+                                         0.0, 1.0)
+                            : -1.0;
+      params.onProgress(report);
+    }
+  }
+
+  // MaxSize honesty (mandate §27.3): validate actual part sizes; a part
+  // over the limit is a failure, never silent acceptance or fake
+  // compression.
+  if (rules.mode == SplitMode::MaxSize && rules.maxSizeBytes > 0) {
+    std::int64_t smallest = INT64_MAX;
+    for (const JobOutput &out : outputs) {
+      if (out.sizeBytes > 0) {
+        smallest = std::min(smallest, out.sizeBytes);
+      }
+    }
+    for (const JobOutput &out : outputs) {
+      if (out.sizeBytes > rules.maxSizeBytes) {
+        result.error = Error::make(
+            ErrorCode::ExecutionFailed,
+            "cannot split under the size limit: part " + out.path + " is " +
+                std::to_string(out.sizeBytes) + " bytes (limit " +
+                std::to_string(rules.maxSizeBytes) +
+                (smallest != INT64_MAX && smallest > rules.maxSizeBytes
+                     ? "; even the smallest part exceeds the maximum"
+                     : "") +
+                "). Try a smaller part duration or a different strategy.",
+            "ffmpeg");
+        return result;
+      }
+    }
+  }
+
+  result.success = true;
+  result.outputs = std::move(outputs);
+  result.pipelineSummary = "split into " + std::to_string(partCount) +
+                           " parts";
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Merge (mandate §27.4 sequential, §27.5 spatial)
+// ---------------------------------------------------------------------------
+
+// REAL compatibility verification across merge sources: codec names alone
+// are insufficient. Compares per-stream codec ids, profile/level, geometry,
+// sample aspect, pixel format, average frame rate, audio shape, stream
+// time bases, extradata BYTES, and the per-index (type, codec, language)
+// layout that the concat demuxer's index mapping relies on (the mandate's
+// "map by codec + language tag").
+struct MergeCompatibility {
+  bool ok = false;
+  std::string reason;
+};
+
+bool mergeSourcesCompatible(const std::vector<AVFormatContext *> &sources,
+                            MergeCompatibility &compat) {
+  const AVFormatContext *first = sources.front();
+  for (std::size_t s = 1; s < sources.size(); ++s) {
+    const AVFormatContext *other = sources[s];
+    if (other->nb_streams != first->nb_streams) {
+      compat.reason = "the sources have different stream layouts";
+      return false;
+    }
+    for (unsigned i = 0; i < first->nb_streams; ++i) {
+      const AVStream *a = first->streams[i];
+      const AVStream *b = other->streams[i];
+      if (a->codecpar->codec_type != b->codecpar->codec_type ||
+          a->codecpar->codec_id != b->codecpar->codec_id) {
+        compat.reason = "stream layouts differ between the sources";
+        return false;
+      }
+      const char *langA = "";
+      const char *langB = "";
+      if (const AVDictionaryEntry *e =
+              av_dict_get(a->metadata, "language", nullptr, 0)) {
+        langA = e->value;
+      }
+      if (const AVDictionaryEntry *e =
+              av_dict_get(b->metadata, "language", nullptr, 0)) {
+        langB = e->value;
+      }
+      if (strcmp(langA, langB) != 0) {
+        compat.reason = "track languages differ between the sources";
+        return false;
+      }
+      const bool isVideo = a->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                           (a->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0;
+      if (isVideo) {
+        if (a->codecpar->profile != b->codecpar->profile) {
+          compat.reason = "video codec profiles differ";
+          return false;
+        }
+        if (a->codecpar->level != b->codecpar->level) {
+          compat.reason = "video codec levels differ";
+          return false;
+        }
+        if (a->codecpar->width != b->codecpar->width ||
+            a->codecpar->height != b->codecpar->height) {
+          compat.reason = "video resolutions differ";
+          return false;
+        }
+        if (a->codecpar->format != b->codecpar->format) {
+          compat.reason = "video pixel formats differ";
+          return false;
+        }
+        if (a->codecpar->sample_aspect_ratio.num !=
+                b->codecpar->sample_aspect_ratio.num ||
+            a->codecpar->sample_aspect_ratio.den !=
+                b->codecpar->sample_aspect_ratio.den) {
+          compat.reason = "video sample aspects differ";
+          return false;
+        }
+        if (a->avg_frame_rate.num != b->avg_frame_rate.num ||
+            a->avg_frame_rate.den != b->avg_frame_rate.den) {
+          compat.reason = "video frame rates differ";
+          return false;
+        }
+      } else if (a->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        if (a->codecpar->sample_rate != b->codecpar->sample_rate ||
+            a->codecpar->ch_layout.nb_channels !=
+                b->codecpar->ch_layout.nb_channels) {
+          compat.reason = "audio formats differ";
+          return false;
+        }
+      }
+      if (a->time_base.num != b->time_base.num ||
+          a->time_base.den != b->time_base.den) {
+        compat.reason = "stream time bases differ";
+        return false;
+      }
+      // Extradata compatibility for the concat path: byte-identical
+      // parameter sets (different SPS/PPS across segments decode as
+      // garbage even when the codec id matches).
+      const bool extradataA =
+          a->codecpar->extradata != nullptr && a->codecpar->extradata_size > 0;
+      const bool extradataB =
+          b->codecpar->extradata != nullptr && b->codecpar->extradata_size > 0;
+      if (extradataA != extradataB ||
+          (extradataA && (a->codecpar->extradata_size !=
+                              b->codecpar->extradata_size ||
+                          std::memcmp(a->codecpar->extradata,
+                                      b->codecpar->extradata,
+                                      std::size_t(a->codecpar->extradata_size)) != 0))) {
+        compat.reason = "codec parameter sets (extradata) differ";
+        return false;
+      }
+    }
+  }
+  compat.ok = true;
+  compat.reason = "compatible";
+  return true;
+}
+
+// One NORMALIZED merge segment: source -> scale+pad to the reference
+// geometry (aspect preserved, never stretched) -> encoder; audio resampled
+// to the reference shape (silence fill when the source lacks audio or its
+// audio ends early); subtitle lanes copied with segment-local timing.
+// Every segment starts at pts 0 with the SAME encoder parameters, so the
+// concat assembly yields uniform streams.
+bool transcodeMergeSegment(const ExecuteParams &params,
+                           const ExecutionIntent &intent,
+                           AVFormatContext *in, std::int64_t durationUs,
+                           const std::string &segPath, std::int32_t targetW,
+                           std::int32_t targetH, AVRational targetRate,
+                           bool wantAudio, int audioInStream,
+                           std::int32_t audioRate, std::int32_t audioChannels,
+                           bool keepSubtitles, int &writeRc,
+                           std::string &reason) {
+  struct MergeCleanup {
+    ~MergeCleanup() {
+      av_frame_free(&frame);
+      av_packet_free(&packet);
+      avfilter_graph_free(&graph);
+      avcodec_free_context(&videoDec);
+      avcodec_free_context(&videoEnc);
+      avcodec_free_context(&audioDec);
+      avcodec_free_context(&audioEnc);
+      swr_free(&swr);
+      if (fifo != nullptr) {
+        av_audio_fifo_free(fifo);
+      }
+      if (out != nullptr) {
+        if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb != nullptr) {
+          avio_closep(&out->pb);
+        }
+        avformat_free_context(out);
+      }
+    }
+    AVFormatContext *out = nullptr;
+    AVCodecContext *videoDec = nullptr;
+    AVCodecContext *videoEnc = nullptr;
+    AVCodecContext *audioDec = nullptr;
+    AVCodecContext *audioEnc = nullptr;
+    SwrContext *swr = nullptr;
+    AVAudioFifo *fifo = nullptr;
+    AVFilterGraph *graph = nullptr;
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+  } cleanup;
+
+  int videoStream = -1;
+  for (unsigned i = 0; i < in->nb_streams; ++i) {
+    if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (in->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      videoStream = int(i);
+      break;
+    }
+  }
+  if (videoStream < 0 && !wantAudio && !keepSubtitles) {
+    reason = "the source has no convertible streams";
+    return false;
+  }
+
+  if (avformat_alloc_output_context2(&cleanup.out, nullptr,
+                                     avFormatNameFor(params.pipeline.container),
+                                     segPath.c_str()) < 0 ||
+      cleanup.out == nullptr) {
+    reason = "cannot allocate the segment output";
+    return false;
+  }
+
+  int videoOut = -1;
+  AVFilterContext *vsrc = nullptr;
+  AVFilterContext *vsink = nullptr;
+  std::int64_t videoFirstUs = AV_NOPTS_VALUE;
+  std::int64_t lastVideoUs = 0;
+  if (videoStream >= 0) {
+    const AVCodec *decCodec =
+        avcodec_find_decoder(in->streams[std::size_t(videoStream)]->codecpar->codec_id);
+    if (decCodec == nullptr) {
+      reason = "no decoder for the source video";
+      return false;
+    }
+    cleanup.videoDec = avcodec_alloc_context3(decCodec);
+    avcodec_parameters_to_context(
+        cleanup.videoDec, in->streams[std::size_t(videoStream)]->codecpar);
+    cleanup.videoDec->pkt_timebase =
+        in->streams[std::size_t(videoStream)]->time_base;
+    if (cleanup.videoDec->time_base.num <= 0 ||
+        cleanup.videoDec->time_base.den <= 0) {
+      cleanup.videoDec->time_base =
+          in->streams[std::size_t(videoStream)]->time_base;
+    }
+    if (avcodec_open2(cleanup.videoDec, decCodec, nullptr) < 0) {
+      reason = "cannot open the source video decoder";
+      return false;
+    }
+    const char *encName = encoderNameFor(params.pipeline.videoCodec);
+    const AVCodec *encCodec = encName != nullptr
+                                  ? avcodec_find_encoder_by_name(encName)
+                                  : nullptr;
+    if (encCodec == nullptr) {
+      encCodec = avcodec_find_encoder(avCodecFor(params.pipeline.videoCodec));
+    }
+    if (encCodec == nullptr) {
+      reason = "no encoder for the normalized video";
+      return false;
+    }
+    cleanup.videoEnc = avcodec_alloc_context3(encCodec);
+    cleanup.videoEnc->width = targetW;
+    cleanup.videoEnc->height = targetH;
+    cleanup.videoEnc->pix_fmt = AV_PIX_FMT_YUV420P;
+    if (targetRate.num > 0 && targetRate.den > 0) {
+      cleanup.videoEnc->framerate = targetRate;
+      cleanup.videoEnc->time_base = av_inv_q(targetRate);
+    } else {
+      cleanup.videoEnc->framerate = AVRational{30, 1};
+      cleanup.videoEnc->time_base = AVRational{1, 30};
+    }
+    if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
+      cleanup.videoEnc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (intent.rate.bitrateMode && intent.rate.bitRate > 0) {
+      cleanup.videoEnc->bit_rate = intent.rate.bitRate;
+      cleanup.videoEnc->rc_max_rate = intent.rate.bitRate;
+      cleanup.videoEnc->rc_buffer_size = intent.rate.bitRate * 2;
+    } else {
+      const int crf = qualityToCrf(params.pipeline.videoCodec,
+                                   intent.rate.quality);
+      av_opt_set(cleanup.videoEnc->priv_data, "crf",
+                 std::to_string(crf).c_str(), 0);
+      if (params.pipeline.videoCodec == VideoCodec::AV1) {
+        av_opt_set(cleanup.videoEnc->priv_data, "preset", "8", 0);
+      }
+    }
+    if (avcodec_open2(cleanup.videoEnc, encCodec, nullptr) < 0) {
+      reason = "cannot open the normalized video encoder";
+      return false;
+    }
+    videoOut = int(cleanup.out->nb_streams);
+    AVStream *outVideo = avformat_new_stream(cleanup.out, nullptr);
+    avcodec_parameters_from_context(outVideo->codecpar, cleanup.videoEnc);
+    outVideo->time_base = cleanup.videoEnc->time_base;
+
+    // Aspect-preserving fit into the reference geometry + black pad.
+    cleanup.graph = avfilter_graph_alloc();
+    const AVFilter *bufSrc = avfilter_get_by_name("buffer");
+    const AVFilter *bufSink = avfilter_get_by_name("buffersink");
+    if (cleanup.graph == nullptr || bufSrc == nullptr || bufSink == nullptr) {
+      reason = "cannot allocate the normalization graph";
+      return false;
+    }
+    AVRational sar = cleanup.videoDec->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) {
+      sar = AVRational{0, 1};
+    }
+    char srcArgs[512];
+    std::snprintf(srcArgs, sizeof(srcArgs),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  cleanup.videoDec->width, cleanup.videoDec->height,
+                  cleanup.videoDec->pix_fmt,
+                  cleanup.videoDec->time_base.num,
+                  cleanup.videoDec->time_base.den, sar.num, sar.den);
+    if (avfilter_graph_create_filter(&vsrc, bufSrc, "in", srcArgs, nullptr,
+                                     cleanup.graph) < 0 ||
+        avfilter_graph_create_filter(&vsink, bufSink, "out", nullptr, nullptr,
+                                     cleanup.graph) < 0) {
+      reason = "cannot create the normalization endpoints";
+      return false;
+    }
+    const enum AVPixelFormat sinkFmts[] = {AV_PIX_FMT_YUV420P,
+                                           AV_PIX_FMT_NONE};
+    if (av_opt_set_bin(vsink, "pix_fmts",
+                       reinterpret_cast<const uint8_t *>(sinkFmts),
+                       sizeof(sinkFmts) - sizeof(sinkFmts[0]),
+                       AV_OPT_SEARCH_CHILDREN) < 0) {
+      reason = "cannot constrain the normalization output format";
+      return false;
+    }
+    const std::string graphDesc =
+        "scale=w=" + std::to_string(targetW) + ":h=" + std::to_string(targetH) +
+        ":force_original_aspect_ratio=decrease,pad=" + std::to_string(targetW) +
+        ":" + std::to_string(targetH) +
+        ":(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+    bool graphOk = outputs != nullptr && inputs != nullptr;
+    if (graphOk) {
+      outputs->name = av_strdup("in");
+      outputs->filter_ctx = vsrc;
+      outputs->pad_idx = 0;
+      outputs->next = nullptr;
+      inputs->name = av_strdup("out");
+      inputs->filter_ctx = vsink;
+      inputs->pad_idx = 0;
+      inputs->next = nullptr;
+      graphOk = avfilter_graph_parse_ptr(cleanup.graph, graphDesc.c_str(),
+                                         &inputs, &outputs, nullptr) >= 0;
+    }
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (graphOk) {
+      graphOk = avfilter_graph_config(cleanup.graph, nullptr) >= 0;
+    }
+    if (!graphOk) {
+      reason = "cannot configure the normalization graph (" + graphDesc + ")";
+      return false;
+    }
+  }
+
+  // Audio lane: decode + resample to the reference shape, or silence when
+  // the source carries no audio.
+  int audioOut = -1;
+  std::int64_t audioSamplesOut = 0;
+  const AVStream *audioInStreamRef = nullptr;
+  if (wantAudio) {
+    if (audioInStream >= 0) {
+      audioInStreamRef = in->streams[std::size_t(audioInStream)];
+      const AVCodec *decCodec =
+          avcodec_find_decoder(audioInStreamRef->codecpar->codec_id);
+      if (decCodec == nullptr) {
+        reason = "no decoder for the source audio";
+        return false;
+      }
+      cleanup.audioDec = avcodec_alloc_context3(decCodec);
+      avcodec_parameters_to_context(cleanup.audioDec,
+                                    audioInStreamRef->codecpar);
+      if (avcodec_open2(cleanup.audioDec, decCodec, nullptr) < 0) {
+        reason = "cannot open the source audio decoder";
+        return false;
+      }
+    }
+    const char *encName = encoderNameFor(params.pipeline.audioCodec);
+    const AVCodec *encCodec = encName != nullptr
+                                  ? avcodec_find_encoder_by_name(encName)
+                                  : nullptr;
+    if (encCodec == nullptr) {
+      encCodec = avcodec_find_encoder(avCodecFor(params.pipeline.audioCodec));
+    }
+    if (encCodec == nullptr) {
+      reason = "no encoder for the normalized audio";
+      return false;
+    }
+    cleanup.audioEnc = avcodec_alloc_context3(encCodec);
+    cleanup.audioEnc->sample_rate = audioRate;
+    if (encCodec->supported_samplerates != nullptr) {
+      bool supported = false;
+      for (int i = 0; encCodec->supported_samplerates[i] != 0; ++i) {
+        if (encCodec->supported_samplerates[i] == audioRate) {
+          supported = true;
+          break;
+        }
+      }
+      if (!supported) {
+        reason = "the normalized audio rate is not encodable";
+        return false;
+      }
+    }
+    av_channel_layout_default(&cleanup.audioEnc->ch_layout,
+                              std::clamp(audioChannels, 1, 8));
+    if (encCodec->sample_fmts != nullptr) {
+      cleanup.audioEnc->sample_fmt = encCodec->sample_fmts[0];
+      for (int i = 0; encCodec->sample_fmts[i] != -1; ++i) {
+        if (encCodec->sample_fmts[i] == AV_SAMPLE_FMT_FLTP) {
+          cleanup.audioEnc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+          break;
+        }
+      }
+    } else {
+      cleanup.audioEnc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    }
+    cleanup.audioEnc->bit_rate = 128000;
+    if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
+      cleanup.audioEnc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (avcodec_open2(cleanup.audioEnc, encCodec, nullptr) < 0) {
+      reason = "cannot open the normalized audio encoder";
+      return false;
+    }
+    audioOut = int(cleanup.out->nb_streams);
+    AVStream *outAudio = avformat_new_stream(cleanup.out, nullptr);
+    avcodec_parameters_from_context(outAudio->codecpar, cleanup.audioEnc);
+    outAudio->time_base = AVRational{1, cleanup.audioEnc->sample_rate};
+
+    if (cleanup.audioDec != nullptr) {
+      cleanup.swr = swr_alloc();
+      AVChannelLayout inLayout;
+      av_channel_layout_copy(&inLayout, &cleanup.audioDec->ch_layout);
+      if (swr_alloc_set_opts2(&cleanup.swr, &cleanup.audioEnc->ch_layout,
+                              cleanup.audioEnc->sample_fmt,
+                              cleanup.audioEnc->sample_rate, &inLayout,
+                              static_cast<AVSampleFormat>(
+                                  cleanup.audioDec->sample_fmt),
+                              cleanup.audioDec->sample_rate > 0
+                                  ? cleanup.audioDec->sample_rate
+                                  : audioRate,
+                              0, nullptr) < 0) {
+        av_channel_layout_uninit(&inLayout);
+        swr_free(&cleanup.swr);
+      } else {
+        av_channel_layout_uninit(&inLayout);
+      }
+      if (cleanup.swr == nullptr || swr_init(cleanup.swr) < 0) {
+        reason = "cannot create the audio resampler";
+        return false;
+      }
+    }
+    cleanup.fifo = av_audio_fifo_alloc(
+        cleanup.audioEnc->sample_fmt, cleanup.audioEnc->ch_layout.nb_channels,
+        1);
+    if (cleanup.fifo == nullptr) {
+      reason = "cannot create the audio fifo";
+      return false;
+    }
+  }
+
+  // Subtitle lanes: copied with segment-local timing (the concat assembly
+  // then offsets them by each source's start — the "cue offsets per source
+  // start" semantics).
+  std::vector<std::pair<int, int>> subInOut;
+  if (keepSubtitles) {
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      if (in->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+        continue;
+      }
+      AVStream *outSub = avformat_new_stream(cleanup.out, nullptr);
+      if (outSub == nullptr) {
+        continue;
+      }
+      avcodec_parameters_copy(outSub->codecpar, in->streams[i]->codecpar);
+      outSub->codecpar->codec_tag = 0;
+      av_dict_copy(&outSub->metadata, in->streams[i]->metadata, 0);
+      outSub->disposition = in->streams[i]->disposition;
+      subInOut.emplace_back(int(i), int(cleanup.out->nb_streams) - 1);
+    }
+  }
+
+  av_dict_copy(&cleanup.out->metadata, in->metadata, AV_DICT_DONT_OVERWRITE);
+  if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
+    const int ioRc = avio_open(&cleanup.out->pb, segPath.c_str(),
+                               AVIO_FLAG_WRITE);
+    if (ioRc < 0) {
+      writeRc = ioRc;
+      reason = "cannot open the segment output";
+      return false;
+    }
+  }
+  if (avformat_write_header(cleanup.out, nullptr) < 0) {
+    writeRc = AVERROR(EIO);
+    reason = "cannot write the segment header";
+    return false;
+  }
+
+  bool writeFailed = false;
+  const auto writePacket = [&](AVPacket *pkt, int outIndex) {
+    pkt->stream_index = outIndex;
+    const int rc = av_interleaved_write_frame(cleanup.out, pkt);
+    if (rc < 0) {
+      writeRc = rc;
+      writeFailed = true;
+    }
+  };
+  const auto encodeVideoFrame = [&](AVFrame *f) {
+    if (avcodec_send_frame(cleanup.videoEnc, f) == 0) {
+      AVPacket *encPacket = av_packet_alloc();
+      while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
+        av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
+                             cleanup.out->streams[std::size_t(videoOut)]
+                                 ->time_base);
+        writePacket(encPacket, videoOut);
+        av_packet_unref(encPacket);
+      }
+      av_packet_free(&encPacket);
+    }
+  };
+  const auto feedAudioFifo = [&](bool flush) {
+    if (cleanup.fifo == nullptr || cleanup.audioEnc == nullptr) {
+      return;
+    }
+    const int frameSize = cleanup.audioEnc->frame_size;
+    while (true) {
+      const int have = av_audio_fifo_size(cleanup.fifo);
+      int want = frameSize > 0 ? frameSize : have;
+      if (want <= 0) {
+        return;
+      }
+      if (have < want) {
+        if (!flush || have == 0) {
+          return;
+        }
+        want = have;
+      }
+      AVFrame *audioFrame = av_frame_alloc();
+      audioFrame->format = cleanup.audioEnc->sample_fmt;
+      audioFrame->sample_rate = cleanup.audioEnc->sample_rate;
+      av_channel_layout_copy(&audioFrame->ch_layout,
+                             &cleanup.audioEnc->ch_layout);
+      audioFrame->nb_samples = want;
+      if (av_frame_get_buffer(audioFrame, 0) < 0 ||
+          av_audio_fifo_read(cleanup.fifo,
+                             reinterpret_cast<void **>(audioFrame->data),
+                             want) < want) {
+        av_frame_free(&audioFrame);
+        return;
+      }
+      audioFrame->pts = audioSamplesOut;
+      audioSamplesOut += want;
+      if (avcodec_send_frame(cleanup.audioEnc, audioFrame) == 0) {
+        AVPacket *encPacket = av_packet_alloc();
+        while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+          av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                               cleanup.out->streams[std::size_t(audioOut)]
+                                   ->time_base);
+          writePacket(encPacket, audioOut);
+          av_packet_unref(encPacket);
+        }
+        av_packet_free(&encPacket);
+      }
+      av_frame_free(&audioFrame);
+      if (frameSize <= 0 || (flush && av_audio_fifo_size(cleanup.fifo) == 0)) {
+        return;
+      }
+    }
+  };
+  const auto encodeAudioFrame = [&](AVFrame *srcFrame) {
+    if (cleanup.swr == nullptr) {
+      return;
+    }
+    const int maxOut = swr_get_out_samples(cleanup.swr, srcFrame->nb_samples);
+    if (maxOut <= 0) {
+      return;
+    }
+    uint8_t **buffer = nullptr;
+    if (av_samples_alloc_array_and_samples(
+            &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels, maxOut,
+            cleanup.audioEnc->sample_fmt, 0) < 0 ||
+        buffer == nullptr) {
+      return;
+    }
+    const int converted = swr_convert(
+        cleanup.swr, buffer, maxOut,
+        const_cast<const uint8_t **>(srcFrame->data), srcFrame->nb_samples);
+    if (converted > 0 &&
+        av_audio_fifo_write(cleanup.fifo, reinterpret_cast<void **>(buffer),
+                            converted) < converted) {
+      writeFailed = true;
+    }
+    if (buffer != nullptr) {
+      av_freep(&buffer[0]);
+      av_freep(&buffer);
+    }
+    feedAudioFifo(false);
+  };
+
+  const AVRational sinkTb =
+      vsink != nullptr ? av_buffersink_get_time_base(vsink) : AVRational{0, 1};
+  const AVRational decTb =
+      cleanup.videoDec != nullptr ? cleanup.videoDec->time_base
+                                  : AVRational{1, 1000000};
+  bool cancelled = false;
+  bool demuxEof = false;
+  while (!writeFailed && !cancelled && !demuxEof) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      cancelled = true;
+      break;
+    }
+    if (av_read_frame(in, cleanup.packet) < 0) {
+      demuxEof = true;
+    }
+    if (!demuxEof) {
+      const int streamIndex = cleanup.packet->stream_index;
+      if (streamIndex == videoStream && cleanup.videoDec != nullptr &&
+          cleanup.videoEnc != nullptr) {
+        if (avcodec_send_packet(cleanup.videoDec, cleanup.packet) == 0) {
+          while (avcodec_receive_frame(cleanup.videoDec, cleanup.frame) == 0) {
+            if (vsrc != nullptr && vsink != nullptr) {
+              av_buffersrc_add_frame_flags(vsrc, cleanup.frame,
+                                           AV_BUFFERSRC_FLAG_KEEP_REF);
+              AVFrame *filt = av_frame_alloc();
+              while (av_buffersink_get_frame(vsink, filt) >= 0) {
+                std::int64_t graphUs = AV_NOPTS_VALUE;
+                if (filt->pts != AV_NOPTS_VALUE) {
+                  graphUs = av_rescale_q(filt->pts, sinkTb,
+                                         AVRational{1, 1000000});
+                }
+                if (graphUs != AV_NOPTS_VALUE) {
+                  if (videoFirstUs == AV_NOPTS_VALUE) {
+                    videoFirstUs = graphUs;
+                  }
+                  const std::int64_t localUs =
+                      std::max<std::int64_t>(0, graphUs - videoFirstUs);
+                  lastVideoUs = std::max(lastVideoUs, localUs);
+                  filt->pts = av_rescale_q(localUs, AVRational{1, 1000000},
+                                           cleanup.videoEnc->time_base);
+                }
+                filt->pict_type = AV_PICTURE_TYPE_NONE;
+                encodeVideoFrame(filt);
+                av_frame_unref(filt);
+              }
+              av_frame_free(&filt);
+            }
+            av_frame_unref(cleanup.frame);
+            if (params.onProgress && durationUs > 0) {
+              ProgressReport report;
+              report.processedDurationUs =
+                  std::min(lastVideoUs, durationUs);
+              report.totalDurationUs = durationUs;
+              report.fraction = std::clamp(
+                  double(report.processedDurationUs) / double(durationUs),
+                  0.0, 1.0);
+              params.onProgress(report);
+            }
+          }
+        }
+      } else if (wantAudio && cleanup.audioDec != nullptr &&
+                 audioInStreamRef != nullptr &&
+                 streamIndex == audioInStreamRef->index) {
+        if (avcodec_send_packet(cleanup.audioDec, cleanup.packet) == 0) {
+          while (avcodec_receive_frame(cleanup.audioDec, cleanup.frame) == 0) {
+            encodeAudioFrame(cleanup.frame);
+            av_frame_unref(cleanup.frame);
+          }
+        }
+      } else {
+        int subOut = -1;
+        for (const auto &pair : subInOut) {
+          if (pair.first == streamIndex) {
+            subOut = pair.second;
+            break;
+          }
+        }
+        if (subOut >= 0) {
+          AVPacket *outPacket = av_packet_alloc();
+          av_packet_move_ref(outPacket, cleanup.packet);
+          const AVStream *srcSub = in->streams[std::size_t(streamIndex)];
+          const AVStream *dstSub =
+              cleanup.out->streams[std::size_t(subOut)];
+          const AVRounding rounding = static_cast<AVRounding>(
+              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+          if (outPacket->pts != AV_NOPTS_VALUE) {
+            std::int64_t pts = av_rescale_q_rnd(outPacket->pts,
+                                                srcSub->time_base,
+                                                dstSub->time_base, rounding);
+            if (pts < 0) {
+              pts = 0;
+            }
+            outPacket->pts = pts;
+          }
+          if (outPacket->dts != AV_NOPTS_VALUE) {
+            outPacket->dts = av_rescale_q_rnd(
+                outPacket->dts, srcSub->time_base, dstSub->time_base, rounding);
+            if (outPacket->dts < 0) {
+              outPacket->dts = 0;
+            }
+          }
+          if (outPacket->duration > 0) {
+            outPacket->duration =
+                av_rescale_q(outPacket->duration, srcSub->time_base,
+                             dstSub->time_base);
+          }
+          outPacket->pos = -1;
+          writePacket(outPacket, subOut);
+          av_packet_free(&outPacket);
+          av_packet_unref(cleanup.packet);
+          continue;
+        }
+      }
+      av_packet_unref(cleanup.packet);
+    }
+  }
+  (void)decTb;
+  if (cancelled) {
+    reason = "cancelled";
+    return false;
+  }
+  if (writeFailed) {
+    return false;
+  }
+
+  // Drains: decoder -> graph -> encoder, then the audio tail.
+  if (cleanup.videoDec != nullptr) {
+    avcodec_send_packet(cleanup.videoDec, nullptr);
+    while (avcodec_receive_frame(cleanup.videoDec, cleanup.frame) == 0) {
+      if (vsrc != nullptr) {
+        av_buffersrc_add_frame_flags(vsrc, cleanup.frame,
+                                     AV_BUFFERSRC_FLAG_KEEP_REF);
+      }
+      av_frame_unref(cleanup.frame);
+    }
+    if (vsrc != nullptr) {
+      av_buffersrc_add_frame(vsrc, nullptr);
+      AVFrame *filt = av_frame_alloc();
+      while (av_buffersink_get_frame(vsink, filt) >= 0) {
+        std::int64_t graphUs = AV_NOPTS_VALUE;
+        if (filt->pts != AV_NOPTS_VALUE) {
+          graphUs =
+              av_rescale_q(filt->pts, sinkTb, AVRational{1, 1000000});
+        }
+        if (graphUs != AV_NOPTS_VALUE) {
+          if (videoFirstUs == AV_NOPTS_VALUE) {
+            videoFirstUs = graphUs;
+          }
+          const std::int64_t localUs =
+              std::max<std::int64_t>(0, graphUs - videoFirstUs);
+          lastVideoUs = std::max(lastVideoUs, localUs);
+          filt->pts = av_rescale_q(localUs, AVRational{1, 1000000},
+                                   cleanup.videoEnc->time_base);
+        }
+        filt->pict_type = AV_PICTURE_TYPE_NONE;
+        encodeVideoFrame(filt);
+        av_frame_unref(filt);
+      }
+      av_frame_free(&filt);
+    }
+    avcodec_send_frame(cleanup.videoEnc, nullptr);
+    AVPacket *encPacket = av_packet_alloc();
+    while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
+      av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
+                           cleanup.out->streams[std::size_t(videoOut)]
+                               ->time_base);
+      writePacket(encPacket, videoOut);
+      av_packet_unref(encPacket);
+    }
+    av_packet_free(&encPacket);
+  }
+
+  if (wantAudio) {
+    if (cleanup.swr != nullptr && cleanup.fifo != nullptr) {
+      while (true) {
+        const int estimate = swr_get_out_samples(cleanup.swr, 0);
+        if (estimate <= 0) {
+          break;
+        }
+        uint8_t **buffer = nullptr;
+        if (av_samples_alloc_array_and_samples(
+                &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels,
+                estimate, cleanup.audioEnc->sample_fmt, 0) < 0 ||
+            buffer == nullptr) {
+          break;
+        }
+        const int converted =
+            swr_convert(cleanup.swr, buffer, estimate, nullptr, 0);
+        if (converted > 0) {
+          av_audio_fifo_write(cleanup.fifo, reinterpret_cast<void **>(buffer),
+                              converted);
+        }
+        av_freep(&buffer[0]);
+        av_freep(&buffer);
+        if (converted <= 0) {
+          break;
+        }
+      }
+    }
+    // Silence fill: tracks align on the video timeline (mandate §27.4 —
+    // missing audio in a source becomes an anullsrc-equivalent padded
+    // track; a short audio tail extends with silence to the video end).
+    if (durationUs > 0 || lastVideoUs > 0) {
+      const std::int64_t targetSamples =
+          std::max<std::int64_t>(
+              lastVideoUs, cleanup.videoDec != nullptr ? 0 : durationUs) *
+          cleanup.audioEnc->sample_rate / 1000000;
+      while (audioSamplesOut < targetSamples && !writeFailed) {
+        const int frameSize = cleanup.audioEnc->frame_size;
+        const int want = frameSize > 0
+                             ? std::min<int>(frameSize,
+                                             int(targetSamples -
+                                                 audioSamplesOut))
+                             : int(targetSamples - audioSamplesOut);
+        if (want <= 0) {
+          break;
+        }
+        AVFrame *silence = av_frame_alloc();
+        silence->format = cleanup.audioEnc->sample_fmt;
+        silence->sample_rate = cleanup.audioEnc->sample_rate;
+        av_channel_layout_copy(&silence->ch_layout,
+                               &cleanup.audioEnc->ch_layout);
+        silence->nb_samples = want;
+        if (av_frame_get_buffer(silence, 0) < 0) {
+          av_frame_free(&silence);
+          break;
+        }
+        av_samples_set_silence(silence->data, 0, want,
+                               cleanup.audioEnc->ch_layout.nb_channels,
+                               cleanup.audioEnc->sample_fmt);
+        silence->pts = audioSamplesOut;
+        audioSamplesOut += want;
+        if (avcodec_send_frame(cleanup.audioEnc, silence) == 0) {
+          AVPacket *encPacket = av_packet_alloc();
+          while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+            av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                                 cleanup.out->streams[std::size_t(audioOut)]
+                                     ->time_base);
+            writePacket(encPacket, audioOut);
+            av_packet_unref(encPacket);
+          }
+          av_packet_free(&encPacket);
+        }
+        av_frame_free(&silence);
+      }
+    }
+    feedAudioFifo(true);
+    avcodec_send_frame(cleanup.audioEnc, nullptr);
+    AVPacket *encPacket = av_packet_alloc();
+    while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+      av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                           cleanup.out->streams[std::size_t(audioOut)]
+                               ->time_base);
+      writePacket(encPacket, audioOut);
+      av_packet_unref(encPacket);
+    }
+    av_packet_free(&encPacket);
+  }
+
+  if (writeFailed) {
+    return false;
+  }
+  av_write_trailer(cleanup.out);
+  return true;
+}
+
+ExecuteResult FfmpegExecutor::executeMerge(const ExecuteParams &params,
+                                           const ExecutionIntent &intent) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  const auto &merge = std::get<job::Merge>(params.request.payload);
+  if (merge.sources.size() < 2) {
+    result.error = Error::make(ErrorCode::InvalidArgument,
+                               "merge needs at least two sources", "ffmpeg");
+    return result;
+  }
+  if (merge.rules.layout != MergeLayout::Sequential) {
+    return executeMergeSpatial(params, intent);
+  }
+
+  // Open every source (all demuxable — a readable container check).
+  std::vector<AVFormatContext *> inputs;
+  std::vector<std::string> paths;
+  for (const MediaSource &source : merge.sources) {
+    const std::optional<std::string> path = localPathFor(source);
+    if (!path.has_value()) {
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "unsupported merge source URI", "ffmpeg");
+      break;
+    }
+    AVFormatContext *in = nullptr;
+    if (avformat_open_input(&in, path->c_str(), nullptr, nullptr) != 0 ||
+        avformat_find_stream_info(in, nullptr) < 0) {
+      if (in != nullptr) {
+        avformat_close_input(&in);
+      }
+      result.error =
+          Error::make(ErrorCode::SourceUnavailable,
+                      "cannot open merge source " + source.displayName,
+                      "ffmpeg");
+      break;
+    }
+    inputs.push_back(in);
+    paths.push_back(*path);
+  }
+  if (!result.error.ok()) {
+    for (AVFormatContext *in : inputs) {
+      avformat_close_input(&in);
+    }
+    return result;
+  }
+
+  // Whole-job progress denominator: total duration.
+  std::int64_t totalUs = 0;
+  for (const AVFormatContext *in : inputs) {
+    if (in->duration != AV_NOPTS_VALUE && in->duration > 0) {
+      totalUs += av_rescale_q(in->duration, AVRational{1, AV_TIME_BASE},
+                              AVRational{1, 1000000});
+    }
+  }
+
+  MergeCompatibility compat;
+  const bool concatCopy = params.pipeline.videoStreamCopy &&
+                          params.pipeline.audioStreamCopy &&
+                          mergeSourcesCompatible(inputs, compat);
+  if (concatCopy) {
+    // Packet concat through the concat demuxer (list file, safe=0,
+    // escaped paths — the assembleSegments machinery).
+    if (params.onProgress) {
+      ProgressReport report;
+      report.fraction = 0.0;
+      report.totalDurationUs = totalUs;
+      params.onProgress(report);
+    }
+    int writeRc = 0;
+    if (!assembleSegments(paths, params.outputPath,
+                          params.pipeline.container, writeRc)) {
+      for (AVFormatContext *in : inputs) {
+        avformat_close_input(&in);
+      }
+      result.error = outputWriteError(writeRc, "cannot concat the sources",
+                                      params.outputPath);
+      return result;
+    }
+    for (AVFormatContext *in : inputs) {
+      avformat_close_input(&in);
+    }
+    if (params.onProgress) {
+      ProgressReport report;
+      report.fraction = 1.0;
+      report.processedDurationUs = totalUs;
+      report.totalDurationUs = totalUs;
+      params.onProgress(report);
+    }
+    struct stat st{};
+    if (::stat(params.outputPath.c_str(), &st) == 0) {
+      result.bytesWritten = st.st_size;
+    }
+    result.success = true;
+    result.pipelineSummary =
+        "merge " + std::to_string(inputs.size()) + " sources (concat stream copy)";
+    return result;
+  }
+
+  // Normalization: every source transcoded to the FIRST source's
+  // characteristics (scale+pad, audio resample, silence fill), then the
+  // segments concatenate.
+  // Reference video: the first source's first non-pic video stream.
+  const AVFormatContext *first = inputs.front();
+  int refVideo = -1;
+  for (unsigned i = 0; i < first->nb_streams; ++i) {
+    if (first->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (first->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      refVideo = int(i);
+      break;
+    }
+  }
+  std::int32_t targetW = 0;
+  std::int32_t targetH = 0;
+  AVRational targetRate{30, 1};
+  if (refVideo >= 0) {
+    const AVStream *ref = first->streams[std::size_t(refVideo)];
+    targetW = std::max(2, ref->codecpar->width & ~1);
+    targetH = std::max(2, ref->codecpar->height & ~1);
+    if (ref->avg_frame_rate.num > 0 && ref->avg_frame_rate.den > 0) {
+      targetRate = ref->avg_frame_rate;
+    }
+  }
+  // Audio reference: the first source carrying audio (missing audio in
+  // other sources becomes silence — never a silent track drop).
+  std::int32_t audioRate = 48000;
+  std::int32_t audioChannels = 2;
+  bool wantAudio = false;
+  for (const AVFormatContext *in : inputs) {
+    for (unsigned i = 0; i < in->nb_streams; ++i) {
+      if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+          audioCodecFromAv(in->streams[i]->codecpar->codec_id).has_value()) {
+        audioRate = in->streams[i]->codecpar->sample_rate > 0
+                        ? in->streams[i]->codecpar->sample_rate
+                        : audioRate;
+        audioChannels = std::clamp(
+            in->streams[i]->codecpar->ch_layout.nb_channels, 1, 8);
+        wantAudio = true;
+        break;
+      }
+    }
+    if (wantAudio) {
+      break;
+    }
+  }
+  // Subtitle policy: carry each source's subtitle lanes when their layout
+  // matches the first source's (concat maps by index); drop conflicting
+  // ones and report it in the summary.
+  bool subsDropped = false;
+  std::vector<bool> keepSubs(inputs.size(), false);
+  if (first->nb_streams > 0) {
+    std::vector<AVCodecID> firstSubs;
+    for (unsigned i = 0; i < first->nb_streams; ++i) {
+      if (first->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+        firstSubs.push_back(first->streams[i]->codecpar->codec_id);
+      }
+    }
+    keepSubs[0] = !firstSubs.empty();
+    for (std::size_t s = 1; s < inputs.size(); ++s) {
+      std::vector<AVCodecID> subs;
+      for (unsigned i = 0; i < inputs[s]->nb_streams; ++i) {
+        if (inputs[s]->streams[i]->codecpar->codec_type ==
+            AVMEDIA_TYPE_SUBTITLE) {
+          subs.push_back(inputs[s]->streams[i]->codecpar->codec_id);
+        }
+      }
+      if (subs == firstSubs) {
+        keepSubs[s] = !subs.empty();
+      } else if (!subs.empty()) {
+        subsDropped = true;
+      }
+    }
+  }
+
+  const std::string segDir = timelineScratchDir(params);
+  std::error_code ec;
+  std::filesystem::create_directories(segDir, ec);
+  const std::filesystem::path outFs(params.outputPath);
+  std::vector<std::string> segmentPaths;
+  std::int64_t doneUs = 0;
+  for (std::size_t s = 0; s < inputs.size(); ++s) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      for (AVFormatContext *in : inputs) {
+        avformat_close_input(&in);
+      }
+      result.error = Error::make(ErrorCode::Cancelled,
+                                 "merge cancelled (segments committed)",
+                                 "ffmpeg");
+      return result;
+    }
+    std::int64_t durationUs = 0;
+    if (inputs[s]->duration != AV_NOPTS_VALUE && inputs[s]->duration > 0) {
+      durationUs = av_rescale_q(inputs[s]->duration, AVRational{1, AV_TIME_BASE},
+                                AVRational{1, 1000000});
+    }
+    int audioInStream = -1;
+    if (wantAudio) {
+      for (unsigned i = 0; i < inputs[s]->nb_streams; ++i) {
+        if (inputs[s]->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+            audioCodecFromAv(inputs[s]->streams[i]->codecpar->codec_id)
+                .has_value()) {
+          audioInStream = int(i);
+          break;
+        }
+      }
+    }
+    const std::string segPath =
+        (std::filesystem::path(segDir) /
+         ("merge-" + std::to_string(s) + outFs.extension().string()))
+            .string();
+    ExecuteParams segParams = params;
+    segParams.outputPath = segPath;
+    segParams.onProgress =
+        windowProgressWrapper(params, doneUs, durationUs, totalUs);
+    int writeRc = 0;
+    std::string reason;
+    if (!transcodeMergeSegment(segParams, intent, inputs[s], durationUs,
+                               segPath, targetW, targetH, targetRate, wantAudio,
+                               audioInStream, audioRate, audioChannels,
+                               keepSubs[s], writeRc, reason)) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      for (AVFormatContext *in : inputs) {
+        avformat_close_input(&in);
+      }
+      std::filesystem::remove_all(segDir, ec);
+      result.error =
+          reason == "cancelled"
+              ? Error::make(ErrorCode::Cancelled, "merge cancelled", "ffmpeg")
+              : writeRc != 0
+                    ? outputWriteError(writeRc,
+                                       "normalized merge segment failed",
+                                       segPath)
+                    : Error::make(ErrorCode::ExecutionFailed,
+                                  "normalized merge segment failed: " + reason,
+                                  "ffmpeg");
+      return result;
+    }
+    if (!segmentArtifactUsable(segPath)) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      for (AVFormatContext *in : inputs) {
+        avformat_close_input(&in);
+      }
+      result.error = Error::make(ErrorCode::ExecutionFailed,
+                                 "merge segment failed artifact validation",
+                                 "ffmpeg");
+      return result;
+    }
+    bool checkpointCancelled = false;
+    const std::string commitError = commitTimelineCheckpoint(
+        params, s + 1, segPath, checkpointCancelled);
+    if (!commitError.empty()) {
+      std::error_code removeEc;
+      std::filesystem::remove(segPath, removeEc);
+      for (AVFormatContext *in : inputs) {
+        avformat_close_input(&in);
+      }
+      result.error = Error::make(
+          checkpointCancelled ? ErrorCode::Cancelled
+                              : ErrorCode::ExecutionFailed,
+          checkpointCancelled ? "merge cancelled (segments committed)"
+                              : commitError,
+          "ffmpeg");
+      return result;
+    }
+    segmentPaths.push_back(segPath);
+    doneUs += durationUs;
+  }
+  for (AVFormatContext *in : inputs) {
+    avformat_close_input(&in);
+  }
+
+  if (segmentPaths.size() == 1) {
+    const Error promoteError =
+        promoteSingleFile(segmentPaths.front(), params.outputPath);
+    if (!promoteError.ok()) {
+      result.error = promoteError;
+      return result;
+    }
+  } else {
+    int asmRc = 0;
+    if (!assembleSegments(segmentPaths, params.outputPath,
+                          params.pipeline.container, asmRc)) {
+      result.error = outputWriteError(asmRc,
+                                      "cannot assemble the merged segments",
+                                      params.outputPath);
+      return result;
+    }
+  }
+  std::filesystem::remove_all(segDir, ec);
+  struct stat st{};
+  if (::stat(params.outputPath.c_str(), &st) == 0) {
+    result.bytesWritten = st.st_size;
+  }
+  result.success = true;
+  result.pipelineSummary =
+      "merge " + std::to_string(inputs.size()) +
+      " sources (normalized transcode" +
+      (subsDropped ? "; later sources' conflicting subtitle tracks dropped)"
+                   : ")");
+  return result;
+}
+
+// Spatial merge (mandate §27.5): two sources, side-by-side or top-bottom
+// composition with aspect-preserving scale + pad, duration policy (longer
+// by default with a black-padded tail, shorter alternative), and audio
+// selection (First/Second/Both with mixing headroom/None).
+ExecuteResult FfmpegExecutor::executeMergeSpatial(
+    const ExecuteParams &params, const ExecutionIntent &intent) {
+  ExecuteResult result;
+  initFfmpegLabel();
+  const auto &merge = std::get<job::Merge>(params.request.payload);
+  if (merge.sources.size() != 2) {
+    result.error = Error::make(ErrorCode::InvalidArgument,
+                               "spatial merge requires exactly two sources",
+                               "ffmpeg");
+    return result;
+  }
+  const bool sideBySide = merge.rules.layout == MergeLayout::SideBySide;
+  const std::optional<std::string> path0 = localPathFor(merge.sources[0]);
+  const std::optional<std::string> path1 = localPathFor(merge.sources[1]);
+  if (!path0.has_value() || !path1.has_value()) {
+    result.error = Error::make(ErrorCode::SourceUnavailable,
+                               "unsupported merge source URI", "ffmpeg");
+    return result;
+  }
+
+  struct SpatialCleanup {
+    ~SpatialCleanup() {
+      av_frame_free(&frame);
+      av_packet_free(&packet);
+      avfilter_graph_free(&graph);
+      avfilter_graph_free(&audioGraph);
+      avcodec_free_context(&dec0);
+      avcodec_free_context(&dec1);
+      avcodec_free_context(&videoEnc);
+      avcodec_free_context(&audioDec0);
+      avcodec_free_context(&audioDec1);
+      avcodec_free_context(&audioEnc);
+      swr_free(&swr0);
+      swr_free(&swr1);
+      if (fifo != nullptr) {
+        av_audio_fifo_free(fifo);
+      }
+      if (out != nullptr) {
+        if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb != nullptr) {
+          avio_closep(&out->pb);
+        }
+        avformat_free_context(out);
+      }
+      if (in0 != nullptr) {
+        avformat_close_input(&in0);
+      }
+      if (in1 != nullptr) {
+        avformat_close_input(&in1);
+      }
+    }
+    AVFormatContext *in0 = nullptr;
+    AVFormatContext *in1 = nullptr;
+    AVFormatContext *out = nullptr;
+    AVCodecContext *dec0 = nullptr;
+    AVCodecContext *dec1 = nullptr;
+    AVCodecContext *videoEnc = nullptr;
+    AVCodecContext *audioDec0 = nullptr;
+    AVCodecContext *audioDec1 = nullptr;
+    AVCodecContext *audioEnc = nullptr;
+    SwrContext *swr0 = nullptr;
+    SwrContext *swr1 = nullptr;
+    AVAudioFifo *fifo = nullptr;
+    AVFilterGraph *graph = nullptr;
+    AVFilterGraph *audioGraph = nullptr;
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+  } cleanup;
+
+  std::string reason;
+  const auto fail = [&](ErrorCode code, const std::string &msg) {
+    result.error = Error::make(code, msg, "ffmpeg");
+    return result;
+  };
+  if (avformat_open_input(&cleanup.in0, path0->c_str(), nullptr, nullptr) != 0 ||
+      avformat_find_stream_info(cleanup.in0, nullptr) < 0 ||
+      avformat_open_input(&cleanup.in1, path1->c_str(), nullptr, nullptr) != 0 ||
+      avformat_find_stream_info(cleanup.in1, nullptr) < 0) {
+    return fail(ErrorCode::SourceUnavailable, "cannot open the merge sources");
+  }
+  int videoIn0 = -1;
+  int videoIn1 = -1;
+  for (unsigned i = 0; i < cleanup.in0->nb_streams; ++i) {
+    if (cleanup.in0->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (cleanup.in0->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      videoIn0 = int(i);
+      break;
+    }
+  }
+  for (unsigned i = 0; i < cleanup.in1->nb_streams; ++i) {
+    if (cleanup.in1->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (cleanup.in1->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      videoIn1 = int(i);
+      break;
+    }
+  }
+  if (videoIn0 < 0 || videoIn1 < 0) {
+    return fail(ErrorCode::InvalidArgument,
+                "spatial merge requires decodable video in both sources");
+  }
+  std::int64_t duration0Us = 0;
+  std::int64_t duration1Us = 0;
+  if (cleanup.in0->duration != AV_NOPTS_VALUE && cleanup.in0->duration > 0) {
+    duration0Us = av_rescale_q(cleanup.in0->duration, AVRational{1, AV_TIME_BASE},
+                               AVRational{1, 1000000});
+  }
+  if (cleanup.in1->duration != AV_NOPTS_VALUE && cleanup.in1->duration > 0) {
+    duration1Us = av_rescale_q(cleanup.in1->duration, AVRational{1, AV_TIME_BASE},
+                               AVRational{1, 1000000});
+  }
+  const std::int64_t longerUs = std::max(duration0Us, duration1Us);
+  const std::int64_t shorterUs = std::min(duration0Us, duration1Us);
+  if (merge.rules.longerDuration && (duration0Us <= 0 || duration1Us <= 0)) {
+    return fail(ErrorCode::InspectionFailed,
+                "cannot determine both source durations for the spatial "
+                "merge duration policy");
+  }
+
+  // Decoders.
+  const auto openDec = [&](AVFormatContext *in, int streamIndex,
+                           AVCodecContext *&dec) -> bool {
+    const AVCodec *decCodec =
+        avcodec_find_decoder(in->streams[std::size_t(streamIndex)]->codecpar->codec_id);
+    if (decCodec == nullptr) {
+      reason = "no decoder for the source video";
+      return false;
+    }
+    dec = avcodec_alloc_context3(decCodec);
+    avcodec_parameters_to_context(
+        dec, in->streams[std::size_t(streamIndex)]->codecpar);
+    dec->pkt_timebase = in->streams[std::size_t(streamIndex)]->time_base;
+    if (dec->time_base.num <= 0 || dec->time_base.den <= 0) {
+      dec->time_base = in->streams[std::size_t(streamIndex)]->time_base;
+    }
+    if (avcodec_open2(dec, decCodec, nullptr) < 0) {
+      reason = "cannot open the source video decoder";
+      return false;
+    }
+    return true;
+  };
+  if (!openDec(cleanup.in0, videoIn0, cleanup.dec0) ||
+      !openDec(cleanup.in1, videoIn1, cleanup.dec1)) {
+    return fail(ErrorCode::ExecutionFailed, reason);
+  }
+
+  // Composition geometry (mandate §27.5: common height = min for SBS,
+  // common width = min for TB — never unnecessary upscaling). Each input
+  // scales aspect-preserving into its slot and pads with black.
+  const std::int32_t w0 = cleanup.dec0->width;
+  const std::int32_t h0 = cleanup.dec0->height;
+  const std::int32_t w1 = cleanup.dec1->width;
+  const std::int32_t h1 = cleanup.dec1->height;
+  std::int32_t totalW = 0;
+  std::int32_t totalH = 0;
+  std::int32_t slot0W = 0;
+  std::int32_t slot0H = 0;
+  std::int32_t slot1W = 0;
+  std::int32_t slot1H = 0;
+  if (sideBySide) {
+    slot0H = slot1H = std::max(2, std::min(h0, h1) & ~1);
+    slot0W = std::max(2, int(std::lround(double(w0) * slot0H / std::max(h0, 1))) & ~1);
+    slot1W = std::max(2, int(std::lround(double(w1) * slot1H / std::max(h1, 1))) & ~1);
+    totalW = slot0W + slot1W;
+    totalH = slot0H;
+  } else {
+    slot0W = slot1W = std::max(2, std::min(w0, w1) & ~1);
+    slot0H = std::max(2, int(std::lround(double(h0) * slot0W / std::max(w0, 1))) & ~1);
+    slot1H = std::max(2, int(std::lround(double(h1) * slot1W / std::max(w1, 1))) & ~1);
+    totalW = slot0W;
+    totalH = slot0H + slot1H;
+  }
+
+  // Output + encoder.
+  if (avformat_alloc_output_context2(&cleanup.out, nullptr,
+                                     avFormatNameFor(params.pipeline.container),
+                                     params.outputPath.c_str()) < 0 ||
+      cleanup.out == nullptr) {
+    return fail(ErrorCode::ExecutionFailed, "cannot allocate the output");
+  }
+  const char *encName = encoderNameFor(params.pipeline.videoCodec);
+  const AVCodec *encCodec =
+      encName != nullptr ? avcodec_find_encoder_by_name(encName) : nullptr;
+  if (encCodec == nullptr) {
+    encCodec = avcodec_find_encoder(avCodecFor(params.pipeline.videoCodec));
+  }
+  if (encCodec == nullptr) {
+    return fail(ErrorCode::UnsupportedOperation,
+                "no encoder for the spatial merge output");
+  }
+  cleanup.videoEnc = avcodec_alloc_context3(encCodec);
+  cleanup.videoEnc->width = totalW;
+  cleanup.videoEnc->height = totalH;
+  cleanup.videoEnc->pix_fmt = AV_PIX_FMT_YUV420P;
+  AVRational rate{30, 1};
+  const AVStream *rateRef = cleanup.in0->streams[std::size_t(videoIn0)];
+  if (rateRef->avg_frame_rate.num > 0 && rateRef->avg_frame_rate.den > 0) {
+    rate = rateRef->avg_frame_rate;
+  }
+  cleanup.videoEnc->framerate = rate;
+  cleanup.videoEnc->time_base = av_inv_q(rate);
+  if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
+    cleanup.videoEnc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  }
+  if (intent.rate.bitrateMode && intent.rate.bitRate > 0) {
+    cleanup.videoEnc->bit_rate = intent.rate.bitRate;
+    cleanup.videoEnc->rc_max_rate = intent.rate.bitRate;
+    cleanup.videoEnc->rc_buffer_size = intent.rate.bitRate * 2;
+  } else {
+    const int crf =
+        qualityToCrf(params.pipeline.videoCodec, intent.rate.quality);
+    av_opt_set(cleanup.videoEnc->priv_data, "crf",
+               std::to_string(crf).c_str(), 0);
+    if (params.pipeline.videoCodec == VideoCodec::AV1) {
+      av_opt_set(cleanup.videoEnc->priv_data, "preset", "8", 0);
+    }
+  }
+  if (avcodec_open2(cleanup.videoEnc, encCodec, nullptr) < 0) {
+    return fail(ErrorCode::ExecutionFailed,
+                "cannot open the spatial merge encoder");
+  }
+  const int videoOut = int(cleanup.out->nb_streams);
+  AVStream *outVideo = avformat_new_stream(cleanup.out, nullptr);
+  avcodec_parameters_from_context(outVideo->codecpar, cleanup.videoEnc);
+  outVideo->time_base = cleanup.videoEnc->time_base;
+
+  // Audio selection.
+  const MergeAudioSelection audioSel = merge.rules.audio;
+  int audioIn0 = -1;
+  int audioIn1 = -1;
+  for (unsigned i = 0; i < cleanup.in0->nb_streams; ++i) {
+    if (cleanup.in0->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+        audioCodecFromAv(cleanup.in0->streams[i]->codecpar->codec_id).has_value()) {
+      audioIn0 = int(i);
+      break;
+    }
+  }
+  for (unsigned i = 0; i < cleanup.in1->nb_streams; ++i) {
+    if (cleanup.in1->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+        audioCodecFromAv(cleanup.in1->streams[i]->codecpar->codec_id).has_value()) {
+      audioIn1 = int(i);
+      break;
+    }
+  }
+  const bool wantAudio = audioSel == MergeAudioSelection::First ||
+                         audioSel == MergeAudioSelection::Second ||
+                         audioSel == MergeAudioSelection::Both;
+  if (audioSel == MergeAudioSelection::First && audioIn0 < 0) {
+    return fail(ErrorCode::InvalidArgument,
+                "audio selection First: the first source has no audio track");
+  }
+  if (audioSel == MergeAudioSelection::Second && audioIn1 < 0) {
+    return fail(ErrorCode::InvalidArgument,
+                "audio selection Second: the second source has no audio track");
+  }
+  if (audioSel == MergeAudioSelection::Both &&
+      (audioIn0 < 0 || audioIn1 < 0)) {
+    return fail(ErrorCode::InvalidArgument,
+                "audio selection Both needs an audio track in both sources");
+  }
+  // Audio reference shape: the selected source (First/Second), else the
+  // first source's.
+  const AVStream *audioRef =
+      audioSel == MergeAudioSelection::Second && audioIn1 >= 0
+          ? cleanup.in1->streams[std::size_t(audioIn1)]
+          : (audioIn0 >= 0 ? cleanup.in0->streams[std::size_t(audioIn0)]
+                           : nullptr);
+  const std::int32_t audioRate =
+      audioRef != nullptr && audioRef->codecpar->sample_rate > 0
+          ? audioRef->codecpar->sample_rate
+          : 48000;
+  const std::int32_t audioChannels =
+      audioRef != nullptr
+          ? std::clamp(audioRef->codecpar->ch_layout.nb_channels, 1, 2)
+          : 2;
+
+  int audioOut = -1;
+  std::int64_t audioSamplesOut = 0;
+  AVFilterContext *aSrc0 = nullptr;
+  AVFilterContext *aSrc1 = nullptr;
+  AVFilterContext *aSink = nullptr;
+  if (wantAudio) {
+    const char *aEncName = encoderNameFor(params.pipeline.audioCodec);
+    const AVCodec *aEncCodec =
+        aEncName != nullptr ? avcodec_find_encoder_by_name(aEncName) : nullptr;
+    if (aEncCodec == nullptr) {
+      aEncCodec = avcodec_find_encoder(avCodecFor(params.pipeline.audioCodec));
+    }
+    if (aEncCodec == nullptr) {
+      return fail(ErrorCode::UnsupportedOperation,
+                  "no encoder for the spatial merge audio");
+    }
+    cleanup.audioEnc = avcodec_alloc_context3(aEncCodec);
+    cleanup.audioEnc->sample_rate = audioRate;
+    if (aEncCodec->supported_samplerates != nullptr) {
+      bool supported = false;
+      for (int i = 0; aEncCodec->supported_samplerates[i] != 0; ++i) {
+        if (aEncCodec->supported_samplerates[i] == audioRate) {
+          supported = true;
+          break;
+        }
+      }
+      if (!supported) {
+        return fail(ErrorCode::ExecutionFailed,
+                    "the spatial merge audio rate is not encodable");
+      }
+    }
+    av_channel_layout_default(&cleanup.audioEnc->ch_layout, audioChannels);
+    if (aEncCodec->sample_fmts != nullptr) {
+      cleanup.audioEnc->sample_fmt = aEncCodec->sample_fmts[0];
+      for (int i = 0; aEncCodec->sample_fmts[i] != -1; ++i) {
+        if (aEncCodec->sample_fmts[i] == AV_SAMPLE_FMT_FLTP) {
+          cleanup.audioEnc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+          break;
+        }
+      }
+    } else {
+      cleanup.audioEnc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+    }
+    cleanup.audioEnc->bit_rate = 128000;
+    if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
+      cleanup.audioEnc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (avcodec_open2(cleanup.audioEnc, aEncCodec, nullptr) < 0) {
+      return fail(ErrorCode::ExecutionFailed,
+                  "cannot open the spatial merge audio encoder");
+    }
+    audioOut = int(cleanup.out->nb_streams);
+    AVStream *outAudio = avformat_new_stream(cleanup.out, nullptr);
+    avcodec_parameters_from_context(outAudio->codecpar, cleanup.audioEnc);
+    outAudio->time_base = AVRational{1, cleanup.audioEnc->sample_rate};
+    cleanup.fifo =
+        av_audio_fifo_alloc(cleanup.audioEnc->sample_fmt, audioChannels, 1);
+    if (cleanup.fifo == nullptr) {
+      return fail(ErrorCode::ExecutionFailed, "cannot create the audio fifo");
+    }
+  }
+
+  // Video composition graph: two aspect-fitting scale+pad chains, a
+  // duration-policy pad/trim on the shorter/longer input, then hstack/
+  // vstack.
+  cleanup.graph = avfilter_graph_alloc();
+  const AVFilter *bufSrc = avfilter_get_by_name("buffer");
+  const AVFilter *bufSink = avfilter_get_by_name("buffersink");
+  if (cleanup.graph == nullptr || bufSrc == nullptr || bufSink == nullptr) {
+    return fail(ErrorCode::ExecutionFailed, "cannot allocate the composition graph");
+  }
+  const auto makeSrc = [&](AVCodecContext *dec, const char *name) {
+    AVRational sar = dec->sample_aspect_ratio;
+    if (sar.num <= 0 || sar.den <= 0) {
+      sar = AVRational{0, 1};
+    }
+    char srcArgs[512];
+    std::snprintf(srcArgs, sizeof(srcArgs),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  dec->width, dec->height, dec->pix_fmt, dec->time_base.num,
+                  dec->time_base.den, sar.num, sar.den);
+    return avfilter_graph_create_filter(nullptr, bufSrc, name, srcArgs,
+                                        nullptr, cleanup.graph) >= 0;
+  };
+  AVFilterContext *vsrc0 = nullptr;
+  AVFilterContext *vsrc1 = nullptr;
+  AVFilterContext *vsink = nullptr;
+  {
+    AVRational sar0 = cleanup.dec0->sample_aspect_ratio;
+    if (sar0.num <= 0 || sar0.den <= 0) {
+      sar0 = AVRational{0, 1};
+    }
+    char srcArgs0[512];
+    std::snprintf(srcArgs0, sizeof(srcArgs0),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  cleanup.dec0->width, cleanup.dec0->height,
+                  cleanup.dec0->pix_fmt, cleanup.dec0->time_base.num,
+                  cleanup.dec0->time_base.den, sar0.num, sar0.den);
+    AVRational sar1 = cleanup.dec1->sample_aspect_ratio;
+    if (sar1.num <= 0 || sar1.den <= 0) {
+      sar1 = AVRational{0, 1};
+    }
+    char srcArgs1[512];
+    std::snprintf(srcArgs1, sizeof(srcArgs1),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  cleanup.dec1->width, cleanup.dec1->height,
+                  cleanup.dec1->pix_fmt, cleanup.dec1->time_base.num,
+                  cleanup.dec1->time_base.den, sar1.num, sar1.den);
+    if (avfilter_graph_create_filter(&vsrc0, bufSrc, "in0", srcArgs0, nullptr,
+                                     cleanup.graph) < 0 ||
+        avfilter_graph_create_filter(&vsrc1, bufSrc, "in1", srcArgs1, nullptr,
+                                     cleanup.graph) < 0 ||
+        avfilter_graph_create_filter(&vsink, bufSink, "out", nullptr, nullptr,
+                                     cleanup.graph) < 0) {
+      return fail(ErrorCode::ExecutionFailed,
+                  "cannot create the composition endpoints");
+    }
+  }
+  (void)makeSrc;
+  const enum AVPixelFormat sinkFmts[] = {AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE};
+  if (av_opt_set_bin(vsink, "pix_fmts",
+                     reinterpret_cast<const uint8_t *>(sinkFmts),
+                     sizeof(sinkFmts) - sizeof(sinkFmts[0]),
+                     AV_OPT_SEARCH_CHILDREN) < 0) {
+    return fail(ErrorCode::ExecutionFailed,
+                "cannot constrain the composition output format");
+  }
+  const auto slotChain = [&](std::int32_t w, std::int32_t h) {
+    return "scale=w=" + std::to_string(w) + ":h=" + std::to_string(h) +
+           ":force_original_aspect_ratio=decrease,pad=" + std::to_string(w) +
+           ":" + std::to_string(h) +
+           ":(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
+  };
+  std::string chain0 = slotChain(slot0W, slot0H);
+  std::string chain1 = slotChain(slot1W, slot1H);
+  bool shortestPolicy = false;
+  if (merge.rules.longerDuration) {
+    // Black-pad the shorter input's tail to the longer duration (tpad).
+    const double deltaSec =
+        std::max<std::int64_t>(longerUs - shorterUs, 0) / 1000000.0;
+    char padArgs[96];
+    std::snprintf(padArgs, sizeof(padArgs),
+                  ",tpad=stop_mode=add:color=black:stop_duration=%.3f",
+                  deltaSec);
+    if (duration0Us <= duration1Us) {
+      chain0 += padArgs;
+    } else {
+      chain1 += padArgs;
+    }
+  } else if (duration0Us != duration1Us) {
+    shortestPolicy = true;
+  }
+  const std::string stackName = sideBySide ? "hstack" : "vstack";
+  const std::string graphDesc =
+      "[in0]" + chain0 + "[x0];[in1]" + chain1 + "[x1];[x0][x1]" + stackName +
+      "=inputs=2" + (shortestPolicy ? ":shortest=1" : "") + "[stack]";
+  AVFilterInOut *gOutputs = avfilter_inout_alloc();
+  AVFilterInOut *gInputs = avfilter_inout_alloc();
+  bool graphOk = gOutputs != nullptr && gInputs != nullptr;
+  if (graphOk) {
+    gOutputs->name = av_strdup("in0");
+    gOutputs->filter_ctx = vsrc0;
+    gOutputs->pad_idx = 0;
+    AVFilterInOut *second = avfilter_inout_alloc();
+    second->name = av_strdup("in1");
+    second->filter_ctx = vsrc1;
+    second->pad_idx = 0;
+    second->next = nullptr;
+    gOutputs->next = second;
+    gInputs->name = av_strdup("stack");
+    gInputs->filter_ctx = vsink;
+    gInputs->pad_idx = 0;
+    gInputs->next = nullptr;
+    graphOk = avfilter_graph_parse_ptr(cleanup.graph, graphDesc.c_str(),
+                                       &gInputs, &gOutputs, nullptr) >= 0;
+  }
+  avfilter_inout_free(&gInputs);
+  avfilter_inout_free(&gOutputs);
+  if (graphOk) {
+    graphOk = avfilter_graph_config(cleanup.graph, nullptr) >= 0;
+  }
+  if (!graphOk) {
+    return fail(ErrorCode::ExecutionFailed,
+                "cannot configure the composition graph (" + graphDesc + ")");
+  }
+
+  // Audio "Both": amix without normalization, both inputs pre-scaled by
+  // 0.5 (clipping protection headroom).
+  if (audioSel == MergeAudioSelection::Both) {
+    cleanup.audioGraph = avfilter_graph_alloc();
+    const AVFilter *abuf = avfilter_get_by_name("abuffer");
+    const AVFilter *amix = avfilter_get_by_name("amix");
+    const AVFilter *abufSink = avfilter_get_by_name("abuffersink");
+    if (cleanup.audioGraph == nullptr || abuf == nullptr || amix == nullptr ||
+        abufSink == nullptr) {
+      return fail(ErrorCode::ExecutionFailed, "cannot allocate the mixing graph");
+    }
+    const auto abufferArgs = [&](AVFormatContext *in, int streamIndex,
+                                 char *buf, std::size_t size) {
+      const AVCodecParameters *par = in->streams[std::size_t(streamIndex)]->codecpar;
+      char layout[64];
+      AVChannelLayout chLayout;
+      av_channel_layout_copy(&chLayout, &par->ch_layout);
+      if (av_channel_layout_describe(&chLayout, layout, sizeof(layout)) < 0) {
+        std::snprintf(layout, sizeof(layout), "stereo");
+      }
+      av_channel_layout_uninit(&chLayout);
+      std::snprintf(buf, size,
+                    "time_base=1/%d:sample_rate=%d:sample_fmt=%s"
+                    ":channel_layout=%s",
+                    par->sample_rate > 0 ? par->sample_rate : 48000,
+                    par->sample_rate > 0 ? par->sample_rate : 48000,
+                    av_get_sample_fmt_name(
+                        static_cast<AVSampleFormat>(par->format)),
+                    layout);
+    };
+    char args0[256];
+    char args1[256];
+    abufferArgs(cleanup.in0, audioIn0, args0, sizeof(args0));
+    abufferArgs(cleanup.in1, audioIn1, args1, sizeof(args1));
+    if (avfilter_graph_create_filter(&aSrc0, abuf, "a0", args0, nullptr,
+                                     cleanup.audioGraph) < 0 ||
+        avfilter_graph_create_filter(&aSrc1, abuf, "a1", args1, nullptr,
+                                     cleanup.audioGraph) < 0 ||
+        avfilter_graph_create_filter(&aSink, abufSink, "aout", nullptr,
+                                     nullptr, cleanup.audioGraph) < 0) {
+      return fail(ErrorCode::ExecutionFailed, "cannot create the mixing endpoints");
+    }
+    char layoutDesc[64];
+    AVChannelLayout outLayout;
+    av_channel_layout_default(&outLayout, audioChannels);
+    av_channel_layout_describe(&outLayout, layoutDesc, sizeof(layoutDesc));
+    av_channel_layout_uninit(&outLayout);
+    const std::string mixDesc =
+        "[a0]aresample=" + std::to_string(audioRate) +
+        ",aformat=sample_fmts=fltp:channel_layouts=" +
+        std::string(layoutDesc) + "[m0];[a1]aresample=" +
+        std::to_string(audioRate) + ",aformat=sample_fmts=fltp:channel_layouts=" +
+        std::string(layoutDesc) + "[m1];[m0][m1]amix=inputs=2:normalize=0:"
+        "weights=0.5 0.5[mout]";
+    AVFilterInOut *aOuts = avfilter_inout_alloc();
+    AVFilterInOut *aIns = avfilter_inout_alloc();
+    bool aOk = aOuts != nullptr && aIns != nullptr;
+    if (aOk) {
+      aOuts->name = av_strdup("a0");
+      aOuts->filter_ctx = aSrc0;
+      aOuts->pad_idx = 0;
+      AVFilterInOut *second = avfilter_inout_alloc();
+      second->name = av_strdup("a1");
+      second->filter_ctx = aSrc1;
+      second->pad_idx = 0;
+      second->next = nullptr;
+      aOuts->next = second;
+      aIns->name = av_strdup("mout");
+      aIns->filter_ctx = aSink;
+      aIns->pad_idx = 0;
+      aIns->next = nullptr;
+      aOk = avfilter_graph_parse_ptr(cleanup.audioGraph, mixDesc.c_str(),
+                                     &aIns, &aOuts, nullptr) >= 0;
+    }
+    avfilter_inout_free(&aIns);
+    avfilter_inout_free(&aOuts);
+    if (aOk) {
+      aOk = avfilter_graph_config(cleanup.audioGraph, nullptr) >= 0;
+    }
+    if (!aOk) {
+      return fail(ErrorCode::ExecutionFailed, "cannot configure the mixing graph");
+    }
+  } else if (wantAudio) {
+    // Single audio lane: resampler straight into the fifo.
+    const AVStream *audioStream =
+        audioSel == MergeAudioSelection::Second
+            ? cleanup.in1->streams[std::size_t(audioIn1)]
+            : cleanup.in0->streams[std::size_t(audioIn0)];
+    SwrContext **swr =
+        audioSel == MergeAudioSelection::Second ? &cleanup.swr1 : &cleanup.swr0;
+    *swr = swr_alloc();
+    AVChannelLayout inLayout;
+    av_channel_layout_copy(&inLayout, &audioStream->codecpar->ch_layout);
+    if (swr_alloc_set_opts2(swr, &cleanup.audioEnc->ch_layout,
+                            cleanup.audioEnc->sample_fmt,
+                            cleanup.audioEnc->sample_rate, &inLayout,
+                            static_cast<AVSampleFormat>(
+                                audioStream->codecpar->format),
+                            audioStream->codecpar->sample_rate > 0
+                                ? audioStream->codecpar->sample_rate
+                                : audioRate,
+                            0, nullptr) < 0) {
+      av_channel_layout_uninit(&inLayout);
+      swr_free(swr);
+    } else {
+      av_channel_layout_uninit(&inLayout);
+    }
+    if (*swr == nullptr || swr_init(*swr) < 0) {
+      return fail(ErrorCode::ExecutionFailed,
+                  "cannot create the spatial merge audio resampler");
+    }
+    const AVCodec *decCodec =
+        avcodec_find_decoder(audioStream->codecpar->codec_id);
+    AVCodecContext *&decCtx =
+        audioSel == MergeAudioSelection::Second ? cleanup.audioDec1
+                                                : cleanup.audioDec0;
+    decCtx = decCodec != nullptr ? avcodec_alloc_context3(decCodec) : nullptr;
+    if (decCtx == nullptr) {
+      return fail(ErrorCode::ExecutionFailed, "no audio decoder");
+    }
+    avcodec_parameters_to_context(decCtx, audioStream->codecpar);
+    if (avcodec_open2(decCtx, decCodec, nullptr) < 0) {
+      return fail(ErrorCode::ExecutionFailed, "cannot open the audio decoder");
+    }
+  }
+  if (audioSel == MergeAudioSelection::Both) {
+    // Decoders for both lanes.
+    for (int lane = 0; lane < 2; ++lane) {
+      const AVStream *audioStream =
+          lane == 0 ? cleanup.in0->streams[std::size_t(audioIn0)]
+                    : cleanup.in1->streams[std::size_t(audioIn1)];
+      const AVCodec *decCodec =
+          avcodec_find_decoder(audioStream->codecpar->codec_id);
+      AVCodecContext *&decCtx =
+          lane == 0 ? cleanup.audioDec0 : cleanup.audioDec1;
+      decCtx = decCodec != nullptr ? avcodec_alloc_context3(decCodec) : nullptr;
+      if (decCtx == nullptr) {
+        return fail(ErrorCode::ExecutionFailed, "no audio decoder");
+      }
+      avcodec_parameters_to_context(decCtx, audioStream->codecpar);
+      if (avcodec_open2(decCtx, decCodec, nullptr) < 0) {
+        return fail(ErrorCode::ExecutionFailed, "cannot open the audio decoder");
+      }
+    }
+  }
+
+  if (!(cleanup.out->oformat->flags & AVFMT_NOFILE)) {
+    const int ioRc =
+        avio_open(&cleanup.out->pb, params.outputPath.c_str(), AVIO_FLAG_WRITE);
+    if (ioRc < 0) {
+      result.error = outputWriteError(ioRc, "open output", params.outputPath);
+      return result;
+    }
+  }
+  if (avformat_write_header(cleanup.out, nullptr) < 0) {
+    result.error =
+        outputWriteError(AVERROR(EIO), "write header", params.outputPath);
+    return result;
+  }
+
+  bool writeFailed = false;
+  int writeRc = 0;
+  const AVRational vSinkTb = av_buffersink_get_time_base(vsink);
+  std::int64_t firstStackUs = AV_NOPTS_VALUE;
+  std::int64_t lastStackUs = 0;
+  const auto encodeVideoFrame = [&](AVFrame *f) {
+    if (avcodec_send_frame(cleanup.videoEnc, f) == 0) {
+      AVPacket *encPacket = av_packet_alloc();
+      while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
+        encPacket->stream_index = videoOut;
+        av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
+                             cleanup.out->streams[std::size_t(videoOut)]
+                                 ->time_base);
+        const int rc = av_interleaved_write_frame(cleanup.out, encPacket);
+        if (rc < 0) {
+          writeRc = rc;
+          writeFailed = true;
+        }
+        av_packet_unref(encPacket);
+      }
+      av_packet_free(&encPacket);
+    }
+  };
+  const auto drainVideoSink = [&]() {
+    AVFrame *stacked = av_frame_alloc();
+    while (av_buffersink_get_frame(vsink, stacked) >= 0) {
+      std::int64_t us = AV_NOPTS_VALUE;
+      if (stacked->pts != AV_NOPTS_VALUE) {
+        us = av_rescale_q(stacked->pts, vSinkTb, AVRational{1, 1000000});
+      }
+      if (us != AV_NOPTS_VALUE) {
+        if (firstStackUs == AV_NOPTS_VALUE) {
+          firstStackUs = us;
+        }
+        lastStackUs = std::max(lastStackUs, us - firstStackUs);
+        stacked->pts = av_rescale_q(std::max<std::int64_t>(0, us - firstStackUs),
+                                    AVRational{1, 1000000},
+                                    cleanup.videoEnc->time_base);
+      }
+      stacked->pict_type = AV_PICTURE_TYPE_NONE;
+      encodeVideoFrame(stacked);
+      av_frame_unref(stacked);
+      if (params.onProgress && longerUs > 0 && lastStackUs > 0) {
+        ProgressReport report;
+        report.processedDurationUs = lastStackUs;
+        report.totalDurationUs = longerUs;
+        report.fraction =
+            std::clamp(double(lastStackUs) / double(longerUs), 0.0, 1.0);
+        params.onProgress(report);
+      }
+    }
+    av_frame_free(&stacked);
+  };
+  const auto feedAudioFifo = [&](bool flush) {
+    if (cleanup.fifo == nullptr || cleanup.audioEnc == nullptr) {
+      return;
+    }
+    const int frameSize = cleanup.audioEnc->frame_size;
+    while (true) {
+      const int have = av_audio_fifo_size(cleanup.fifo);
+      int want = frameSize > 0 ? frameSize : have;
+      if (want <= 0) {
+        return;
+      }
+      if (have < want) {
+        if (!flush || have == 0) {
+          return;
+        }
+        want = have;
+      }
+      AVFrame *audioFrame = av_frame_alloc();
+      audioFrame->format = cleanup.audioEnc->sample_fmt;
+      audioFrame->sample_rate = cleanup.audioEnc->sample_rate;
+      av_channel_layout_copy(&audioFrame->ch_layout,
+                             &cleanup.audioEnc->ch_layout);
+      audioFrame->nb_samples = want;
+      if (av_frame_get_buffer(audioFrame, 0) < 0 ||
+          av_audio_fifo_read(cleanup.fifo,
+                             reinterpret_cast<void **>(audioFrame->data),
+                             want) < want) {
+        av_frame_free(&audioFrame);
+        return;
+      }
+      audioFrame->pts = audioSamplesOut;
+      audioSamplesOut += want;
+      if (avcodec_send_frame(cleanup.audioEnc, audioFrame) == 0) {
+        AVPacket *encPacket = av_packet_alloc();
+        while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+          encPacket->stream_index = audioOut;
+          av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                               cleanup.out->streams[std::size_t(audioOut)]
+                                   ->time_base);
+          const int rc = av_interleaved_write_frame(cleanup.out, encPacket);
+          if (rc < 0) {
+            writeRc = rc;
+            writeFailed = true;
+          }
+          av_packet_unref(encPacket);
+        }
+        av_packet_free(&encPacket);
+      }
+      av_frame_free(&audioFrame);
+      if (frameSize <= 0 ||
+          (flush && av_audio_fifo_size(cleanup.fifo) == 0)) {
+        return;
+      }
+    }
+  };
+  const auto pushAudioToLane = [&](int lane, AVFrame *decoded) {
+    if (audioSel == MergeAudioSelection::Both) {
+      AVFilterContext *src = lane == 0 ? aSrc0 : aSrc1;
+      if (src != nullptr) {
+        av_buffersrc_add_frame_flags(src, decoded, AV_BUFFERSRC_FLAG_KEEP_REF);
+        AVFrame *mixed = av_frame_alloc();
+        while (aSink != nullptr &&
+               av_buffersink_get_frame(aSink, mixed) >= 0) {
+          // Resample the mix output into the fifo.
+          if (cleanup.swr0 == nullptr) {
+            cleanup.swr0 = swr_alloc();
+            AVChannelLayout inLayout;
+            av_channel_layout_copy(&inLayout, &mixed->ch_layout);
+            if (swr_alloc_set_opts2(&cleanup.swr0, &cleanup.audioEnc->ch_layout,
+                                    cleanup.audioEnc->sample_fmt,
+                                    cleanup.audioEnc->sample_rate, &inLayout,
+                                    static_cast<AVSampleFormat>(mixed->format),
+                                    mixed->sample_rate > 0
+                                        ? mixed->sample_rate
+                                        : cleanup.audioEnc->sample_rate,
+                                    0, nullptr) < 0) {
+              av_channel_layout_uninit(&inLayout);
+              swr_free(&cleanup.swr0);
+            } else {
+              av_channel_layout_uninit(&inLayout);
+            }
+            if (cleanup.swr0 == nullptr || swr_init(cleanup.swr0) < 0) {
+              av_frame_free(&mixed);
+              return;
+            }
+          }
+          const int maxOut = swr_get_out_samples(cleanup.swr0, mixed->nb_samples);
+          if (maxOut > 0) {
+            uint8_t **buffer = nullptr;
+            if (av_samples_alloc_array_and_samples(
+                    &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels,
+                    maxOut, cleanup.audioEnc->sample_fmt, 0) == 0 &&
+                buffer != nullptr) {
+              const int converted = swr_convert(
+                  cleanup.swr0, buffer, maxOut,
+                  const_cast<const uint8_t **>(mixed->data),
+                  mixed->nb_samples);
+              if (converted > 0 &&
+                  av_audio_fifo_write(cleanup.fifo,
+                                      reinterpret_cast<void **>(buffer),
+                                      converted) < converted) {
+                writeFailed = true;
+              }
+              av_freep(&buffer[0]);
+              av_freep(&buffer);
+            }
+          }
+          feedAudioFifo(false);
+          av_frame_unref(mixed);
+        }
+        av_frame_free(&mixed);
+      }
+      return;
+    }
+    // Single lane: through this lane's resampler.
+    SwrContext *resampler = lane == 0 ? cleanup.swr0 : cleanup.swr1;
+    if (resampler == nullptr) {
+      return;
+    }
+    const int maxOut = swr_get_out_samples(resampler, decoded->nb_samples);
+    if (maxOut <= 0) {
+      return;
+    }
+    uint8_t **buffer = nullptr;
+    if (av_samples_alloc_array_and_samples(
+            &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels, maxOut,
+            cleanup.audioEnc->sample_fmt, 0) < 0 ||
+        buffer == nullptr) {
+      return;
+    }
+    const int converted = swr_convert(
+        resampler, buffer, maxOut,
+        const_cast<const uint8_t **>(decoded->data), decoded->nb_samples);
+    if (converted > 0 &&
+        av_audio_fifo_write(cleanup.fifo, reinterpret_cast<void **>(buffer),
+                            converted) < converted) {
+      writeFailed = true;
+    }
+    av_freep(&buffer[0]);
+    av_freep(&buffer);
+    feedAudioFifo(false);
+  };
+
+  // Central loop: pump both inputs, decode, feed the composition graph.
+  bool cancelled = false;
+  bool eof0 = false;
+  bool eof1 = false;
+  while ((!eof0 || !eof1) && !writeFailed && !cancelled) {
+    if (params.cancel && params.cancel->isCancelled()) {
+      cancelled = true;
+      break;
+    }
+    for (int lane = 0; lane < 2 && !writeFailed; ++lane) {
+      AVFormatContext *in = lane == 0 ? cleanup.in0 : cleanup.in1;
+      bool &eof = lane == 0 ? eof0 : eof1;
+      int videoIn = lane == 0 ? videoIn0 : videoIn1;
+      int audioIn = lane == 0 ? audioIn0 : audioIn1;
+      AVCodecContext *videoDec = lane == 0 ? cleanup.dec0 : cleanup.dec1;
+      AVCodecContext *audioDec =
+          lane == 0 ? cleanup.audioDec0 : cleanup.audioDec1;
+      if (eof) {
+        continue;
+      }
+      if (av_read_frame(in, cleanup.packet) < 0) {
+        eof = true;
+        avcodec_send_packet(videoDec, nullptr);
+        while (avcodec_receive_frame(videoDec, cleanup.frame) == 0) {
+          av_buffersrc_add_frame_flags(lane == 0 ? vsrc0 : vsrc1,
+                                       cleanup.frame,
+                                       AV_BUFFERSRC_FLAG_KEEP_REF);
+          av_frame_unref(cleanup.frame);
+        }
+        if (audioDec != nullptr) {
+          avcodec_send_packet(audioDec, nullptr);
+          while (avcodec_receive_frame(audioDec, cleanup.frame) == 0) {
+            pushAudioToLane(lane, cleanup.frame);
+            av_frame_unref(cleanup.frame);
+          }
+        }
+        av_buffersrc_add_frame(lane == 0 ? vsrc0 : vsrc1, nullptr);
+        continue;
+      }
+      if (cleanup.packet->stream_index == videoIn) {
+        if (avcodec_send_packet(videoDec, cleanup.packet) == 0) {
+          while (avcodec_receive_frame(videoDec, cleanup.frame) == 0) {
+            av_buffersrc_add_frame_flags(lane == 0 ? vsrc0 : vsrc1,
+                                         cleanup.frame,
+                                         AV_BUFFERSRC_FLAG_KEEP_REF);
+            av_frame_unref(cleanup.frame);
+            drainVideoSink();
+          }
+        }
+      } else if (wantAudio && cleanup.packet->stream_index == audioIn &&
+                 audioDec != nullptr) {
+        if (avcodec_send_packet(audioDec, cleanup.packet) == 0) {
+          while (avcodec_receive_frame(audioDec, cleanup.frame) == 0) {
+            pushAudioToLane(lane, cleanup.frame);
+            av_frame_unref(cleanup.frame);
+          }
+        }
+      }
+      av_packet_unref(cleanup.packet);
+      drainVideoSink();
+    }
+  }
+  if (cancelled) {
+    result.error = Error::make(ErrorCode::Cancelled, "merge cancelled", "ffmpeg");
+    return result;
+  }
+  if (writeFailed) {
+    result.error = outputWriteError(writeRc, "write failed during merge",
+                                    params.outputPath);
+    return result;
+  }
+
+  // Drains: graph tails, then the encoders.
+  drainVideoSink();
+  avcodec_send_frame(cleanup.videoEnc, nullptr);
+  {
+    AVPacket *encPacket = av_packet_alloc();
+    while (avcodec_receive_packet(cleanup.videoEnc, encPacket) == 0) {
+      encPacket->stream_index = videoOut;
+      av_packet_rescale_ts(encPacket, cleanup.videoEnc->time_base,
+                           cleanup.out->streams[std::size_t(videoOut)]->time_base);
+      const int rc = av_interleaved_write_frame(cleanup.out, encPacket);
+      if (rc < 0) {
+        writeRc = rc;
+        writeFailed = true;
+      }
+      av_packet_unref(encPacket);
+    }
+    av_packet_free(&encPacket);
+  }
+  if (wantAudio) {
+    if (audioSel == MergeAudioSelection::Both && aSrc0 != nullptr) {
+      av_buffersrc_add_frame(aSrc0, nullptr);
+      av_buffersrc_add_frame(aSrc1, nullptr);
+      AVFrame *mixed = av_frame_alloc();
+      while (aSink != nullptr && av_buffersink_get_frame(aSink, mixed) >= 0) {
+        if (cleanup.swr0 != nullptr) {
+          const int maxOut = swr_get_out_samples(cleanup.swr0, mixed->nb_samples);
+          if (maxOut > 0) {
+            uint8_t **buffer = nullptr;
+            if (av_samples_alloc_array_and_samples(
+                    &buffer, nullptr, cleanup.audioEnc->ch_layout.nb_channels,
+                    maxOut, cleanup.audioEnc->sample_fmt, 0) == 0 &&
+                buffer != nullptr) {
+              const int converted = swr_convert(
+                  cleanup.swr0, buffer, maxOut,
+                  const_cast<const uint8_t **>(mixed->data),
+                  mixed->nb_samples);
+              if (converted > 0) {
+                av_audio_fifo_write(cleanup.fifo,
+                                    reinterpret_cast<void **>(buffer),
+                                    converted);
+              }
+              av_freep(&buffer[0]);
+              av_freep(&buffer);
+            }
+          }
+        }
+        av_frame_unref(mixed);
+      }
+      av_frame_free(&mixed);
+    }
+    feedAudioFifo(true);
+    avcodec_send_frame(cleanup.audioEnc, nullptr);
+    AVPacket *encPacket = av_packet_alloc();
+    while (avcodec_receive_packet(cleanup.audioEnc, encPacket) == 0) {
+      encPacket->stream_index = audioOut;
+      av_packet_rescale_ts(encPacket, cleanup.audioEnc->time_base,
+                           cleanup.out->streams[std::size_t(audioOut)]
+                               ->time_base);
+      const int rc = av_interleaved_write_frame(cleanup.out, encPacket);
+      if (rc < 0) {
+        writeRc = rc;
+        writeFailed = true;
+      }
+      av_packet_unref(encPacket);
+    }
+    av_packet_free(&encPacket);
+  }
+  if (writeFailed) {
+    result.error = outputWriteError(writeRc, "write failed during merge",
+                                    params.outputPath);
+    return result;
+  }
+  av_write_trailer(cleanup.out);
+  struct stat st{};
+  if (::stat(params.outputPath.c_str(), &st) == 0) {
+    result.bytesWritten = st.st_size;
+  }
+  result.success = true;
+  result.pipelineSummary = std::string("merge ") +
+                           (sideBySide ? "side-by-side" : "top-bottom") +
+                           " (2 sources" +
+                           (audioSel == MergeAudioSelection::None
+                                ? ", no audio)"
+                                : audioSel == MergeAudioSelection::Both
+                                      ? ", mixed audio)"
+                                      : ")");
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // FfmpegBackend
 // ---------------------------------------------------------------------------
+
+// Velmux frame extraction (mandate §29): real decoded frame identity,
+// JPEG/PNG/still-WebP output, orientation resolution, manifest.
+// Appended into velmux::ffmpeg (ffmpeg_backend.cpp) before
+// FfmpegBackend::initialize().
+ExecuteResult FfmpegExecutor::executeExtractFrames(
+    const ExecuteParams &params, const ExecutionIntent &intent) {
+  ExecuteResult result;
+  const auto &payload = std::get<job::ExtractFrames>(params.request.payload);
+  const FrameSelection &selection = intent.frameSelection;
+  const ImageOutputRules &rules = intent.imageRules;
+
+  const auto fail = [&](ErrorCode code, const std::string &msg) {
+    result.error = Error::make(code, msg, "ffmpeg");
+    return result;
+  };
+  const auto escapeJson = [](const std::string &text) {
+    std::string out;
+    for (unsigned char c : text) {
+      switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", unsigned(c));
+          out += buf;
+        } else {
+          out.push_back(char(c));
+        }
+      }
+    }
+    return out;
+  };
+  const auto modeName = [](FrameSelectionMode mode) -> const char * {
+    switch (mode) {
+    case FrameSelectionMode::Current:
+      return "current";
+    case FrameSelectionMode::Selected:
+      return "selected";
+    case FrameSelectionMode::Interval:
+      return "interval";
+    case FrameSelectionMode::FrameRate:
+      return "frame-rate";
+    case FrameSelectionMode::Count:
+      return "count";
+    case FrameSelectionMode::AllInRange:
+      return "all";
+    case FrameSelectionMode::Keyframes:
+      return "keyframes";
+    case FrameSelectionMode::SceneChanges:
+      return "scene-changes";
+    }
+    return "unknown";
+  };
+
+  // Output layout: the primary output path is the manifest location;
+  // images live beside it.
+  const std::string dir = [p = params.outputPath]() {
+    const auto slash = p.rfind('/');
+    return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
+  }();
+  const std::string stem = [p = params.outputPath]() {
+    auto base = p;
+    const auto slash = base.rfind('/');
+    if (slash != std::string::npos) {
+      base = base.substr(slash + 1);
+    }
+    const auto dot = base.rfind('.');
+    if (dot != std::string::npos) {
+      base = base.substr(0, dot);
+    }
+    return base;
+  }();
+  const char *imageExt = rules.format == ImageOutputRules::Format::Jpeg
+                             ? "jpg"
+                             : (rules.format == ImageOutputRules::Format::Png
+                                    ? "png"
+                                    : "webp");
+  const std::string manifestPath = dir + "/" + stem + "_manifest.json";
+
+  struct FramesCleanup {
+    ~FramesCleanup() {
+      avformat_close_input(&in);
+      avcodec_free_context(&dec);
+      avcodec_free_context(&imgEnc);
+      sws_freeContext(toRgba);
+      sws_freeContext(toTarget);
+      av_frame_free(&frame);
+      av_frame_free(&rgba);
+      av_frame_free(&best);
+      av_frame_free(&converted);
+      av_packet_free(&packet);
+      if (convertedBuffers[0] != nullptr) {
+        av_freep(&convertedBuffers[0]);
+      }
+      if (rgbaBuffer != nullptr) {
+        av_free(rgbaBuffer);
+      }
+    }
+    AVFormatContext *in = nullptr;
+    AVCodecContext *dec = nullptr;
+    AVCodecContext *imgEnc = nullptr;
+    SwsContext *toRgba = nullptr;
+    SwsContext *toTarget = nullptr;
+    AVFrame *frame = av_frame_alloc();
+    AVFrame *rgba = av_frame_alloc();
+    AVFrame *best = av_frame_alloc();
+    AVFrame *converted = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+    uint8_t *rgbaBuffer = nullptr;
+    uint8_t *convertedBuffers[4] = {nullptr, nullptr, nullptr, nullptr};
+    int convertedLinesizes[4] = {0, 0, 0, 0};
+  } cleanup;
+
+  if (avformat_open_input(&cleanup.in, payload.source.uri.c_str(), nullptr,
+                          nullptr) != 0 ||
+      avformat_find_stream_info(cleanup.in, nullptr) < 0) {
+    return fail(ErrorCode::SourceUnavailable,
+                "cannot open the frame extraction source");
+  }
+  int videoIn = -1;
+  for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
+    AVStream *stream = cleanup.in->streams[i];
+    if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0) {
+      videoIn = int(i);
+      break;
+    }
+  }
+  if (videoIn < 0) {
+    return fail(ErrorCode::UnsupportedOperation,
+                "the source has no timed video stream to extract frames "
+                "from");
+  }
+  AVStream *videoStream = cleanup.in->streams[videoIn];
+  const AVCodec *decoder =
+      avcodec_find_decoder(videoStream->codecpar->codec_id);
+  if (decoder == nullptr) {
+    return fail(ErrorCode::DecoderUnavailable,
+                "no decoder for the source video codec");
+  }
+  cleanup.dec = avcodec_alloc_context3(decoder);
+  if (avcodec_parameters_to_context(cleanup.dec, videoStream->codecpar) < 0 ||
+      avcodec_open2(cleanup.dec, decoder, nullptr) < 0) {
+    return fail(ErrorCode::DecoderUnavailable,
+                "cannot open the source video decoder");
+  }
+
+  // Orientation: resolve the display rotation ONCE (mandate §29.3).
+  int rotation = 0;
+  {
+    const uint8_t *data = av_stream_get_side_data(
+        videoStream, AV_PKT_DATA_DISPLAYMATRIX, nullptr);
+    if (data != nullptr) {
+      const double degrees =
+          -av_display_rotation_get(reinterpret_cast<const int32_t *>(data));
+      if (degrees > 315 || degrees <= -315) {
+        rotation = 0;
+      } else if (degrees > 45 && degrees <= 135) {
+        rotation = 90;
+      } else if (degrees > 135 || degrees <= -45) {
+        rotation = 180;
+      } else {
+        rotation = 270;
+      }
+    }
+  }
+
+  // Range resolution.
+  std::int64_t durationUs = 0;
+  if (videoStream->duration > 0) {
+    durationUs = av_rescale_q(videoStream->duration, videoStream->time_base,
+                              AVRational{1, 1000000});
+  } else if (cleanup.in->duration > 0) {
+    durationUs = std::int64_t(cleanup.in->duration * 1000000.0);
+  }
+  std::int64_t rangeStartUs = selection.range.startUs;
+  std::int64_t rangeEndUs =
+      selection.range.endUs < 0 ? durationUs : selection.range.endUs;
+  if (rangeEndUs <= rangeStartUs) {
+    return fail(ErrorCode::InvalidTimeRange, "frame selection range is "
+                                             "empty");
+  }
+
+  // Image encoder setup.
+  const char *encoderName = rules.format == ImageOutputRules::Format::Jpeg
+                                ? "mjpeg"
+                                : (rules.format == ImageOutputRules::Format::Png
+                                       ? "png"
+                                       : "libwebp");
+  const AVCodec *imgCodec = avcodec_find_encoder_by_name(encoderName);
+  if (imgCodec == nullptr) {
+    imgCodec = avcodec_find_encoder(
+        rules.format == ImageOutputRules::Format::Jpeg
+            ? AV_CODEC_ID_MJPEG
+            : (rules.format == ImageOutputRules::Format::Png
+                   ? AV_CODEC_ID_PNG
+                   : AV_CODEC_ID_WEBP));
+  }
+  if (imgCodec == nullptr) {
+    return fail(ErrorCode::EncoderUnavailable,
+                std::string("no image encoder for ") + imageExt);
+  }
+  cleanup.imgEnc = avcodec_alloc_context3(imgCodec);
+  if (rules.format == ImageOutputRules::Format::Png) {
+    cleanup.imgEnc->pix_fmt = AV_PIX_FMT_RGBA;
+  } else {
+    // mjpeg uses the full-range yuvj420p; libwebp takes yuv420p.
+    cleanup.imgEnc->pix_fmt = rules.format == ImageOutputRules::Format::Jpeg
+                                  ? AV_PIX_FMT_YUVJ420P
+                                  : AV_PIX_FMT_YUV420P;
+  }
+  if (rules.quality.has_value() &&
+      rules.format != ImageOutputRules::Format::Png) {
+    // Quality 1..100 (higher = better). mjpeg maps it to qscale 1..31;
+    // libwebp reads global_quality in lambda units directly.
+    const int q = std::clamp(*rules.quality, 1, 100);
+    if (rules.format == ImageOutputRules::Format::WebP) {
+      cleanup.imgEnc->global_quality = q * FF_QP2LAMBDA;
+    } else {
+      const int qscale = 1 + (100 - q) * 30 / 99;
+      cleanup.imgEnc->global_quality = qscale * FF_QP2LAMBDA;
+    }
+    cleanup.imgEnc->flags |= AV_CODEC_FLAG_QSCALE;
+  }
+  cleanup.imgEnc->time_base = AVRational{1, 1000000};
+  if (avcodec_open2(cleanup.imgEnc, imgCodec, nullptr) < 0) {
+    return fail(ErrorCode::EncoderUnavailable, "cannot open the image "
+                                               "encoder");
+  }
+
+  const int srcW = cleanup.dec->width;
+  const int srcH = cleanup.dec->height;
+  if (srcW <= 0 || srcH <= 0) {
+    return fail(ErrorCode::UnsupportedOperation,
+                "the source video has no dimensions");
+  }
+  // Target dimensions: original by default; custom bounds scale down
+  // preserving the aspect ratio (never stretch, never upscale).
+  int targetW = srcW;
+  int targetH = srcH;
+  if (rules.maxWidth.has_value() || rules.maxHeight.has_value()) {
+    double scale = 1.0;
+    if (rules.maxWidth.has_value() && srcW > *rules.maxWidth) {
+      scale = std::min(scale, double(*rules.maxWidth) / double(srcW));
+    }
+    if (rules.maxHeight.has_value() && srcH > *rules.maxHeight) {
+      scale = std::min(scale, double(*rules.maxHeight) / double(srcH));
+    }
+    targetW = std::max(2, int(double(srcW) * scale) / 2 * 2);
+    targetH = std::max(2, int(double(srcH) * scale) / 2 * 2);
+  }
+  // Rotation swaps the written image's axis for quarter turns.
+  const bool rotatedQuarter = rotation == 90 || rotation == 270;
+  const int imgW = rotatedQuarter ? targetH : targetW;
+  const int imgH = rotatedQuarter ? targetW : targetH;
+
+  // Persistent conversion buffers.
+  const int rgbaLinesize = imgW * 4;
+  cleanup.rgbaBuffer =
+      static_cast<uint8_t *>(av_malloc(size_t(rgbaLinesize) * imgH));
+  if (cleanup.rgbaBuffer == nullptr) {
+    return fail(ErrorCode::InternalError, "out of memory (rgba buffer)");
+  }
+  const int convertedSize = av_image_get_buffer_size(
+      cleanup.imgEnc->pix_fmt, imgW, imgH, 16);
+  if (convertedSize <= 0 ||
+      av_image_alloc(cleanup.convertedBuffers, cleanup.convertedLinesizes,
+                     imgW, imgH, cleanup.imgEnc->pix_fmt, 16) < 0) {
+    return fail(ErrorCode::InternalError, "out of memory (image buffer)");
+  }
+
+  struct ManifestEntry {
+    std::int64_t timestampUs;
+    std::string file;
+    std::int64_t sizeBytes;
+  };
+  std::vector<ManifestEntry> manifest;
+  std::int64_t sequence = 0;
+
+  // Frame write helper: decoded -> RGBA (scaled) -> rotate -> encode.
+  const auto writeImage = [&](AVFrame *decoded,
+                              std::int64_t ptsUs) -> bool {
+    if (cleanup.toRgba == nullptr) {
+      cleanup.toRgba = sws_getContext(
+          srcW, srcH, cleanup.dec->pix_fmt, targetW, targetH,
+          AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+      if (cleanup.toRgba == nullptr) {
+        return false;
+      }
+    }
+    {
+      uint8_t *dst[4] = {cleanup.rgbaBuffer, nullptr, nullptr, nullptr};
+      int dstLinesize[4] = {rgbaLinesize, 0, 0, 0};
+      if (sws_scale(cleanup.toRgba, decoded->data, decoded->linesize, 0,
+                    srcH, dst, dstLinesize) <= 0) {
+        return false;
+      }
+    }
+    // Rotation on the RGBA buffer (90 cw / 180 / 270 cw).
+    if (rotation != 0) {
+      const int w = imgW; // pre-rotation geometry for the pixel math:
+                          // 90/270 wrote the swapped dims already? No:
+      // the scale above produced targetW x targetH; quarter turns swap
+      // the axes in the output image.
+      (void)w;
+      const int preW = targetW;
+      const int preH = targetH;
+      const int postW = rotatedQuarter ? preH : preW;
+      const int postH = rotatedQuarter ? preW : preH;
+      const size_t rotatedBytes =
+          size_t(postW) * size_t(postH) * 4;
+      uint8_t *rotated =
+          static_cast<uint8_t *>(av_malloc(rotatedBytes));
+      if (rotated == nullptr) {
+        return false;
+      }
+      const uint8_t *srcBuf = cleanup.rgbaBuffer;
+      for (int y = 0; y < preH; ++y) {
+        for (int x = 0; x < preW; ++x) {
+          const size_t srcIdx = (size_t(y) * preW + x) * 4;
+          int outX;
+          int outY;
+          if (rotation == 180) {
+            outX = preW - 1 - x;
+            outY = preH - 1 - y;
+          } else if (rotation == 90) {
+            outX = preH - 1 - y;
+            outY = x;
+          } else { // 270
+            outX = y;
+            outY = preW - 1 - x;
+          }
+          const size_t dstIdx = (size_t(outY) * postW + outX) * 4;
+          rotated[dstIdx + 0] = srcBuf[srcIdx + 0];
+          rotated[dstIdx + 1] = srcBuf[srcIdx + 1];
+          rotated[dstIdx + 2] = srcBuf[srcIdx + 2];
+          rotated[dstIdx + 3] = srcBuf[srcIdx + 3];
+        }
+      }
+      av_free(cleanup.rgbaBuffer);
+      cleanup.rgbaBuffer = rotated;
+    }
+    const int finalW = imgW;
+    const int finalH = imgH;
+    const int finalLinesize = finalW * 4;
+    if (cleanup.toTarget == nullptr) {
+      cleanup.toTarget = sws_getContext(
+          finalW, finalH, AV_PIX_FMT_RGBA, finalW, finalH,
+          cleanup.imgEnc->pix_fmt, SWS_BILINEAR, nullptr, nullptr, nullptr);
+      if (cleanup.toTarget == nullptr) {
+        return false;
+      }
+    }
+    {
+      uint8_t *src[4] = {cleanup.rgbaBuffer, nullptr, nullptr, nullptr};
+      int srcLinesize[4] = {finalLinesize, 0, 0, 0};
+      if (sws_scale(cleanup.toTarget, src, srcLinesize, 0, finalH,
+                    cleanup.convertedBuffers, cleanup.convertedLinesizes) <=
+          0) {
+        return false;
+      }
+    }
+    cleanup.converted->format = cleanup.imgEnc->pix_fmt;
+    cleanup.converted->width = finalW;
+    cleanup.converted->height = finalH;
+    cleanup.converted->pict_type = AV_PICTURE_TYPE_NONE;
+    av_image_fill_arrays(
+        cleanup.converted->data, cleanup.converted->linesize,
+        cleanup.convertedBuffers[0], cleanup.imgEnc->pix_fmt, finalW,
+        finalH, 16);
+    if (avcodec_send_frame(cleanup.imgEnc, cleanup.converted) < 0) {
+      return false;
+    }
+    AVPacket *encPacket = av_packet_alloc();
+    bool wrote = false;
+    std::int64_t writtenBytes = 0;
+    std::string filePath;
+    while (avcodec_receive_packet(cleanup.imgEnc, encPacket) >= 0) {
+      if (!wrote) {
+        ++sequence;
+        char nameBuf[256];
+        if (rules.sequentialNaming) {
+          std::snprintf(nameBuf, sizeof(nameBuf), "%s_%05lld.%s",
+                        stem.c_str(), static_cast<long long>(sequence),
+                        imageExt);
+        } else {
+          std::snprintf(nameBuf, sizeof(nameBuf), "%s_%lldus.%s",
+                        stem.c_str(), static_cast<long long>(ptsUs),
+                        imageExt);
+        }
+        filePath = dir + "/" + nameBuf;
+      }
+      FILE *out = fopen(filePath.c_str(), "wb");
+      if (out == nullptr) {
+        av_packet_free(&encPacket);
+        return false;
+      }
+      const size_t wroteNow = fwrite(encPacket->data, 1,
+                                     size_t(encPacket->size), out);
+      const int closeRc = fclose(out);
+      if (wroteNow != size_t(encPacket->size) || closeRc != 0) {
+        av_packet_free(&encPacket);
+        result.error = Error::make(ErrorCode::StorageFull,
+                                   "image write failed (disk full?)",
+                                   "ffmpeg");
+        return false;
+      }
+      writtenBytes += encPacket->size;
+      wrote = true;
+    }
+    av_packet_free(&encPacket);
+    if (!wrote) {
+      return false;
+    }
+    manifest.push_back(ManifestEntry{ptsUs, filePath, writtenBytes});
+    result.bytesWritten += writtenBytes;
+    return true;
+  };
+
+  const auto ptsToUs = [&](AVFrame *frame) -> std::int64_t {
+    if (frame->pts == AV_NOPTS_VALUE) {
+      return -1;
+    }
+    return av_rescale_q(frame->pts, videoStream->time_base,
+                        AVRational{1, 1000000});
+  };
+  const auto cancelled = [&]() {
+    return params.cancel != nullptr && params.cancel->isCancelled();
+  };
+  const auto reportProgress = [&](std::int64_t processedUs) {
+    if (params.onProgress == nullptr) {
+      return;
+    }
+    const std::int64_t totalUs = rangeEndUs - rangeStartUs;
+    if (totalUs <= 0) {
+      return;
+    }
+    backend::ProgressReport report;
+    report.processedDurationUs = processedUs - rangeStartUs;
+    report.totalDurationUs = totalUs;
+    report.fraction = std::clamp(
+        double(processedUs - rangeStartUs) / double(totalUs), 0.0, 1.0);
+    params.onProgress(report);
+  };
+
+  // Streaming decode over the range: writes every frame whose pts falls
+  // in [start, end) — AllInRange mode.
+  const auto decodeRange = [&](std::int64_t startUs,
+                               std::int64_t endUs) -> bool {
+    if (startUs > 0) {
+      const std::int64_t seekTs =
+          av_rescale_q(startUs, AVRational{1, 1000000},
+                       videoStream->time_base);
+      avformat_seek_file(cleanup.in, videoIn, INT64_MIN, seekTs, INT64_MAX,
+                         AVSEEK_FLAG_BACKWARD);
+      avcodec_flush_buffers(cleanup.dec);
+    }
+    bool eof = false;
+    std::int64_t lastReported = -1;
+    while (!eof) {
+      if (cancelled()) {
+        return false;
+      }
+      if (av_read_frame(cleanup.in, cleanup.packet) < 0) {
+        eof = true;
+        avcodec_send_packet(cleanup.dec, nullptr);
+      } else if (cleanup.packet->stream_index == videoIn) {
+        avcodec_send_packet(cleanup.dec, cleanup.packet);
+      }
+      if (cleanup.packet->stream_index == videoIn || eof) {
+        while (avcodec_receive_frame(cleanup.dec, cleanup.frame) >= 0) {
+          const std::int64_t us = ptsToUs(cleanup.frame);
+          if (us < 0) {
+            av_frame_unref(cleanup.frame);
+            continue;
+          }
+          if (us >= endUs) {
+            av_frame_unref(cleanup.frame);
+            return true;
+          }
+          if (us >= startUs) {
+            const bool ok = writeImage(cleanup.frame, us);
+            av_frame_unref(cleanup.frame);
+            if (!ok) {
+              return false;
+            }
+          } else {
+            av_frame_unref(cleanup.frame);
+          }
+          if (lastReported < 0 || us - lastReported >= 250000) {
+            lastReported = us;
+            reportProgress(us);
+          }
+        }
+      }
+      av_packet_unref(cleanup.packet);
+    }
+    return true;
+  };
+
+  // Resolve ONE actual frame for a requested timestamp: seek back to the
+  // keyframe at/before it and decode forward to the nearest frame at or
+  // before the request (mandate §29.1: real presentation-frame identity,
+  // never the nearest keyframe picture).
+  const auto resolveFrameAt = [&](std::int64_t requestedUs) -> bool {
+    const std::int64_t seekUs = std::max<std::int64_t>(0, requestedUs - 1000000);
+    if (seekUs > 0) {
+      const std::int64_t seekTs = av_rescale_q(
+          seekUs, AVRational{1, 1000000}, videoStream->time_base);
+      if (avformat_seek_file(cleanup.in, videoIn, INT64_MIN, seekTs,
+                             INT64_MAX, AVSEEK_FLAG_BACKWARD) < 0) {
+        return false;
+      }
+      avcodec_flush_buffers(cleanup.dec);
+    }
+    av_frame_unref(cleanup.best);
+    bool found = false;
+    bool eof = false;
+    while (!eof) {
+      if (cancelled()) {
+        return false;
+      }
+      if (av_read_frame(cleanup.in, cleanup.packet) < 0) {
+        eof = true;
+        avcodec_send_packet(cleanup.dec, nullptr);
+      } else if (cleanup.packet->stream_index == videoIn) {
+        avcodec_send_packet(cleanup.dec, cleanup.packet);
+      }
+      if (cleanup.packet->stream_index == videoIn || eof) {
+        while (avcodec_receive_frame(cleanup.dec, cleanup.frame) >= 0) {
+          const std::int64_t us = ptsToUs(cleanup.frame);
+          if (us < 0) {
+            av_frame_unref(cleanup.frame);
+            continue;
+          }
+          if (us <= requestedUs) {
+            av_frame_unref(cleanup.best);
+            av_frame_ref(cleanup.best, cleanup.frame);
+            found = true;
+            av_frame_unref(cleanup.frame);
+          } else {
+            // First frame past the request: resolve now.
+            bool ok;
+            if (found) {
+              const std::int64_t bestUs = av_rescale_q(
+                  cleanup.best->pts, videoStream->time_base,
+                  AVRational{1, 1000000});
+              ok = writeImage(cleanup.best, bestUs);
+            } else {
+              ok = writeImage(cleanup.frame, us);
+            }
+            av_frame_unref(cleanup.frame);
+            return ok;
+          }
+        }
+      }
+      av_packet_unref(cleanup.packet);
+    }
+    if (found) {
+      const std::int64_t bestUs = av_rescale_q(
+          cleanup.best->pts, videoStream->time_base, AVRational{1, 1000000});
+      return writeImage(cleanup.best, bestUs);
+    }
+    return false;
+  };
+
+  // Scene-change timestamps (real analysis, only when requested):
+  // decode through the select='gt(scene,0.3)' filter graph.
+  const auto detectSceneTimestamps = [&]() -> std::vector<std::int64_t> {
+    std::vector<std::int64_t> stamps;
+    AVFilterGraph *graph = avfilter_graph_alloc();
+    if (graph == nullptr) {
+      return stamps;
+    }
+    struct GraphCleanup {
+      ~GraphCleanup() { avfilter_graph_free(&graph); }
+      AVFilterGraph *graph;
+    } graphCleanup{graph};
+    const AVFilter *buffersrc = avfilter_get_by_name("buffer");
+    const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+    const AVFilter *selectF = avfilter_get_by_name("select");
+    if (buffersrc == nullptr || buffersink == nullptr ||
+        selectF == nullptr) {
+      return stamps;
+    }
+    AVFilterContext *src = nullptr;
+    AVFilterContext *sel = nullptr;
+    AVFilterContext *sink = nullptr;
+    char args[512];
+    std::snprintf(args, sizeof(args),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d"
+                  ":pixel_aspect=%d/%d",
+                  cleanup.dec->width, cleanup.dec->height,
+                  int(cleanup.dec->pix_fmt), videoStream->time_base.num,
+                  videoStream->time_base.den, 0, 1);
+    if (avfilter_graph_create_filter(&src, buffersrc, "in", args, nullptr,
+                                     graph) < 0 ||
+        avfilter_graph_create_filter(&sel, selectF, "sel",
+                                     "gt(scene\\,0.3)", nullptr, graph) <
+            0 ||
+        avfilter_graph_create_filter(&sink, buffersink, "out", nullptr,
+                                     nullptr, graph) < 0) {
+      return stamps;
+    }
+    if (avfilter_link(src, 0, sel, 0) != 0 ||
+        avfilter_link(sel, 0, sink, 0) != 0 ||
+        avfilter_graph_config(graph, nullptr) < 0) {
+      return stamps;
+    }
+    // Rewind + decode the whole range through the graph.
+    avformat_seek_file(cleanup.in, videoIn, INT64_MIN, 0, INT64_MAX,
+                       AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(cleanup.dec);
+    bool eof = false;
+    while (!eof) {
+      if (cancelled()) {
+        break;
+      }
+      if (av_read_frame(cleanup.in, cleanup.packet) < 0) {
+        eof = true;
+        av_buffersrc_add_frame(src, nullptr);
+      } else if (cleanup.packet->stream_index == videoIn) {
+        avcodec_send_packet(cleanup.dec, cleanup.packet);
+      }
+      if (cleanup.packet->stream_index == videoIn || eof) {
+        while (avcodec_receive_frame(cleanup.dec, cleanup.frame) >= 0) {
+          AVFrame *graphFrame = av_frame_clone(cleanup.frame);
+          av_frame_unref(cleanup.frame);
+          if (graphFrame != nullptr) {
+            if (av_buffersrc_add_frame_flags(
+                    src, graphFrame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+              AVFrame *selectedFrame = av_frame_alloc();
+              while (av_buffersink_get_frame(sink, selectedFrame) >= 0) {
+                if (selectedFrame->pts != AV_NOPTS_VALUE) {
+                  stamps.push_back(av_rescale_q(
+                      selectedFrame->pts, av_buffersink_get_time_base(sink),
+                      AVRational{1, 1000000}));
+                }
+                av_frame_unref(selectedFrame);
+              }
+              av_frame_free(&selectedFrame);
+            }
+            av_frame_free(&graphFrame);
+          }
+        }
+      }
+      av_packet_unref(cleanup.packet);
+    }
+    avcodec_flush_buffers(cleanup.dec);
+    return stamps;
+  };
+
+  bool ok = false;
+  switch (selection.mode) {
+  case FrameSelectionMode::AllInRange:
+    ok = decodeRange(rangeStartUs, rangeEndUs);
+    break;
+  case FrameSelectionMode::Current:
+  case FrameSelectionMode::Selected: {
+    ok = true;
+    for (const std::int64_t ts : selection.timestampsUs) {
+      if (cancelled()) {
+        ok = false;
+        break;
+      }
+      if (ts >= rangeStartUs && ts < rangeEndUs) {
+        ok = resolveFrameAt(ts);
+        if (!ok) {
+          break;
+        }
+      }
+    }
+    break;
+  }
+  case FrameSelectionMode::Interval:
+  case FrameSelectionMode::FrameRate:
+  case FrameSelectionMode::Count: {
+    std::vector<std::int64_t> requested;
+    if (selection.mode == FrameSelectionMode::Interval) {
+      if (selection.intervalUs <= 0) {
+        return fail(ErrorCode::InvalidArgument,
+                    "invalid extraction interval");
+      }
+      for (std::int64_t ts = rangeStartUs; ts < rangeEndUs;
+           ts += selection.intervalUs) {
+        requested.push_back(ts);
+      }
+    } else if (selection.mode == FrameSelectionMode::FrameRate) {
+      if (!selection.frameRate.valid()) {
+        return fail(ErrorCode::InvalidArgument, "invalid sampling rate");
+      }
+      const std::int64_t stepUs = 1000000LL * selection.frameRate.den /
+                                  selection.frameRate.num;
+      if (stepUs <= 0) {
+        return fail(ErrorCode::InvalidArgument, "invalid sampling rate");
+      }
+      for (std::int64_t ts = rangeStartUs; ts < rangeEndUs; ts += stepUs) {
+        requested.push_back(ts);
+      }
+    } else {
+      if (selection.count <= 0) {
+        return fail(ErrorCode::InvalidArgument, "invalid frame count");
+      }
+      const std::int64_t span = rangeEndUs - rangeStartUs;
+      for (std::int32_t k = 0; k < selection.count; ++k) {
+        const std::int64_t ts = selection.count == 1
+                                    ? rangeStartUs + span / 2
+                                    : rangeStartUs +
+                                          span * k / (selection.count - 1);
+        requested.push_back(ts);
+      }
+    }
+    // Deduplicate resolved frames by identity: consecutive requests may
+    // resolve to the same actual frame; write each actual frame once
+    // (never fabricate duplicates — mandate §29.2).
+    std::int64_t lastWrittenPts = -1;
+    ok = true;
+    for (const std::int64_t ts : requested) {
+      if (cancelled()) {
+        ok = false;
+        break;
+      }
+      const std::size_t before = manifest.size();
+      ok = resolveFrameAt(ts);
+      if (!ok) {
+        break;
+      }
+      if (manifest.size() > before) {
+        const std::int64_t writtenPts = manifest.back().timestampUs;
+        if (writtenPts == lastWrittenPts) {
+          std::remove(manifest.back().file.c_str());
+          manifest.pop_back();
+        } else {
+          lastWrittenPts = writtenPts;
+        }
+      }
+      reportProgress(ts);
+    }
+    break;
+  }
+  case FrameSelectionMode::Keyframes: {
+    // Packet-level pass (no decode): the ACTUAL random-access flags
+    // (mandate §29.2); only selected keyframe images decode.
+    ok = true;
+    std::int64_t lastReported = -1;
+    bool eof = false;
+    while (!eof && ok) {
+      if (cancelled()) {
+        ok = false;
+        break;
+      }
+      if (av_read_frame(cleanup.in, cleanup.packet) < 0) {
+        eof = true;
+      } else if (cleanup.packet->stream_index == videoIn) {
+        const std::int64_t us =
+            cleanup.packet->pts == AV_NOPTS_VALUE
+                ? -1
+                : av_rescale_q(cleanup.packet->pts, videoStream->time_base,
+                               AVRational{1, 1000000});
+        if (us >= rangeStartUs && us < rangeEndUs &&
+            (cleanup.packet->flags & AV_PKT_FLAG_KEY) != 0) {
+          // A keyframe packet decodes standalone.
+          avcodec_send_packet(cleanup.dec, cleanup.packet);
+          if (avcodec_receive_frame(cleanup.dec, cleanup.frame) >= 0) {
+            ok = writeImage(cleanup.frame, us >= 0 ? us : 0);
+            av_frame_unref(cleanup.frame);
+          }
+          avcodec_flush_buffers(cleanup.dec);
+        }
+        if (us > 0 && (lastReported < 0 || us - lastReported >= 250000)) {
+          lastReported = us;
+          reportProgress(us);
+        }
+      }
+      av_packet_unref(cleanup.packet);
+    }
+    break;
+  }
+  case FrameSelectionMode::SceneChanges: {
+    const std::vector<std::int64_t> sceneStamps = detectSceneTimestamps();
+    if (sceneStamps.empty()) {
+      return fail(ErrorCode::UnsupportedOperation,
+                  "no scene changes detected in the selection range");
+    }
+    ok = true;
+    std::int64_t lastWrittenPts = -1;
+    for (const std::int64_t ts : sceneStamps) {
+      if (cancelled()) {
+        ok = false;
+        break;
+      }
+      const std::size_t before = manifest.size();
+      ok = resolveFrameAt(ts);
+      if (!ok) {
+        break;
+      }
+      if (manifest.size() > before &&
+          manifest.back().timestampUs == lastWrittenPts) {
+        std::remove(manifest.back().file.c_str());
+        manifest.pop_back();
+      } else if (manifest.size() > before) {
+        lastWrittenPts = manifest.back().timestampUs;
+      }
+    }
+    break;
+  }
+  }
+
+  if (!ok) {
+    if (cancelled()) {
+      result.error = Error::make(ErrorCode::Cancelled, "cancelled", "ffmpeg");
+    } else if (result.error.code == ErrorCode::None) {
+      result.error =
+          Error::make(ErrorCode::ExecutionFailed, "frame extraction failed",
+                      "ffmpeg");
+    }
+    return result;
+  }
+  if (manifest.empty()) {
+    return fail(ErrorCode::UnsupportedOperation,
+                "the source cannot provide frames in the selected range");
+  }
+
+  // Manifest file (mandate §29.4): frame identity, timestamp, file.
+  {
+    std::string json = "{\"source\":\"" + escapeJson(payload.source.displayName) +
+                       "\",\"mode\":\"" + modeName(selection.mode) +
+                       "\",\"count\":" + std::to_string(manifest.size()) +
+                       ",\"frames\":[";
+    for (std::size_t i = 0; i < manifest.size(); ++i) {
+      if (i > 0) {
+        json += ",";
+      }
+      json += "{\"timestampUs\":" + std::to_string(manifest[i].timestampUs) +
+              ",\"file\":\"" + escapeJson(manifest[i].file) + "\"}";
+    }
+    json += "]}";
+    FILE *mf = fopen(manifestPath.c_str(), "wb");
+    if (mf == nullptr ||
+        fwrite(json.data(), 1, json.size(), mf) != json.size() ||
+        fclose(mf) != 0) {
+      return fail(ErrorCode::InvalidOutputDestination,
+                  "cannot write the frames manifest");
+    }
+  }
+
+  result.success = true;
+  result.framesProcessed = std::int64_t(manifest.size());
+  JobOutput manifestOut;
+  manifestOut.path = manifestPath;
+  manifestOut.kind = "manifest";
+  result.outputs.push_back(std::move(manifestOut));
+  const std::size_t imageCap = 5000;
+  for (std::size_t i = 0; i < manifest.size() && i < imageCap; ++i) {
+    JobOutput imageOut;
+    imageOut.path = manifest[i].file;
+    imageOut.sizeBytes = manifest[i].sizeBytes;
+    imageOut.kind = "image";
+    result.outputs.push_back(std::move(imageOut));
+  }
+  return result;
+}
 
 Error FfmpegBackend::initialize() {
   initFfmpegLabel();
@@ -4726,6 +9179,11 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   // zscale (libzimg) and tonemap — probed at initialize(). HDR
   // PRESERVATION works via stream copy regardless.
   caps.hdrToneMapping = hdrToneMappingAvailable_;
+  // Timeline operations (mandate §27/§29): multi-range Cut, Split with all
+  // boundary strategies (real chapter reading, real scene detection), Merge
+  // with compatibility verification + normalization, and frame extraction
+  // with real frame identity. All implemented by this executor.
+  caps.timelineOps = true;
 
   const auto &features = FeatureRegistry::instance();
 

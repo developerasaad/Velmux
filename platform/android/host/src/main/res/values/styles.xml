@@ -1,0 +1,9 @@
+<resources>
+
+    <!-- Base application theme: Compose renders the whole UI; the platform
+         theme only covers the launch window. No AppCompat dependency. -->
+    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+
+</resources>

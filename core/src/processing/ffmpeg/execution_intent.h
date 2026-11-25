@@ -6,10 +6,9 @@
 // into concrete rate control and flattens the typed fields into the lanes
 // the execution paths already understand.
 //
-// Deferred operations: Split / Merge / multi-range Cut / ExtractFrames are
-// carried in full (split/merge/image rules) for the future executors, but
-// canExecute refuses them in this build — they never reach the execution
-// paths.
+// Timeline operations: Split / Merge / multi-range Cut / ExtractFrames are
+// carried in full (split/merge/image rules) and executed by the dedicated
+// timeline executor paths (see FfmpegExecutor).
 #pragma once
 
 #include <velmux/jobs.h>

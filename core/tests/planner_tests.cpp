@@ -61,6 +61,7 @@ struct Fixture {
                                  Container::WebM, Container::Mov};
     ffmpeg.subtitleExtract = true;
     ffmpeg.timeTrim = true;
+    ffmpeg.timelineOps = true;
     ffmpeg.videoScaling = true;
     ffmpeg.audioResampling = true;
 
@@ -317,9 +318,8 @@ TEST_CASE_FIXTURE(Fixture, "alternates are ranked best-first") {
 // Typed operation payloads
 // ---------------------------------------------------------------------------
 
-TEST_CASE_FIXTURE(Fixture, "deferred operations refuse with UnsupportedOperation") {
+TEST_CASE_FIXTURE(Fixture, "timeline and frame operations route through the FFmpeg executor") {
   const MediaInfo source = h264AacSource();
-  const std::string message = "operation not yet implemented in this build";
 
   SUBCASE("multi-range Cut") {
     JobRequest request;
@@ -333,9 +333,9 @@ TEST_CASE_FIXTURE(Fixture, "deferred operations refuse with UnsupportedOperation
     payload.removed.push_back(removed);
     request.payload = std::move(payload);
     const PlanResult plan = planOf(request, source);
-    CHECK_FALSE(plan.feasible);
-    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
-    CHECK(plan.message == message);
+    REQUIRE(plan.feasible);
+    REQUIRE(plan.best.has_value());
+    CHECK(plan.best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
   }
   SUBCASE("Split") {
     JobRequest request;
@@ -343,11 +343,13 @@ TEST_CASE_FIXTURE(Fixture, "deferred operations refuse with UnsupportedOperation
     job::Split payload;
     payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
     payload.output.container = Container::Mp4;
+    payload.rules.mode = SplitMode::EqualParts;
+    payload.rules.partCount = 3;
     request.payload = std::move(payload);
     const PlanResult plan = planOf(request, source);
-    CHECK_FALSE(plan.feasible);
-    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
-    CHECK(plan.message == message);
+    REQUIRE(plan.feasible);
+    REQUIRE(plan.best.has_value());
+    CHECK(plan.best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
   }
   SUBCASE("Merge") {
     JobRequest request;
@@ -356,22 +358,27 @@ TEST_CASE_FIXTURE(Fixture, "deferred operations refuse with UnsupportedOperation
     payload.sources = {MediaSource{"a.mp4", "a.mp4"},
                        MediaSource{"b.mp4", "b.mp4"}};
     payload.output.container = Container::Mp4;
+    payload.rules.layout = MergeLayout::Sequential;
     request.payload = std::move(payload);
     const PlanResult plan = planOf(request, source);
-    CHECK_FALSE(plan.feasible);
-    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
-    CHECK(plan.message == message);
+    REQUIRE(plan.feasible);
+    REQUIRE(plan.best.has_value());
+    CHECK(plan.best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
   }
   SUBCASE("ExtractFrames") {
     JobRequest request;
     request.operation = Operation::ExtractFrames;
     job::ExtractFrames payload;
     payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.selection.mode = FrameSelectionMode::AllInRange;
     request.payload = std::move(payload);
     const PlanResult plan = planOf(request, source);
-    CHECK_FALSE(plan.feasible);
-    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
-    CHECK(plan.message == message);
+    REQUIRE(plan.feasible);
+    REQUIRE(plan.best.has_value());
+    // Dedicated image pipeline: demux + decode + image encode (no mux
+    // stage — the artifact set is a manifest + image files).
+    CHECK(plan.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
+    CHECK(plan.best->pipeline.sidecarExtension == "json");
   }
 }
 
@@ -441,6 +448,7 @@ CapabilityRegistry hybridScenarioCaps(bool vp9StreamCopy = true) {
   ffmpeg.writableContainers = {Container::Mp4};
   ffmpeg.stageDecodeToCpuFrames = true;
   ffmpeg.timeTrim = true;
+  ffmpeg.timelineOps = true;
   ffmpeg.videoScaling = true;
   ffmpeg.audioResampling = true;
 

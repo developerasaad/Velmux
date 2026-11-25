@@ -325,46 +325,60 @@ Result<ExecutionIntent> buildIntent(const JobRequest &request,
     case 3: // Trim
       error = buildTrim(request, pipeline, source, intent);
       break;
-    case 4: { // Cut (multi-range): deferred, carried for the future executor.
+    case 4: { // Cut (multi-range): retained = complement of removed.
       const auto &payload = std::get<velmux::core::job::Cut>(request.payload);
       intent.source = payload.source;
       intent.outputContainer = pipeline.container;
-      intent.cutRemoved = payload.removed;
-      error = Error::make(ErrorCode::UnsupportedOperation,
-                          "operation not yet implemented in this build");
+      intent.wantsVideo = source.hasVideo();
+      intent.wantsAudio = source.hasAudio();
+      for (std::int32_t i = 0; i < std::int32_t(source.audio.size()); ++i) {
+        intent.audioSourceOrdinals.push_back(i);
+      }
+      intent.subtitles.keepSubtitles = source.hasSubtitles();
+      intent.cutRemoved = payload.removed; // the executor re-normalizes
       break;
     }
-    case 5: { // Split: deferred, rules carried.
+    case 5: { // Split: boundary rules carried for the part executor.
       const auto &payload =
           std::get<velmux::core::job::Split>(request.payload);
       intent.source = payload.source;
+      intent.outputContainer = pipeline.container;
+      intent.wantsVideo = source.hasVideo();
+      intent.wantsAudio = source.hasAudio();
+      for (std::int32_t i = 0; i < std::int32_t(source.audio.size()); ++i) {
+        intent.audioSourceOrdinals.push_back(i);
+      }
+      intent.subtitles.keepSubtitles = source.hasSubtitles();
       intent.splitRules = payload.rules;
-      error = Error::make(ErrorCode::UnsupportedOperation,
-                          "operation not yet implemented in this build");
       break;
     }
-    case 6: { // Merge: deferred, rules carried.
+    case 6: { // Merge: composition rules; the executor reads all sources
+      // from the payload itself (the intent carries the FIRST source's
+      // shape for codec/rate resolution).
       const auto &payload =
           std::get<velmux::core::job::Merge>(request.payload);
       intent.source =
           payload.sources.empty() ? MediaSource{} : payload.sources.front();
+      intent.outputContainer = pipeline.container;
+      intent.wantsVideo = source.hasVideo();
+      intent.wantsAudio = source.hasAudio();
       intent.mergeRules = payload.rules;
-      error = Error::make(ErrorCode::UnsupportedOperation,
-                          "operation not yet implemented in this build");
+      intent.rate = resolveRate(source, CompressionIntent{}, pipeline);
       break;
     }
     case 7: // ExtractAudio
       error = buildExtractAudio(request, pipeline, source, sampleWindow,
                                 intent);
       break;
-    case 8: { // ExtractFrames: deferred, rules carried.
+    case 8: { // ExtractFrames: selection + image rules carried.
       const auto &payload =
           std::get<velmux::core::job::ExtractFrames>(request.payload);
       intent.source = payload.source;
+      intent.outputContainer = pipeline.container;
+      intent.wantsVideo = source.hasVideo();
+      intent.wantsAudio = false;
       intent.frameSelection = payload.selection;
       intent.imageRules = payload.image;
-      error = Error::make(ErrorCode::UnsupportedOperation,
-                          "operation not yet implemented in this build");
       break;
     }
     case 9: // ExtractSubtitles
