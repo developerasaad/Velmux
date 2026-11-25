@@ -555,6 +555,8 @@
                         isa = XCBuildConfiguration;
                         baseConfigurationReference = 3B4392A12AC88292D35C810B /* Pods-Velmux.debug.xcconfig */;
                         buildSettings = {
+                                BUNDLE_LOADER = "$(TEST_HOST)";
+                                TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Velmux.app/Velmux";
                                 CLANG_CXX_LANGUAGE_STANDARD = "c++20";
                                 CLANG_CXX_LIBRARY = "libc++";
                                 CURRENT_PROJECT_VERSION = 1;
@@ -567,7 +569,7 @@
                                         "$(SRCROOT)/../../../backends/apple/objcpp",
                                         "$(SRCROOT)/../../../backends/ffmpeg/include",
                                         "$(SRCROOT)/../../../third_party/sqlite",
-                                        "$(PODS_ROOT)/VelmuxTestConfig",
+                                        "$(SRCROOT)/Pods/VelmuxTestConfig",
                                 );
                                 INFOPLIST_FILE = VelmuxEngineTests/Info.plist;
                                 IPHONEOS_DEPLOYMENT_TARGET = 15.1;
@@ -590,6 +592,8 @@
                         isa = XCBuildConfiguration;
                         baseConfigurationReference = 5709B34CF0A7D63546082F79 /* Pods-Velmux.release.xcconfig */;
                         buildSettings = {
+                                BUNDLE_LOADER = "$(TEST_HOST)";
+                                TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Velmux.app/Velmux";
                                 CLANG_CXX_LANGUAGE_STANDARD = "c++20";
                                 CLANG_CXX_LIBRARY = "libc++";
                                 CURRENT_PROJECT_VERSION = 1;
@@ -602,7 +606,7 @@
                                         "$(SRCROOT)/../../../backends/apple/objcpp",
                                         "$(SRCROOT)/../../../backends/ffmpeg/include",
                                         "$(SRCROOT)/../../../third_party/sqlite",
-                                        "$(PODS_ROOT)/VelmuxTestConfig",
+                                        "$(SRCROOT)/Pods/VelmuxTestConfig",
                                 );
                                 INFOPLIST_FILE = VelmuxEngineTests/Info.plist;
                                 IPHONEOS_DEPLOYMENT_TARGET = 15.1;

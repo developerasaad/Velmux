@@ -478,7 +478,10 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   XCTAssertNotNil(fixture, @"fixture generation failed");
 
   VelmuxEngineHandle *engine = vlmxCreateFacadeEngine(@"fftof-engine");
-  XCTAssertNotNil(engine, @"engine construction failed");
+  // XCTAssertNotNil takes id (an ObjC object reference); the engine
+  // facade handle is an opaque C struct pointer, so the nil check is an
+  // explicit boolean assertion instead.
+  XCTAssertTrue(engine != nullptr, @"engine construction failed");
   if (engine == nullptr) {
     return;
   }
@@ -680,7 +683,7 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   // FFmpeg is the only backend that encodes FFV1; Apple cannot, so the
   // planner's only route is the FFmpeg whole-pipeline transcode.
   VelmuxEngineHandle *engine = vlmxCreateFacadeEngine(@"fton-engine");
-  XCTAssertNotNil(engine, @"engine construction failed");
+  XCTAssertTrue(engine != nullptr, @"engine construction failed");
   NSString *ffv1Path = @"";
   @try {
     if (!vlmxFfmpegBackendPresent(engine)) {
@@ -835,7 +838,7 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   XCTAssertNotNil(fixture, @"fixture generation failed");
 
   VelmuxEngineHandle *engine = vlmxCreateFacadeEngine(@"cancel-engine");
-  XCTAssertNotNil(engine, @"engine construction failed");
+  XCTAssertTrue(engine != nullptr, @"engine construction failed");
   if (engine == nullptr) {
     return;
   }
