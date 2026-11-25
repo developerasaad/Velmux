@@ -81,7 +81,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Budget math + feasibility + unrealistic-target detection | IMPLEMENTED + VERIFIED | `computeBitrateBudget` + planner advisories (tested) |
 | Fit Under Size: budget DRIVES encoding | IMPLEMENTED + VERIFIED | budget-derived bitrate parameterizes the real encode (deterministic on retry; samples preview it) |
 | Second attempt when first exceeds target | IMPLEMENTED + VERIFIED | one corrective re-encode at 0.9x(target/actual); honest summary note on a still-missed target |
-| Sample compression preview | IMPLEMENTED + VERIFIED | engine op + tests + TurboModule method + Convert-screen SamplePreviewCard (generates the exact request's 8 s densest-window preview, invalidates on draft change, share on iOS) |
+| Sample compression preview | IMPLEMENTED + VERIFIED | engine op + tests + TurboModule method + Convert-screen SamplePreviewCard (generates the exact request's 8 s densest-window preview, invalidates on draft change, share on both platforms through the file-access layer) |
 
 ## 8. Capability system & planner (spec §15/§16)
 
@@ -146,7 +146,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | "Custom — based on [preset]" | IMPLEMENTED + VERIFIED | `computeGoalLabel()` |
 | Trim UI | IMPLEMENTED + VERIFIED | Convert-screen TrimSection: toggle + start/end steppers (mm:ss), window summary, honest disabled states; plan re-estimates on trim change; engine trim paths host-verified |
 | Sample preview flow | IMPLEMENTED + VERIFIED | SamplePreviewCard on the Convert screen (see §7) |
-| History actions (Open/Play/Share) | IMPLEMENTED + VERIFIED | wired to real output locations (share/play on iOS, delete with file removal, re-use settings) |
+| History actions (Save/Share/Remove) | IMPLEMENTED + VERIFIED | Save to… presents the platform save UI (SAF ACTION_CREATE_DOCUMENT / iOS Files picker) and keeps the app's copy; Share works on both platforms (FileProvider content URI on Android, core Share on iOS); Remove deletes the job RECORD only — outputs are kept by the bridge contract ("outputs are not touched"), confirmed in the UI copy; re-use settings wired to real history |
 | Accessibility pass | IMPLEMENTED — screen-reader validation pending | full annotation pass: one accessible element per row/card, control+value labels, job-scoped action labels, selected/disabled states announced; VoiceOver/TalkBack behavior on device pending |
 
 ## 15. Performance (spec §24/§25)
@@ -170,7 +170,27 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Area | Status |
 |---|---|
 | Android build (APK with FFmpeg) | IMPLEMENTED + VERIFIED (CI) |
-| Android instrumented tests executed | IMPLEMENTED + VERIFIED (CI, 2026-11-24) | `android-emulated.yml` boots KVM emulators on API 29 + 34 (google_apis x86_64), installs the app, verifies the cold launch (process alive + RN init marker + clean log), runs 6/6 instrumented engine tests (NativeConversionTest/HybridConversionTest with on-device encoder fixtures + independent MediaExtractor validation), reinstalls the app AGP uninstalls and re-verifies the relaunch — green on both API levels (runs 45483513108 / 45494973509 / 45504299023) |
+| Android instrumented tests executed | IMPLEMENTED + VERIFIED (CI, 2026-11-25) | `android-emulated.yml` boots KVM emulators on API 29 + 34 (google_apis x86_64), installs the app, verifies the cold launch (process alive + RN init marker + clean log), runs 9/9 instrumented tests (6 engine tests + FileAccessTest provider/import suites + the SAF-import end-to-end conversion) with on-device encoder fixtures + independent MediaExtractor validation, reinstalls the app AGP uninstalls and re-verifies the relaunch — green on both API levels (latest: run 45556729054 on cb405b2) |
 | iOS simulator build with FFmpeg | IMPLEMENTED + VERIFIED (CI) |
 | iOS simulator tests (engine execution) | IMPLEMENTED (VelmuxEngineTests XCTest target runs via `./scripts/test.sh --ios-sim`; first green run pending the bash-3.2 fix) |
 | Physical-device validation (both platforms) | HARDWARE VALIDATION PENDING (documented; RC notes must state it) |
+
+## 18. File access, storage & permissions
+
+Verification levels are distinguished explicitly: **instrumented** = real
+on-emulator execution through the production code paths (content URIs from
+the app's own FileProvider stand in for third-party providers — the same
+ContentResolver contract); **system-UI interaction** = the picker/save
+sheets are OS UI and cannot be driven headlessly; **hardware** = requires
+a physical device.
+
+| Requirement | Status | Evidence / gap |
+|---|---|---|
+| Import: system document picker, no storage permissions | IMPLEMENTED + VERIFIED (TS suite; instrumented for the copy path) | HomeScreen/SubtitlesSection `pick()` (open mode, `requestLongTermAccess: false`) → `importPickedFiles` → native `importFile`; manifest declares no storage permissions (only INTERNET, FOREGROUND_SERVICE*, POST_NOTIFICATIONS) — there is deliberately nothing to show in the OS permissions screen |
+| Non-destructive durable import (Android) | IMPLEMENTED + VERIFIED (instrumented, API 29 + 34) | `FileImport.importFileInto`: content URI → byte-identical copy under filesDir/imports/<uuid>/ with the original untouched — `FileAccessTest.productionImportCopiesByteIdenticallyAndPreservesTheOriginal` (run 45556729054) |
+| Non-destructive durable import (iOS) | IMPLEMENTED (native code, CI-compiled) — system-UI/hardware E2E pending | ObjC++ `importFile`: `copyItemAtURL` under Documents/imports/<uuid>/ (the picker library's keepLocalCopy MOVES the source on iOS — D-062), picker-held security scope released after (`releaseSecureAccess`); the simulator cannot drive the system picker UI headlessly |
+| Engine consumes imported sources end to end | IMPLEMENTED + VERIFIED (instrumented) | `safImportedSourceConvertsAndCleansSegments`: content URI → production import → engine inspect + convert → independent MediaExtractor probe → segment-cleanup assertion, green on API 29 + 34 |
+| Provider scope & share surface (Android) | IMPLEMENTED + VERIFIED (instrumented) | `FileAccessTest.fileProviderServesEngineOutputs`: exact bytes via openInputStream AND openFileDescriptor, non-null MIME type, and out-of-root files refused AT URI-CREATION (IllegalArgumentException) — the provider covers filesDir/velmux/ only |
+| Export to user-chosen destination | IMPLEMENTED — save-sheet interaction is system UI (hardware validation pending) | `saveOutput` → `saveDocuments` (SAF CREATE_DOCUMENT / iOS Files picker), copy semantics (app's file kept); TS type-checked; failure/cancel paths surfaced honestly |
+| Storage lifecycle & cleanup | IMPLEMENTED + VERIFIED (instrumented + host) | completed jobs leave no velmux-seg-* directories (asserted on-device); `deleteJob` never deletes outputs (bridge contract, engine tests); originals never modified (instrumented); transcode segments cleaned after assembly (engine, host-tested) |
+| Real third-party providers (MediaStore, cloud, SAF documents) | HARDWARE VALIDATION PENDING | instrumented tests exercise the identical ContentResolver contract through the app's own provider; real providers need a device |

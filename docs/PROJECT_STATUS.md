@@ -60,6 +60,20 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
   + ReactNative-application.cmake) with the Velmux engine/JNI as a child
   module; every APK is verified to carry libappmodules.so + libvelmux_jni.so
   per ABI; emulator launches assert the RN init marker.
+- File access & permissions (D-062): the app declares NO storage
+  permissions — import goes through the system document picker with an
+  immediate non-destructive native copy into durable storage
+  (filesDir/imports on Android, Documents/imports on iOS; the picker
+  library's keepLocalCopy was rejected: it MOVES the source on iOS),
+  export through the platform save UI (the app's copy is kept), share
+  through core Share (iOS) / the app's FileProvider covering exactly the
+  engine's output tree (Android). CI-verified on Android: 9/9
+  instrumented tests on API 29 + 34 including the provider round-trip
+  (exact bytes, out-of-root refusal at URI creation), the production
+  import with original-preserved assertions, and the content-URI →
+  import → convert → probe end-to-end (run 45556729054). System-picker
+  and save-sheet INTERACTION (OS UI) and real third-party providers
+  remain hardware-validation items.
 - iOS: Debug AND Release simulator builds with the FFmpeg xcframework.
   The simulator is a development/test target only: the FFmpeg artifact
   model is device-arm64 + sim-arm64 (single-arch, identity-accurate); the
@@ -82,6 +96,9 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
 
 ## Known limitations (do not pretend otherwise)
 
+- Imported sources accumulate in app storage (one durable copy per
+  pick, by design — recovery, retry and re-use-settings read them); a
+  storage-management UI is not in V1.
 - Physical-device validation is pending for both platforms (the emulated
   CI covers the Android paths on x86_64 system images).
 - Hybrid runs are not checkpointed (restart from zero on retry).
