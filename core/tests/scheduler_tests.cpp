@@ -1,5 +1,5 @@
 // Scheduler unit tests: resource-aware concurrency, ordering, suspend/resume.
-#include "velmux/core/scheduler.h"
+#include "jobs/scheduler.h"
 
 #include <doctest/doctest.h>
 

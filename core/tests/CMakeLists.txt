@@ -17,7 +17,7 @@ target_include_directories(doctest INTERFACE "${DOCTEST_DIR}")
 
 function(velmux_core_test name)
   add_executable(${name} ${name}.cpp doctest_main.cpp)
-  target_link_libraries(${name} PRIVATE velmux::core doctest)
+  target_link_libraries(${name} PRIVATE velmux::core velmux::internal doctest)
   target_compile_definitions(${name} PRIVATE
     VELMUX_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../testdata")
   add_test(NAME ${name} COMMAND ${name})

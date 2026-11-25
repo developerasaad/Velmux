@@ -1,6 +1,6 @@
 // Job store unit tests: durable persistence round-trips and resumable
 // queries. Uses a temp directory database.
-#include "velmux/core/job_store.h"
+#include "persistence/job_store.h"
 
 #include <doctest/doctest.h>
 

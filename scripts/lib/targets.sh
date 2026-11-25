@@ -132,7 +132,7 @@ parse_test_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --host) suite="host" ;;
-      --ts) suite="ts" ;;
+      --ui) suite="ui" ;;
       --android-emulator) suite="android-emulator" ;;
       --ios-sim) suite="ios-sim" ;;
       --android-device) suite="android-device" ;;
@@ -165,8 +165,9 @@ Usage: ./scripts/test.sh [suite] [options]
 
 Suites:
   (default)          Host tests: pinned FFmpeg build + full C++ suite
-                     (core, backends, bridge) through ctest
-  --ts               TypeScript: type check + lint of the mobile app
+                     (core, processing, ABI) through ctest
+  --ui               Shared Kotlin/Compose app: compile + JVM tests through
+                     Gradle
   --android-emulator Automated emulator run (needs --api): boot, install,
                      cold-launch verification, instrumented engine tests,
                      relaunch/recovery checks

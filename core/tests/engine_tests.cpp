@@ -1,8 +1,8 @@
 // Engine-level unit tests using a fake backend (test double — allowed only
 // in tests). Verifies the full lifecycle wiring: registration, planning,
 // job execution through the scheduler, event emission and durability.
-#include "velmux/backend/contracts.h"
-#include "velmux/core/engine.h"
+#include "processing/contracts/contracts.h"
+#include <velmux/engine.h>
 
 #include <doctest/doctest.h>
 

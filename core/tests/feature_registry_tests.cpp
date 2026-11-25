@@ -1,6 +1,6 @@
 // Feature registry unit tests: the product-controlled catalog.
-#include "velmux/core/feature_registry.h"
-#include "velmux/core/job.h"
+#include "catalog/features.h"
+#include <velmux/jobs.h>
 
 #include <doctest/doctest.h>
 

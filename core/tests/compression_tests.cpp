@@ -1,6 +1,6 @@
 // Compression intelligence unit tests: bitrate budgets, feasibility,
 // goal-derived quality and output estimation.
-#include "velmux/core/compression.h"
+#include "compression/compression.h"
 
 #include <doctest/doctest.h>
 

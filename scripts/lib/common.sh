@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the Velmux build/test scripts (scripts/*).
 # The FFmpeg builder has its own helper library
-# (tools/ffmpeg-builder/lib.sh); this one serves the top-level scripts.
+# (scripts/ffmpeg-builder/lib.sh); this one serves the top-level scripts.
 
 # Shell strictness matching the builder: command substitution failures must
 # propagate (inherit_errexit, guarded for bash < 4.4).
@@ -66,18 +66,6 @@ run_in() {
 # block indefinitely and eat the whole job budget silently.
 adb_t() {
   timeout "${VELMUX_ADB_TIMEOUT:-20}" adb "$@" 2>/dev/null || true
-}
-
-# Ensure the JS dependencies of the mobile app are installed (gradle and
-# xcodebuild need node_modules for React Native autolinking).
-ensure_js_deps() {
-  local js_dir
-  js_dir="$(repo_dir "$VELMUX_APP_JS_DIR")"
-  if [ ! -d "$js_dir/node_modules" ]; then
-    require_tool npm
-    vlog "installing JS dependencies (npm ci)"
-    run_in "$js_dir" npm ci --no-audit --no-fund
-  fi
 }
 
 # resolve_android_ndk — locate the pinned NDK and export ANDROID_NDK_HOME.

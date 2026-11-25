@@ -1,6 +1,6 @@
 // Capability registry unit tests: runtime capability reporting and narrow
 // failure records.
-#include "velmux/core/capability_registry.h"
+#include "capabilities/capabilities.h"
 
 #include <doctest/doctest.h>
 

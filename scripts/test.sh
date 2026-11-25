@@ -37,7 +37,7 @@ ABI="${ARGS[2]#abi:}"
 
 case "$SUITE" in
   host) bash "$SCRIPTS_DIR/lib/host-suite.sh" ;;
-  ts) bash "$SCRIPTS_DIR/lib/ts-suite.sh" ;;
+  ui) bash "$SCRIPTS_DIR/lib/ui-suite.sh" ;;
   android-emulator)
     bash "$SCRIPTS_DIR/android/emulator-test.sh" --api "$API" --abi "$ABI"
     ;;

@@ -13,9 +13,9 @@
 # own environment variables (ANDROID_NDK_HOME for android targets).
 #
 # Outputs: nothing on stdout; the artifacts land in
-#   tools/ffmpeg-builder/out/host
-#   tools/ffmpeg-builder/out/android/<abi>
-#   tools/ffmpeg-builder/out/ios/{iphoneos,iphonesimulator}
+#   scripts/ffmpeg-builder/out/host
+#   scripts/ffmpeg-builder/out/android/<abi>
+#   scripts/ffmpeg-builder/out/ios/{iphoneos,iphonesimulator}
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,7 +23,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$SCRIPTS_DIR/lib/common.sh"
 # The builder library provides the identity helpers and the canonical
 # DOWNLOADS/SRC/OUT locations (VELMUX_* overrides honored).
-# shellcheck source=../../tools/ffmpeg-builder/lib.sh
+# shellcheck source=../../scripts/ffmpeg-builder/lib.sh
 . "$VELMUX_ROOT/$VELMUX_FFMPEG_BUILDER_DIR/lib.sh"
 
 usage() {

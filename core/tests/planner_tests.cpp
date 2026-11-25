@@ -1,6 +1,6 @@
 // Planner unit tests: candidate generation, compatibility validation, cost
 // ranking, stream-copy preference and warm-path planning latency.
-#include "velmux/core/planner.h"
+#include "planning/planner.h"
 
 #include <doctest/doctest.h>
 

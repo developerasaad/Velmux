@@ -34,17 +34,18 @@ done
 # Core host build tree.
 rm -rf "$VELMUX_ROOT/$VELMUX_HOST_BUILD_DIR"
 
-# Android app build outputs.
-rm -rf "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build" \
-       "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/build" \
-       "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/.cxx"
-
-# iOS app build outputs and CocoaPods artifacts.
-rm -rf "$VELMUX_ROOT/$VELMUX_APP_IOS_DIR/build" \
-       "$VELMUX_ROOT/$VELMUX_APP_IOS_DIR/build-release" \
-       "$VELMUX_ROOT/$VELMUX_APP_IOS_DIR/build-release-device" \
-       "$VELMUX_ROOT/$VELMUX_APP_IOS_DIR/DerivedData" \
-       "$VELMUX_ROOT/$VELMUX_APP_IOS_DIR/Pods"
+# Gradle build outputs (shared UI + platform hosts).
+rm -rf "$VELMUX_ROOT/build" \
+       "$VELMUX_ROOT/.gradle" \
+       "$VELMUX_ROOT/ui/mobile/build" \
+       "$VELMUX_ROOT/platform/android/host/build" \
+       "$VELMUX_ROOT/platform/android/host/app/build" \
+       "$VELMUX_ROOT/platform/android/host/.cxx" \
+       "$VELMUX_ROOT/platform/ios/host/build" \
+       "$VELMUX_ROOT/platform/ios/host/build-release" \
+       "$VELMUX_ROOT/platform/ios/host/build-release-device" \
+       "$VELMUX_ROOT/platform/ios/host/DerivedData" \
+       "$VELMUX_ROOT/platform/ios/host/Pods"
 rm -rf "$VELMUX_ROOT/ffmpeg-ios-packaged"
 
 # Built FFmpeg artifacts (identity stamped; rebuilt on demand).

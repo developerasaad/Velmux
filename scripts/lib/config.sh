@@ -11,11 +11,13 @@
 # ---------------------------------------------------------------------------
 # Repository layout (relative to the repository root)
 # ---------------------------------------------------------------------------
-VELMUX_APP_ANDROID_DIR="apps/mobile/android"
-VELMUX_APP_IOS_DIR="apps/mobile/ios"
-VELMUX_APP_JS_DIR="apps/mobile"
-VELMUX_FFMPEG_BUILDER_DIR="tools/ffmpeg-builder"
-VELMUX_FFMPEG_OUT_DIR="${VELMUX_FFMPEG_OUT_DIR:-tools/ffmpeg-builder/out}"
+VELMUX_UI_DIR="ui/mobile"
+VELMUX_PLATFORM_ANDROID_DIR="platform/android"
+VELMUX_PLATFORM_IOS_DIR="platform/ios"
+VELMUX_ANDROID_HOST_DIR="platform/android/host"
+VELMUX_IOS_HOST_DIR="platform/ios/host"
+VELMUX_FFMPEG_BUILDER_DIR="scripts/ffmpeg-builder"
+VELMUX_FFMPEG_OUT_DIR="${VELMUX_FFMPEG_OUT_DIR:-scripts/ffmpeg-builder/out}"
 VELMUX_HOST_BUILD_DIR="build/host"
 
 # ---------------------------------------------------------------------------
@@ -33,8 +35,8 @@ VELMUX_ANDROID_DEFAULT_ABI="arm64-v8a"
 VELMUX_ANDROID_ALL_ABIS="arm64-v8a armeabi-v7a x86_64"
 # The emulator test job builds only the emulator's ABI.
 VELMUX_ANDROID_EMULATOR_ABI="x86_64"
-# NDK used by BOTH the app build (gradle ext.ndkVersion) and the FFmpeg
-# cross-build. Must match apps/mobile/android/build.gradle.
+# NDK used by BOTH the app build (platform/android/host Gradle build) and
+# the FFmpeg cross-build. Must match the host Gradle configuration.
 VELMUX_ANDROID_NDK_VERSION="27.1.12297006"
 # Emulator system images used by the automated test job (google_apis, not
 # "default": the API 29 default image hangs during headless boot).
@@ -55,7 +57,7 @@ VELMUX_IOS_SIMULATOR_DEVICE="iPhone 16"
 # ---------------------------------------------------------------------------
 # Versions
 # ---------------------------------------------------------------------------
-# FFmpeg and dependency pins live in tools/ffmpeg-builder/versions.json
+# FFmpeg and dependency pins live in scripts/ffmpeg-builder/versions.json
 # (the single source for those); this file never duplicates them.
 # App version defaults (CI may override through gradle/xcodebuild properties).
 VELMUX_VERSION_NAME="${VELMUX_VERSION_NAME:-0.1.0-rc.2}"

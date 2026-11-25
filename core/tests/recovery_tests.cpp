@@ -1,6 +1,6 @@
 // Recovery system unit tests: checkpoint persistence, artifact validation,
 // reconciliation decisions.
-#include "velmux/core/recovery.h"
+#include "recovery/recovery.h"
 
 #include <doctest/doctest.h>
 

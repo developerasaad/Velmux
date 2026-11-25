@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$SCRIPTS_DIR/lib/common.sh"
-# shellcheck source=../../tools/ffmpeg-builder/lib.sh
+# shellcheck source=../../scripts/ffmpeg-builder/lib.sh
 . "$VELMUX_ROOT/$VELMUX_FFMPEG_BUILDER_DIR/lib.sh"
 
 REPO_API="https://api.github.com/repos/${VELMUX_GITHUB_REPO:-developerasaad/Velmux}"
