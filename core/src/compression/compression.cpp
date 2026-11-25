@@ -1,5 +1,7 @@
 #include "compression/compression.h"
 
+#include "processing/pipeline.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -114,7 +116,7 @@ double containerOverheadFactor(Container container) {
 }
 
 BitrateBudget computeBitrateBudget(const MediaInfo &source,
-                                   const ConversionRequest &request,
+                                   const BudgetInputs &inputs,
                                    std::int64_t targetSizeBytes) {
   BitrateBudget budget;
   if (targetSizeBytes <= 0) {
@@ -122,32 +124,39 @@ BitrateBudget computeBitrateBudget(const MediaInfo &source,
     budget.message = "Target size must be positive.";
     return budget;
   }
-  if (source.durationSec <= 0.0) {
+  // Timeline scaling (playbackSpeed): the output timeline is
+  // duration / speed, and the budget must fit THAT timeline.
+  const double speed = inputs.playbackSpeed.value_or(1.0);
+  if (speed <= 0.0) {
+    budget.feasible = false;
+    budget.message = "Playback speed must be positive.";
+    return budget;
+  }
+  const double effectiveDuration = source.durationSec / speed;
+  if (effectiveDuration <= 0.0) {
     budget.feasible = false;
     budget.message = "Source duration is unknown; cannot compute a budget.";
     return budget;
   }
 
-  const Container container = request.outputContainer.value_or(source.container);
+  const Container container = inputs.outputContainer;
   const double overhead = containerOverheadFactor(container);
   // Payload bytes available after container overhead.
   const double payloadBytes = double(targetSizeBytes) / (1.0 + overhead);
   const double payloadBits = payloadBytes * 8.0;
-  const double duration = source.durationSec;
+  const double duration = effectiveDuration;
 
   // Audio allocation.
-  const bool wantsAudio = request.audio.enabled && source.hasAudio();
+  const bool wantsAudio = inputs.audioEnabled && source.hasAudio();
   if (wantsAudio) {
     const AudioStream &srcAudio = source.audio.front();
     const std::int32_t channels =
-        request.audio.channels.value_or(srcAudio.channels);
+        inputs.audio.channels.value_or(srcAudio.channels);
     const AudioCodec audioCodec =
-        request.audio.codec.value_or(srcAudio.codec);
-    if (request.audio.bitRate.has_value()) {
+        inputs.audio.codec.value_or(srcAudio.codec);
+    if (inputs.audio.bitRate.has_value()) {
       budget.audioBitrate =
-          clampAudioBitrate(audioCodec, channels, *request.audio.bitRate);
-    } else if (request.goal.kind == GoalKind::SmallerFile) {
-      budget.audioBitrate = audioFloorBps(audioCodec, channels);
+          clampAudioBitrate(audioCodec, channels, *inputs.audio.bitRate);
     } else {
       // Default: keep the source audio bitrate when it looks sane, else the
       // codec floor.
@@ -160,26 +169,40 @@ BitrateBudget computeBitrateBudget(const MediaInfo &source,
 
   const double audioBits = double(budget.audioBitrate) * duration;
   double videoBits = payloadBits - audioBits;
+  if (!inputs.videoEnabled) {
+    // Audio-only output: the whole payload budget is the audio budget.
+    if (wantsAudio) {
+      const std::int64_t audioBudget = std::int64_t(payloadBits / duration);
+      budget.audioBitrate = std::max(budget.audioBitrate, audioBudget);
+    }
+    budget.videoBitrate = 0;
+    budget.feasible = wantsAudio ? duration > 0.0 : false;
+    if (!budget.feasible) {
+      budget.message = "Audio-only target needs a source audio track.";
+    }
+    return budget;
+  }
 
   // Feasibility: the video budget must stay above the codec floor.
   const VideoCodec videoCodec =
-      request.video.codec.value_or(source.hasVideo() ? source.video.front().codec
-                                                     : VideoCodec::H264);
+      inputs.videoCodec.value_or(source.hasVideo() ? source.video.front().codec
+                                                   : VideoCodec::H264);
   const VideoStream &srcVideo =
       source.hasVideo() ? source.video.front() : VideoStream{};
   const std::int32_t srcHeight =
-      request.video.resolutionHeight.value_or(
+      inputs.resolutionHeight.value_or(
           srcVideo.height > 0 ? srcVideo.height : 1080);
   const std::int32_t srcWidth = srcVideo.width > 0 ? srcVideo.width
-                                  : srcHeight * 16 / 9;
+                                                    : srcHeight * 16 / 9;
   const double frameRate =
-      request.video.frameRate.value_or(srcVideo.frameRate > 0 ? srcVideo.frameRate
-                                                              : 30.0);
+      inputs.frameRate.value_or(srcVideo.frameRate > 0 ? srcVideo.frameRate
+                                                       : 30.0);
   const double pixelsPerSec = double(srcWidth) * double(srcHeight) * frameRate;
 
   if (const CodecRatePoint *point = ratePointFor(videoCodec)) {
     if (point->bitsPerPixelFloor > 0.0) {
-      const double floorBits = point->bitsPerPixelFloor * pixelsPerSec * duration;
+      const double floorBits =
+          point->bitsPerPixelFloor * pixelsPerSec * duration;
       if (videoBits < floorBits) {
         budget.feasible = false;
         budget.message =
@@ -202,51 +225,104 @@ BitrateBudget computeBitrateBudget(const MediaInfo &source,
   return budget;
 }
 
-double qualityFactorForGoal(GoalKind kind) {
-  switch (kind) {
-    case GoalKind::Recommended:
-      return 0.6;
-    case GoalKind::SmallerFile:
+double qualityFactorForPreset(CompressionPreset preset) {
+  switch (preset) {
+    case CompressionPreset::SmallerFile:
       return 0.35;
-    case GoalKind::HighQuality:
+    case CompressionPreset::HighQuality:
       return 0.85;
-    case GoalKind::FitUnderSize:
+    case CompressionPreset::TargetSize:
       return 0.5; // bitrate-driven; quality follows the budget
-    case GoalKind::Custom:
-      return 0.6;
+    default:
+      return 0.6; // Balanced, Custom without explicit quality
   }
-  return 0.6;
 }
 
-std::optional<std::int64_t> estimateOutputBytes(const MediaInfo &source,
-                                                const Pipeline &pipeline,
-                                                const ConversionRequest &request) {
+ResolvedRatePolicy resolveRatePolicy(const MediaInfo &source,
+                                     const CompressionIntent &compression,
+                                     const BudgetInputs &inputs) {
+  ResolvedRatePolicy policy;
+  if (!compression.enabled) {
+    // High-fidelity default for forced transcodes: CRF ~18 per codec
+    // family (quality 65 maps to CRF 18 on the x264/x265 0..51 scale and
+    // ~23 on the AV1/VP9 0..63 scale).
+    policy.mode = ResolvedRatePolicy::Mode::Quality;
+    policy.quality = 65;
+    return policy;
+  }
+  switch (compression.preset) {
+    case CompressionPreset::HighQuality:
+      policy.quality = 85;
+      return policy;
+    case CompressionPreset::Balanced:
+      policy.quality = 60;
+      return policy;
+    case CompressionPreset::SmallerFile:
+      policy.quality = 35;
+      return policy;
+    case CompressionPreset::Custom: {
+      if (compression.videoBitrate.has_value() &&
+          *compression.videoBitrate > 0) {
+        policy.mode = ResolvedRatePolicy::Mode::Bitrate;
+        policy.bitRate = *compression.videoBitrate;
+        return policy;
+      }
+      policy.quality = std::clamp(compression.quality.value_or(60), 1, 100);
+      return policy;
+    }
+    case CompressionPreset::TargetSize: {
+      if (compression.targetSizeBytes <= 0) {
+        policy.quality = 60; // honest fallback: no target, balanced default
+        return policy;
+      }
+      const BitrateBudget budget =
+          computeBitrateBudget(source, inputs, compression.targetSizeBytes);
+      if (budget.feasible && budget.videoBitrate > 0) {
+        policy.mode = ResolvedRatePolicy::Mode::Bitrate;
+        policy.bitRate = budget.videoBitrate;
+      } else {
+        // Infeasible target: balanced quality; planning surfaces the honest
+        // budget message through its advisories.
+        policy.quality = 60;
+      }
+      return policy;
+    }
+  }
+  policy.quality = 60;
+  return policy;
+}
+
+std::optional<std::int64_t> estimateOutputBytes(
+    const MediaInfo &source, const Pipeline &pipeline,
+    const BudgetInputs &inputs, const ResolvedRatePolicy &rate) {
   if (source.durationSec <= 0.0) {
     return std::nullopt;
   }
-  const double duration = source.durationSec;
+  const double speed = inputs.playbackSpeed.value_or(1.0);
+  const double duration = source.durationSec / std::max(speed, 0.01);
   const Container container = pipeline.container;
   const double overhead = containerOverheadFactor(container);
 
   double bits = 0.0;
   if (pipeline.videoStreamCopy && source.hasVideo()) {
     bits += double(source.video.front().bitRate) * duration;
-  } else if (request.video.bitRate.has_value()) {
-    bits += double(*request.video.bitRate) * duration;
+  } else if (rate.mode == ResolvedRatePolicy::Mode::Bitrate &&
+             rate.bitRate > 0) {
+    bits += double(rate.bitRate) * duration;
   } else {
     // Quality-mode estimate: rate point * pixels * fps.
     const VideoStream &srcVideo =
         source.hasVideo() ? source.video.front() : VideoStream{};
-    const std::int32_t height = request.video.resolutionHeight.value_or(
+    const std::int32_t height = inputs.resolutionHeight.value_or(
         srcVideo.height > 0 ? srcVideo.height : 1080);
     const std::int32_t width =
         srcVideo.width > 0 ? srcVideo.width : height * 16 / 9;
     const double fps =
-        request.video.frameRate.value_or(
+        inputs.frameRate.value_or(
             srcVideo.frameRate > 0 ? srcVideo.frameRate : 30.0);
     const double bpp =
         [&]() {
-          const double q = qualityFactorForGoal(request.goal.kind);
+          const double q = double(rate.quality) / 100.0;
           if (const CodecRatePoint *p = ratePointFor(pipeline.videoCodec)) {
             if (p->bitsPerPixelGood > 0.0) {
               return p->bitsPerPixelFloor +
@@ -258,12 +334,12 @@ std::optional<std::int64_t> estimateOutputBytes(const MediaInfo &source,
     bits += bpp * double(width) * double(height) * fps * duration;
   }
 
-  if (request.audio.enabled && source.hasAudio()) {
+  if (inputs.audioEnabled && source.hasAudio()) {
     if (pipeline.audioStreamCopy) {
       bits += double(source.audio.front().bitRate) * duration;
     } else {
       const AudioStream &srcAudio = source.audio.front();
-      bits += double(request.audio.bitRate.value_or(
+      bits += double(inputs.audio.bitRate.value_or(
           srcAudio.bitRate > 0 ? srcAudio.bitRate : 128000)) *
               duration;
     }

@@ -82,7 +82,9 @@ TEST_CASE("name round-trips are stable") {
 TEST_CASE("error codes and states have stable names") {
   CHECK(std::string(errorCodeName(ErrorCode::NoCompatiblePipeline)) ==
         "no-compatible-pipeline");
-  CHECK(std::string(jobStateName(JobState::Checkpointing)) == "checkpointing");
+  CHECK(std::string(jobStateName(JobState::Finalizing)) == "finalizing");
+  CHECK(std::string(jobStateName(JobState::TargetNotMet)) == "target-not-met");
   CHECK(jobStateFromName("recovering").value() == JobState::Recovering);
+  CHECK(jobStateFromName("finalizing").value() == JobState::Finalizing);
   CHECK(std::string(stageName(StageId::Bitstream)) == "bitstream");
 }

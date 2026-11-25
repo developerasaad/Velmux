@@ -100,18 +100,36 @@ struct Fixture {
     info.audio.push_back(audio);
     return info;
   }
+
+  // A plain VideoConvert request (the conversion-family workhorse).
+  JobRequest convertRequest(Container out, VideoCodec video,
+                            AudioCodec audio) {
+    JobRequest request;
+    request.operation = Operation::VideoConvert;
+    job::VideoConvert payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.output.container = out;
+    payload.video.codec = video;
+    payload.audioSettings.codec = audio;
+    request.payload = std::move(payload);
+    return request;
+  }
+
+  PlanResult planOf(const JobRequest &request, const MediaInfo &source) {
+    const Result<PlanResult> planned = planner.plan(request, {source});
+    REQUIRE(planned.ok());
+    return planned.value();
+  }
 };
 
 } // namespace
 
 TEST_CASE_FIXTURE(Fixture, "same-codec remux prefers stream copy") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.outputContainer = Container::Mkv; // h264+aac both valid in mkv
-  request.video.codec = VideoCodec::H264;
-  request.audio.codec = AudioCodec::Aac;
+  const JobRequest request =
+      convertRequest(Container::Mkv, VideoCodec::H264, AudioCodec::Aac);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
   CHECK(plan.best->pipeline.videoStreamCopy);
@@ -120,14 +138,32 @@ TEST_CASE_FIXTURE(Fixture, "same-codec remux prefers stream copy") {
   CHECK(plan.best->pipeline.summary.find("Remux") != std::string::npos);
 }
 
+TEST_CASE_FIXTURE(Fixture, "automatic codec routing preserves the source codec") {
+  // nullopt codec = Automatic: keep the compatible source codec (H.264+AAC
+  // into MKV) — the plan is a stream-copy remux, never a pointless
+  // re-encode (mandate §19).
+  const MediaInfo source = h264AacSource();
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  job::VideoConvert payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mkv;
+  request.payload = std::move(payload);
+
+  const PlanResult plan = planOf(request, source);
+  REQUIRE(plan.feasible);
+  REQUIRE(plan.best.has_value());
+  CHECK(plan.best->pipeline.videoCodec == VideoCodec::H264);
+  CHECK(plan.best->pipeline.audioCodec == AudioCodec::Aac);
+  CHECK(plan.best->pipeline.videoStreamCopy);
+}
+
 TEST_CASE_FIXTURE(Fixture, "transcode requests re-encode with valid stages") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.outputContainer = Container::WebM;
-  request.video.codec = VideoCodec::VP9;
-  request.audio.codec = AudioCodec::Opus;
+  const JobRequest request =
+      convertRequest(Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
   CHECK_FALSE(plan.best->pipeline.videoStreamCopy);
@@ -143,12 +179,11 @@ TEST_CASE_FIXTURE(Fixture, "transcode requests re-encode with valid stages") {
 
 TEST_CASE_FIXTURE(Fixture, "invalid codec/container pairs are rejected") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
   // H.264 cannot go into WebM (feature registry says no).
-  request.outputContainer = Container::WebM;
-  request.video.codec = VideoCodec::H264;
+  const JobRequest request =
+      convertRequest(Container::WebM, VideoCodec::H264, AudioCodec::Opus);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   CHECK_FALSE(plan.feasible);
   CHECK_FALSE(plan.message.empty());
 }
@@ -160,12 +195,17 @@ TEST_CASE_FIXTURE(Fixture,
   sub.format = SubtitleFormat::Ass; // ASS is not valid in MP4
   source.subtitles.push_back(sub);
 
-  ConversionRequest request;
-  request.outputContainer = Container::Mp4;
-  request.video.codec = VideoCodec::H264;
-  request.subtitles.policy = SubtitlePolicy::Preserve;
+  // Empty subtitle rules = preserve all (mandate §24); the ASS track cannot
+  // survive MP4, so the plan must say so instead of silently dropping it.
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  job::VideoConvert payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mp4;
+  payload.video.codec = VideoCodec::H264;
+  request.payload = std::move(payload);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   CHECK_FALSE(plan.feasible);
   // Case-insensitive: the message names the subtitle problem.
   std::string lower;
@@ -181,37 +221,41 @@ TEST_CASE_FIXTURE(Fixture, "explicit subtitle removal avoids the conflict") {
   sub.format = SubtitleFormat::Ass;
   source.subtitles.push_back(sub);
 
-  ConversionRequest request;
-  request.outputContainer = Container::Mp4;
-  request.video.codec = VideoCodec::H264;
-  request.subtitles.policy = SubtitlePolicy::Remove;
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  job::VideoConvert payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mp4;
+  payload.video.codec = VideoCodec::H264;
+  SubtitleTrackRule rule;
+  rule.sourceTrackIndex = 0;
+  rule.policy = SubtitleTrackPolicy::Remove;
+  payload.subtitleTracks.push_back(rule);
+  request.payload = std::move(payload);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   CHECK(plan.feasible);
 }
 
 TEST_CASE_FIXTURE(Fixture, "no capable backend means honest infeasibility") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.video.codec = VideoCodec::Ffv1; // no backend in this fixture encodes FFV1
-  request.outputContainer = Container::Mkv;
+  const JobRequest request =
+      convertRequest(Container::Mkv, VideoCodec::Ffv1, AudioCodec::Aac);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   CHECK_FALSE(plan.feasible);
   CHECK(plan.message.find("backend") != std::string::npos);
 }
 
-TEST_CASE_FIXTURE(Fixture, "processing preference influences ranking") {
+TEST_CASE_FIXTURE(Fixture, "validity outranks availability: the only capable backend wins") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.video.codec = VideoCodec::VP9; // only FFmpeg serves VP9 here
-  request.audio.codec = AudioCodec::Opus;
-  request.outputContainer = Container::WebM;
+  // Only FFmpeg in this fixture serves VP9/Opus/WebM; the Android hardware
+  // backend is registered but cannot serve this output — the plan must pick
+  // the valid route (the retired PreferNative knob's core assertion).
+  const JobRequest request =
+      convertRequest(Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
 
-  // Prefer native: no native backend can do VP9, so FFmpeg still wins —
-  // validity outranks preference (spec §4.6).
-  request.processingMode = ProcessingMode::PreferNative;
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
   CHECK(plan.best->pipeline.assigns(StageId::Encode, BackendId::Ffmpeg));
@@ -219,15 +263,13 @@ TEST_CASE_FIXTURE(Fixture, "processing preference influences ranking") {
 
 TEST_CASE_FIXTURE(Fixture, "telemetry improves cost estimates") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.video.codec = VideoCodec::AV1;
-  request.audio.codec = AudioCodec::Opus;
-  request.outputContainer = Container::Mkv;
+  const JobRequest request =
+      convertRequest(Container::Mkv, VideoCodec::AV1, AudioCodec::Opus);
 
-  const PlanResult cold = planner.plan(source, request);
+  const PlanResult cold = planOf(request, source);
   REQUIRE(cold.feasible);
   telemetry.learned_ = true;
-  const PlanResult warm = planner.plan(source, request);
+  const PlanResult warm = planOf(request, source);
   REQUIRE(warm.feasible);
   // With learned throughput the estimated throughput reflects the sample.
   CHECK(warm.best->expectedThroughput == doctest::Approx(123.0));
@@ -239,18 +281,16 @@ TEST_CASE_FIXTURE(Fixture, "warm-path planning latency target") {
   // assertion budget is generous (CI machines vary) but still catches
   // accidental probing/enumeration inside plan().
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.video.codec = VideoCodec::VP9;
-  request.audio.codec = AudioCodec::Opus;
-  request.outputContainer = Container::WebM;
+  const JobRequest request =
+      convertRequest(Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
 
   // Warm up once (branch predictors, caches).
-  (void)planner.plan(source, request);
+  (void)planner.plan(request, {source});
 
   const auto start = std::chrono::steady_clock::now();
   constexpr int kIterations = 1000;
   for (int i = 0; i < kIterations; ++i) {
-    (void)planner.plan(source, request);
+    (void)planner.plan(request, {source});
   }
   const double perCallMs =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
@@ -262,17 +302,117 @@ TEST_CASE_FIXTURE(Fixture, "warm-path planning latency target") {
 
 TEST_CASE_FIXTURE(Fixture, "alternates are ranked best-first") {
   const MediaInfo source = h264AacSource();
-  ConversionRequest request;
-  request.video.codec = VideoCodec::H264;
-  request.audio.codec = AudioCodec::Aac;
-  request.outputContainer = Container::Mp4;
+  const JobRequest request =
+      convertRequest(Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   REQUIRE(plan.feasible);
   REQUIRE(plan.alternates.size() >= 2);
   for (std::size_t i = 1; i < plan.alternates.size(); ++i) {
     CHECK(plan.alternates[i - 1].cost <= plan.alternates[i].cost);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Typed operation payloads
+// ---------------------------------------------------------------------------
+
+TEST_CASE_FIXTURE(Fixture, "deferred operations refuse with UnsupportedOperation") {
+  const MediaInfo source = h264AacSource();
+  const std::string message = "operation not yet implemented in this build";
+
+  SUBCASE("multi-range Cut") {
+    JobRequest request;
+    request.operation = Operation::VideoCutMerge;
+    job::Cut payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.output.container = Container::Mp4;
+    TimeRange removed;
+    removed.startUs = 500000;
+    removed.endUs = 1500000;
+    payload.removed.push_back(removed);
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
+    CHECK(plan.message == message);
+  }
+  SUBCASE("Split") {
+    JobRequest request;
+    request.operation = Operation::VideoCutMerge;
+    job::Split payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.output.container = Container::Mp4;
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
+    CHECK(plan.message == message);
+  }
+  SUBCASE("Merge") {
+    JobRequest request;
+    request.operation = Operation::VideoCutMerge;
+    job::Merge payload;
+    payload.sources = {MediaSource{"a.mp4", "a.mp4"},
+                       MediaSource{"b.mp4", "b.mp4"}};
+    payload.output.container = Container::Mp4;
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
+    CHECK(plan.message == message);
+  }
+  SUBCASE("ExtractFrames") {
+    JobRequest request;
+    request.operation = Operation::ExtractFrames;
+    job::ExtractFrames payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
+    CHECK(plan.message == message);
+  }
+}
+
+TEST_CASE_FIXTURE(Fixture, "Crop plans a transcode with the source codec when encodable") {
+  const MediaInfo source = h264AacSource();
+  JobRequest request;
+  request.operation = Operation::VideoCrop;
+  job::Crop payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mp4;
+  payload.crop.x = 100;
+  payload.crop.y = 100;
+  payload.crop.width = 1280;
+  payload.crop.height = 720;
+  request.payload = std::move(payload);
+
+  const PlanResult plan = planOf(request, source);
+  REQUIRE(plan.feasible);
+  REQUIRE(plan.best.has_value());
+  // Crop rewrites pixels: never stream copy; H.264 (the encodable source
+  // codec) is preserved (mandate §27 spatial).
+  CHECK_FALSE(plan.best->pipeline.videoStreamCopy);
+  CHECK(plan.best->pipeline.videoCodec == VideoCodec::H264);
+}
+
+TEST_CASE_FIXTURE(Fixture, "Crop validates the rectangle against the source") {
+  const MediaInfo source = h264AacSource();
+  JobRequest request;
+  request.operation = Operation::VideoCrop;
+  job::Crop payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mp4;
+  payload.crop.x = 1500;
+  payload.crop.y = 900;
+  payload.crop.width = 1280;
+  payload.crop.height = 720;
+  request.payload = std::move(payload);
+
+  const PlanResult plan = planOf(request, source);
+  CHECK_FALSE(plan.feasible);
+  CHECK(plan.errorCode == ErrorCode::InvalidCrop);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,14 +425,15 @@ namespace {
 // but cannot encode HEVC; Android encodes HEVC (stage-encodes from CPU
 // frames) but cannot decode VP9. Only a hybrid pipeline can serve
 // VP9 -> HEVC.
-CapabilityRegistry hybridScenarioCaps() {
+CapabilityRegistry hybridScenarioCaps(bool vp9StreamCopy = true) {
   CapabilityRegistry caps;
   BackendCapabilities ffmpeg;
   ffmpeg.backend = BackendId::Ffmpeg;
   ffmpeg.implementation = "scenario";
   ffmpeg.canInspect = true;
   ffmpeg.video.push_back(VideoCapability{VideoCodec::VP9,
-                                         {true, false, true}, false, 0, 0});
+                                         {true, false, vp9StreamCopy}, false,
+                                         0, 0});
   ffmpeg.video.push_back(VideoCapability{VideoCodec::H264,
                                          {true, true, true}, false, 0, 0});
   ffmpeg.audio.push_back(AudioCapability{AudioCodec::Aac, {true, true, true}});
@@ -329,13 +470,12 @@ TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single ba
   MediaInfo source = h264AacSource();
   source.video.front().codec = VideoCodec::VP9;
 
-  ConversionRequest request;
-  request.outputContainer = Container::Mp4;
-  request.goal.kind = GoalKind::Custom;
-  request.video.codec = VideoCodec::HEVC;
-  request.audio.codec = AudioCodec::Aac;
+  const JobRequest request =
+      convertRequest(Container::Mp4, VideoCodec::HEVC, AudioCodec::Aac);
 
-  const PlanResult plan = scenarioPlanner.plan(source, request);
+  const Result<PlanResult> planned = scenarioPlanner.plan(request, {source});
+  REQUIRE(planned.ok());
+  const PlanResult plan = planned.value();
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
   const Pipeline &pipeline = plan.best->pipeline;
@@ -352,10 +492,10 @@ TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single ba
 
   // Sanity: single-backend scenarios never degrade to hybrid (the normal
   // Fixture registry serves H.264 -> HEVC through FFmpeg alone).
-  ConversionRequest single = request;
-  single.video.codec = VideoCodec::HEVC;
-  source.video.front().codec = VideoCodec::H264;
-  const PlanResult classic = planner.plan(source, single);
+  MediaInfo h264 = h264AacSource();
+  const JobRequest single =
+      convertRequest(Container::Mp4, VideoCodec::HEVC, AudioCodec::Aac);
+  const PlanResult classic = planOf(single, h264);
   REQUIRE(classic.feasible);
   REQUIRE(classic.best.has_value());
   CHECK(classic.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
@@ -365,35 +505,39 @@ TEST_CASE_FIXTURE(Fixture, "hybrid candidates compose backends when no single ba
 TEST_CASE_FIXTURE(Fixture, "trimmed requests route only to trim-capable backends") {
   // A trim window is honored exclusively by backends reporting timeTrim;
   // anything else would silently produce full-length output.
-  CapabilityRegistry scenario = hybridScenarioCaps();
+  CapabilityRegistry scenario = hybridScenarioCaps(false);
   Planner scenarioPlanner{FeatureRegistry::instance(), scenario, nullptr};
 
   MediaInfo source = h264AacSource();
   source.video.front().codec = VideoCodec::VP9;
 
-  ConversionRequest request;
-  request.outputContainer = Container::Mp4;
-  request.goal.kind = GoalKind::Custom;
-  request.video.codec = VideoCodec::HEVC;
-  request.audio.codec = AudioCodec::Aac;
-  request.trim.startUs = 500000;
-  request.trim.endUs = 1500000;
+  JobRequest trimRequest;
+  trimRequest.operation = Operation::VideoCutMerge;
+  job::Trim payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  payload.output.container = Container::Mp4;
+  payload.range.startUs = 500000;
+  payload.range.endUs = 1500000;
+  trimRequest.payload = std::move(payload);
 
   // Without the trim this exact scenario plans a hybrid route (tested
-  // above); with the trim it must refuse rather than mis-execute.
-  const PlanResult hybridShape = scenarioPlanner.plan(source, request);
-  CHECK_FALSE(hybridShape.feasible);
+  // above); with the trim it must refuse rather than mis-execute — the
+  // v1 hybrid interchange carries no trim.
+  const Result<PlanResult> hybridPlanned =
+      scenarioPlanner.plan(trimRequest, {source});
+  REQUIRE(hybridPlanned.ok());
+  CHECK_FALSE(hybridPlanned.value().feasible);
 
   // Positive control: the Fixture FFmpeg reports timeTrim and serves the
   // same trimmed request end-to-end.
   MediaInfo plain = h264AacSource();
-  ConversionRequest routed = request;
-  routed.video.codec = VideoCodec::H264;
-  const PlanResult plan = planner.plan(plain, routed);
+  const PlanResult plan = planOf(trimRequest, plain);
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
-  CHECK(plan.best->pipeline.assigns(StageId::Decode, BackendId::Ffmpeg));
+  CHECK(plan.best->pipeline.assigns(StageId::Demux, BackendId::Ffmpeg));
   CHECK(plan.best->pipeline.assigns(StageId::Mux, BackendId::Ffmpeg));
+  // The retained window is honest work: the summary says so.
+  CHECK(plan.best->pipeline.summary.find("trim") != std::string::npos);
 
   // A trim-incapable-only registry refuses: native Android alone (no
   // timeTrim) must never receive the trimmed request.
@@ -410,8 +554,10 @@ TEST_CASE_FIXTURE(Fixture, "trimmed requests route only to trim-capable backends
   android.writableContainers = {Container::Mp4};
   nativeOnly.registerBackend(android);
   Planner nativePlanner{FeatureRegistry::instance(), nativeOnly, nullptr};
-  const PlanResult refused = nativePlanner.plan(plain, routed);
-  CHECK_FALSE(refused.feasible);
+  const Result<PlanResult> refused =
+      nativePlanner.plan(trimRequest, {plain});
+  REQUIRE(refused.ok());
+  CHECK_FALSE(refused.value().feasible);
 }
 
 TEST_CASE_FIXTURE(Fixture, "subtitle extraction plans a sidecar pipeline") {
@@ -420,14 +566,13 @@ TEST_CASE_FIXTURE(Fixture, "subtitle extraction plans a sidecar pipeline") {
   sub.format = SubtitleFormat::Srt;
   source.subtitles.push_back(sub);
 
-  ConversionRequest request;
-  request.outputContainer = Container::Mkv;
-  request.goal.kind = GoalKind::Custom;
-  request.video.enabled = false;
-  request.audio.enabled = false;
-  request.subtitles.policy = SubtitlePolicy::Extract;
+  JobRequest request;
+  request.operation = Operation::ExtractSubtitles;
+  job::ExtractSubtitles payload;
+  payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  request.payload = std::move(payload);
 
-  const PlanResult plan = planner.plan(source, request);
+  const PlanResult plan = planOf(request, source);
   REQUIRE(plan.feasible);
   REQUIRE(plan.best.has_value());
   const Pipeline &pipeline = plan.best->pipeline;
@@ -439,14 +584,37 @@ TEST_CASE_FIXTURE(Fixture, "subtitle extraction plans a sidecar pipeline") {
 
   // Container-internal text decodes to SRT; ASS-family keeps its format.
   source.subtitles.front().format = SubtitleFormat::MovText;
-  const PlanResult movText = planner.plan(source, request);
+  const PlanResult movText = planOf(request, source);
   REQUIRE(movText.feasible);
   CHECK(movText.best->pipeline.sidecarExtension == "srt");
 
   source.subtitles.front().format = SubtitleFormat::Ass;
-  const PlanResult ass = planner.plan(source, request);
+  const PlanResult ass = planOf(request, source);
   REQUIRE(ass.feasible);
   CHECK(ass.best->pipeline.sidecarExtension == "ass");
+
+  // Explicit text targets pick their own extension (the executor writes
+  // the requested representation).
+  source.subtitles.front().format = SubtitleFormat::MovText;
+  JobRequest vttRequest;
+  vttRequest.operation = Operation::ExtractSubtitles;
+  job::ExtractSubtitles vttPayload;
+  vttPayload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  vttPayload.targets.push_back(SubtitleTextTarget::Vtt);
+  vttRequest.payload = std::move(vttPayload);
+  const PlanResult vtt = planOf(vttRequest, source);
+  REQUIRE(vtt.feasible);
+  CHECK(vtt.best->pipeline.sidecarExtension == "vtt");
+
+  JobRequest srtRequest;
+  srtRequest.operation = Operation::ExtractSubtitles;
+  job::ExtractSubtitles srtPayload;
+  srtPayload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+  srtPayload.targets.push_back(SubtitleTextTarget::Ass);
+  srtRequest.payload = std::move(srtPayload);
+  const PlanResult srtTarget = planOf(srtRequest, source);
+  REQUIRE(srtTarget.feasible);
+  CHECK(srtTarget.best->pipeline.sidecarExtension == "ass");
 }
 
 TEST_CASE_FIXTURE(Fixture, "subtitle extraction refuses impossible shapes") {
@@ -456,26 +624,47 @@ TEST_CASE_FIXTURE(Fixture, "subtitle extraction refuses impossible shapes") {
     SubtitleStream sub;
     sub.format = SubtitleFormat::Pgs;
     source.subtitles.push_back(sub);
-    ConversionRequest request;
-    request.goal.kind = GoalKind::Custom;
-    request.video.enabled = false;
-    request.audio.enabled = false;
-    request.subtitles.policy = SubtitlePolicy::Extract;
-    const PlanResult plan = planner.plan(source, request);
+    JobRequest request;
+    request.operation = Operation::ExtractSubtitles;
+    job::ExtractSubtitles payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
     CHECK_FALSE(plan.feasible);
     CHECK(plan.message.find("OCR") != std::string::npos);
   }
 
-  SUBCASE("mixed convert+extract is refused") {
+  SUBCASE("multi-track sidecar sets are not implemented in this build") {
+    SubtitleStream first;
+    first.format = SubtitleFormat::Srt;
+    SubtitleStream second;
+    second.format = SubtitleFormat::Srt;
+    source.subtitles.push_back(first);
+    source.subtitles.push_back(second);
+    JobRequest request;
+    request.operation = Operation::ExtractSubtitles;
+    job::ExtractSubtitles payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.trackIndices = {0, 1};
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
+    CHECK_FALSE(plan.feasible);
+    CHECK(plan.errorCode == ErrorCode::UnsupportedOperation);
+    CHECK(plan.message.find("one track") != std::string::npos);
+  }
+
+  SUBCASE("a track index outside the source is a request error") {
     SubtitleStream sub;
     sub.format = SubtitleFormat::Srt;
     source.subtitles.push_back(sub);
-    ConversionRequest request;
-    request.goal.kind = GoalKind::Custom;
-    request.video.enabled = true;
-    request.subtitles.policy = SubtitlePolicy::Extract;
-    const PlanResult plan = planner.plan(source, request);
+    JobRequest request;
+    request.operation = Operation::ExtractSubtitles;
+    job::ExtractSubtitles payload;
+    payload.source = MediaSource{"test-src.mp4", "test-src.mp4"};
+    payload.trackIndices = {7};
+    request.payload = std::move(payload);
+    const PlanResult plan = planOf(request, source);
     CHECK_FALSE(plan.feasible);
-    CHECK(plan.message.find("standalone") != std::string::npos);
+    CHECK(plan.errorCode == ErrorCode::InvalidTrackIdentity);
   }
 }

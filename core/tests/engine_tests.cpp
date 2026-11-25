@@ -68,7 +68,7 @@ public:
 class FakeExecutor final : public IPipelineExecutor {
 public:
   bool canExecute(const Pipeline &pipeline,
-                  const ConversionRequest &) const override {
+                  const JobRequest &) const override {
     for (const auto &assignment : pipeline.stages) {
       if (assignment.backend != BackendId::Ffmpeg) {
         return false;
@@ -149,7 +149,7 @@ class ScriptedExecutor final : public IPipelineExecutor {
 public:
   explicit ScriptedExecutor(bool fail) : fail_(fail) {}
 
-  bool canExecute(const Pipeline &, const ConversionRequest &) const override {
+  bool canExecute(const Pipeline &, const JobRequest &) const override {
     return true;
   }
 
@@ -321,14 +321,17 @@ public:
   EventRecorder &events() { return recorder_; }
   const std::filesystem::path &dir() const { return dir_; }
 
-  ConversionRequest requestFor(const std::string &sourcePath) {
-    ConversionRequest request;
-    request.source.uri = sourcePath;
-    request.source.displayName = "sample.mp4";
-    request.outputContainer = Container::Mkv;
-    request.goal.kind = GoalKind::Recommended;
-    request.video.codec = VideoCodec::VP9; // forces transcode in fake caps
-    request.audio.codec = AudioCodec::Opus;
+  JobRequest requestFor(const std::string &sourcePath) {
+    JobRequest request;
+    request.operation = Operation::VideoConvert;
+    auto &payload = request.payload.emplace<job::VideoConvert>();
+    payload.source.uri = sourcePath;
+    payload.source.displayName = "sample.mp4";
+    payload.output.container = Container::Mkv;
+    payload.compression.enabled = true;
+    payload.compression.preset = CompressionPreset::Balanced;
+    payload.video.codec = VideoCodec::VP9; // forces transcode in fake caps
+    payload.audioSettings.codec = AudioCodec::Opus;
     return request;
   }
 
@@ -362,8 +365,8 @@ TEST_CASE("engine plans without creating jobs") {
   EngineEnv env;
   const std::string media = makeFakeMedia(env.dir() / "in.mp4");
   const Result<PlanResult> plan =
-      env.engine().plan(MediaSource{media, "in.mp4"},
-                        env.requestFor(media));
+      env.engine().plan(env.requestFor(media));
+
   REQUIRE(plan.ok());
   CHECK(plan.value().feasible);
   REQUIRE(plan.value().best.has_value());
@@ -375,7 +378,7 @@ TEST_CASE("full job lifecycle: submit, run, validate, complete, persist") {
   EngineEnv env;
   const std::string media = makeFakeMedia(env.dir() / "in.mp4");
   const Result<std::string> jobId =
-      env.engine().startJob(env.requestFor(media));
+      env.engine().submitJob(env.requestFor(media));
   REQUIRE(jobId.ok());
 
   const auto terminal =
@@ -407,8 +410,8 @@ TEST_CASE("cancel terminates a running job honestly") {
   EngineEnv env;
   // Make the fake executor slow enough to cancel mid-flight.
   const std::string media = makeFakeMedia(env.dir() / "in.mp4");
-  ConversionRequest request = env.requestFor(media);
-  const Result<std::string> jobId = env.engine().startJob(request);
+  JobRequest request = env.requestFor(media);
+  const Result<std::string> jobId = env.engine().submitJob(request);
   REQUIRE(jobId.ok());
 
   const Result<bool> cancelled = env.engine().cancelJob(jobId.value());
@@ -445,11 +448,11 @@ TEST_CASE("pause holds a running job; resume finishes it for real") {
   env.backend().executor_.iterationSleepMs.store(50); // ~550 ms per run
   const std::string media = makeFakeMedia(env.dir() / "in.mp4");
   const Result<std::string> jobId =
-      env.engine().startJob(env.requestFor(media));
+      env.engine().submitJob(env.requestFor(media));
   REQUIRE(jobId.ok());
 
   REQUIRE(env.events()
-              .waitForState(JobState::Running, std::chrono::seconds(5))
+              .waitForState(JobState::Processing, std::chrono::seconds(5))
               .has_value());
 
   const Result<bool> paused = env.engine().pauseJob(jobId.value());
@@ -481,13 +484,16 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
   std::filesystem::create_directories(dir);
   const std::string media = makeFakeMedia(dir / "in.mp4");
 
-  ConversionRequest request;
-  request.source.uri = media;
-  request.source.displayName = "sample.mp4";
-  request.outputContainer = Container::Mkv;
-  request.goal.kind = GoalKind::Recommended;
-  request.video.codec = VideoCodec::VP9;
-  request.audio.codec = AudioCodec::Opus;
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  auto &vc = request.payload.emplace<job::VideoConvert>();
+  vc.source.uri = media;
+  vc.source.displayName = "sample.mp4";
+  vc.output.container = Container::Mkv;
+  vc.compression.enabled = true;
+  vc.compression.preset = CompressionPreset::Balanced;
+  vc.video.codec = VideoCodec::VP9;
+  vc.audioSettings.codec = AudioCodec::Opus;
 
   std::string jobId;
   {
@@ -500,11 +506,11 @@ TEST_CASE("engine shutdown hands running jobs to recovery, not cancel") {
     REQUIRE(engine != nullptr);
     EventRecorder recorder(engine->events());
 
-    const Result<std::string> submitted = engine->startJob(request);
+    const Result<std::string> submitted = engine->submitJob(request);
     REQUIRE(submitted.ok());
     jobId = submitted.value();
     REQUIRE(recorder
-                .waitForState(JobState::Running, std::chrono::seconds(5))
+                .waitForState(JobState::Processing, std::chrono::seconds(5))
                 .has_value());
     // Engine destruction runs the shutdown contract: running jobs become
     // recoverable, never silently canceled. Detach first: the engine's
@@ -569,18 +575,21 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
       VelmuxEngine::create(EngineConfig{dir.string()}, std::move(backends));
   REQUIRE(engine != nullptr);
 
-  ConversionRequest request;
-  request.source.uri = media;
-  request.source.displayName = "sample.mp4";
-  request.outputContainer = Container::Mkv;
-  request.goal.kind = GoalKind::Recommended;
-  request.video.codec = VideoCodec::VP9;
-  request.audio.codec = AudioCodec::Opus;
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  auto &vc = request.payload.emplace<job::VideoConvert>();
+  vc.source.uri = media;
+  vc.source.displayName = "sample.mp4";
+  vc.output.container = Container::Mkv;
+  vc.compression.enabled = true;
+  vc.compression.preset = CompressionPreset::Balanced;
+  vc.video.codec = VideoCodec::VP9;
+  vc.audioSettings.codec = AudioCodec::Opus;
 
   // Baseline: the faster ffmpeg route wins the plan (cost priors).
   {
     const Result<PlanResult> plan =
-        engine->plan(MediaSource{media, "sample.mp4"}, request);
+        engine->plan(request);
     REQUIRE(plan.ok());
     REQUIRE(plan.value().feasible);
     REQUIRE(plan.value().best.has_value());
@@ -589,7 +598,7 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
 
   // Job 1 executes on the failing backend and fails for real.
   EventRecorder recorder(engine->events());
-  const Result<std::string> first = engine->startJob(request);
+  const Result<std::string> first = engine->submitJob(request);
   REQUIRE(first.ok());
   const auto terminal = recorder.waitForTerminal(std::chrono::seconds(10));
   REQUIRE(terminal.has_value());
@@ -617,7 +626,7 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
   // on the working backend.
   {
     const Result<PlanResult> plan =
-        engine->plan(MediaSource{media, "sample.mp4"}, request);
+        engine->plan(request);
     REQUIRE(plan.ok());
     REQUIRE(plan.value().feasible);
     REQUIRE(plan.value().best.has_value());
@@ -628,7 +637,7 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
 
   // Job 2 completes through the working backend.
   EventRecorder secondRecorder(engine->events());
-  const Result<std::string> second = engine->startJob(request);
+  const Result<std::string> second = engine->submitJob(request);
   REQUIRE(second.ok());
   const auto terminal2 =
       secondRecorder.waitForTerminal(std::chrono::seconds(10));
@@ -641,10 +650,11 @@ TEST_CASE("backend execution failures are recorded and reroute the next plan") {
   // Narrowness: a different output codec on the failed backend still plans
   // there — the record is a configuration key, not a backend ban.
   {
-    ConversionRequest h264 = request;
-    h264.video.codec = VideoCodec::H264; // forces a transcode
+    JobRequest h264 = request;
+    std::get<job::VideoConvert>(h264.payload).video.codec =
+        VideoCodec::H264; // forces a transcode
     const Result<PlanResult> plan =
-        engine->plan(MediaSource{media, "sample.mp4"}, h264);
+        engine->plan(h264);
     REQUIRE(plan.ok());
     REQUIRE(plan.value().feasible);
     REQUIRE(plan.value().best.has_value());

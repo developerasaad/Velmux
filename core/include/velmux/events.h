@@ -19,6 +19,9 @@ struct JobEvent {
   double progress = -1.0; // 0..1 or negative when unknown
   std::int64_t outputSizeBytes = -1;
   std::string error; // populated on failure
+  // Stable canonical error identifier (errorCodeName), populated on failure
+  // and on TargetNotMet completion.
+  std::string errorCode;
 };
 
 // Sinks must be cheap: the emitter does not wait. UI-level coalescing

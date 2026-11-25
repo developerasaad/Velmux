@@ -30,7 +30,7 @@ public:
   explicit AppleExecutor(const AppleBackend *backend) : backend_(backend) {}
 
   bool canExecute(const velmux::core::Pipeline &pipeline,
-                  const velmux::core::ConversionRequest &request) const override;
+                  const velmux::core::JobRequest &request) const override;
   velmux::backend::ExecuteResult
   execute(const velmux::backend::ExecuteParams &params) override;
 

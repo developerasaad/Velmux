@@ -1,6 +1,7 @@
 // Compression intelligence unit tests: bitrate budgets, feasibility,
-// goal-derived quality and output estimation.
+// preset-derived quality and output estimation.
 #include "compression/compression.h"
+#include "processing/pipeline.h"
 
 #include <doctest/doctest.h>
 
@@ -30,12 +31,23 @@ MediaInfo sampleVideo(std::int64_t sizeBytes = 620'000'000,
   return info;
 }
 
-ConversionRequest requestForGoal(GoalKind kind, std::int64_t target = 0) {
-  ConversionRequest request;
-  request.goal.kind = kind;
-  request.goal.targetSizeBytes = target;
-  request.outputContainer = Container::Mp4;
-  return request;
+BudgetInputs inputsFor(Container container, AudioSettings audio = {}) {
+  BudgetInputs inputs;
+  inputs.outputContainer = container;
+  inputs.audioEnabled = true;
+  inputs.videoEnabled = true;
+  inputs.videoCodec = VideoCodec::H264;
+  inputs.audio = audio;
+  return inputs;
+}
+
+CompressionIntent presetIntent(CompressionPreset preset,
+                               std::int64_t target = 0) {
+  CompressionIntent compression;
+  compression.enabled = true;
+  compression.preset = preset;
+  compression.targetSizeBytes = target;
+  return compression;
 }
 
 } // namespace
@@ -43,10 +55,9 @@ ConversionRequest requestForGoal(GoalKind kind, std::int64_t target = 0) {
 TEST_CASE("a realistic fit-under-size budget is feasible and consistent") {
   // 2 GB, 10 minutes -> fit under 500 MB.
   const MediaInfo source = sampleVideo();
-  const ConversionRequest request = requestForGoal(GoalKind::FitUnderSize,
-                                                   500LL * 1000 * 1000);
-  const BitrateBudget budget =
-      computeBitrateBudget(source, request, request.goal.targetSizeBytes);
+  const BudgetInputs inputs = inputsFor(Container::Mp4);
+  const std::int64_t target = 500LL * 1000 * 1000;
+  const BitrateBudget budget = computeBitrateBudget(source, inputs, target);
   REQUIRE(budget.feasible);
   REQUIRE(budget.videoBitrate > 0);
 
@@ -57,7 +68,7 @@ TEST_CASE("a realistic fit-under-size budget is feasible and consistent") {
                             double(budget.audioBitrate)) *
                            source.durationSec;
   const double projectedBytes = totalBits / 8.0 * (1.0 + overhead);
-  CHECK(projectedBytes < double(request.goal.targetSizeBytes));
+  CHECK(projectedBytes < double(target));
 }
 
 TEST_CASE("impossible targets are rejected with an honest message") {
@@ -66,48 +77,84 @@ TEST_CASE("impossible targets are rejected with an honest message") {
   uhd.video.front().width = 3840;
   uhd.video.front().height = 2160;
   uhd.video.front().bitRate = 25'000'000;
-  const ConversionRequest request = requestForGoal(GoalKind::FitUnderSize,
-                                                   1LL * 1000 * 1000);
+  const BudgetInputs inputs = inputsFor(Container::Mp4);
   const BitrateBudget budget =
-      computeBitrateBudget(uhd, request, request.goal.targetSizeBytes);
+      computeBitrateBudget(uhd, inputs, 1LL * 1000 * 1000);
   CHECK_FALSE(budget.feasible);
   CHECK_FALSE(budget.message.empty());
 
   // 4K content under a tight-but-large target is also honestly infeasible
   // at the source resolution (the floor bitrate alone exceeds it).
   const BitrateBudget tight =
-      computeBitrateBudget(uhd, request, 500LL * 1000 * 1000);
+      computeBitrateBudget(uhd, inputs, 500LL * 1000 * 1000);
   CHECK_FALSE(tight.feasible);
   CHECK_FALSE(tight.message.empty());
 }
 
 TEST_CASE("degenerate inputs produce clear infeasibility") {
   const MediaInfo source = sampleVideo();
-  const ConversionRequest request = requestForGoal(GoalKind::FitUnderSize,
-                                                   100LL * 1000 * 1000);
+  const BudgetInputs inputs = inputsFor(Container::Mp4);
   SUBCASE("zero target") {
     CHECK_FALSE(
-        computeBitrateBudget(source, request, 0).feasible);
+        computeBitrateBudget(source, inputs, 0).feasible);
   }
   SUBCASE("unknown duration") {
     MediaInfo noDuration = source;
     noDuration.durationSec = 0.0;
     CHECK_FALSE(
-        computeBitrateBudget(noDuration, request, 100'000'000).feasible);
+        computeBitrateBudget(noDuration, inputs, 100'000'000).feasible);
   }
 }
 
-TEST_CASE("quality factors order goals sensibly") {
-  CHECK(qualityFactorForGoal(GoalKind::SmallerFile) <
-        qualityFactorForGoal(GoalKind::Recommended));
-  CHECK(qualityFactorForGoal(GoalKind::Recommended) <
-        qualityFactorForGoal(GoalKind::HighQuality));
+TEST_CASE("quality factors order presets sensibly") {
+  CHECK(qualityFactorForPreset(CompressionPreset::SmallerFile) <
+        qualityFactorForPreset(CompressionPreset::Balanced));
+  CHECK(qualityFactorForPreset(CompressionPreset::Balanced) <
+        qualityFactorForPreset(CompressionPreset::HighQuality));
+}
+
+TEST_CASE("resolveRatePolicy maps presets onto the user quality scale") {
+  const MediaInfo source = sampleVideo();
+  const BudgetInputs inputs = inputsFor(Container::Mp4);
+  // Disabled intent on a forced transcode: high-fidelity default.
+  const ResolvedRatePolicy disabled =
+      resolveRatePolicy(source, CompressionIntent{}, inputs);
+  CHECK(disabled.mode == ResolvedRatePolicy::Mode::Quality);
+  CHECK(disabled.quality == 65);
+  // Presets map to 85/60/35 (mandate §20).
+  CHECK(resolveRatePolicy(source, presetIntent(CompressionPreset::HighQuality),
+                          inputs)
+            .quality == 85);
+  CHECK(resolveRatePolicy(source, presetIntent(CompressionPreset::Balanced),
+                          inputs)
+            .quality == 60);
+  CHECK(resolveRatePolicy(source,
+                          presetIntent(CompressionPreset::SmallerFile), inputs)
+            .quality == 35);
+  // Custom honors the explicit quality.
+  CompressionIntent custom = presetIntent(CompressionPreset::Custom);
+  custom.quality = 42;
+  CHECK(resolveRatePolicy(source, custom, inputs).quality == 42);
+  // Custom with an explicit bitrate goes to bitrate mode.
+  CompressionIntent customRate = presetIntent(CompressionPreset::Custom);
+  customRate.videoBitrate = 1'500'000;
+  const ResolvedRatePolicy rate =
+      resolveRatePolicy(source, customRate, inputs);
+  CHECK(rate.mode == ResolvedRatePolicy::Mode::Bitrate);
+  CHECK(rate.bitRate == 1'500'000);
+  // TargetSize computes a real budget when feasible.
+  const ResolvedRatePolicy sized =
+      resolveRatePolicy(source,
+                        presetIntent(CompressionPreset::TargetSize,
+                                     500LL * 1000 * 1000),
+                        inputs);
+  CHECK(sized.mode == ResolvedRatePolicy::Mode::Bitrate);
+  CHECK(sized.bitRate > 0);
 }
 
 TEST_CASE("output estimation respects stream copy") {
   const MediaInfo source = sampleVideo();
-  ConversionRequest request = requestForGoal(GoalKind::Recommended);
-  request.outputContainer = Container::Mkv; // same container, same codecs
+  const BudgetInputs inputs = inputsFor(Container::Mkv);
 
   Pipeline copyPipeline;
   copyPipeline.videoCodec = VideoCodec::H264;
@@ -116,7 +163,8 @@ TEST_CASE("output estimation respects stream copy") {
   copyPipeline.videoStreamCopy = true;
   copyPipeline.audioStreamCopy = true;
 
-  const auto copyBytes = estimateOutputBytes(source, copyPipeline, request);
+  const auto copyBytes =
+      estimateOutputBytes(source, copyPipeline, inputs, ResolvedRatePolicy{});
   REQUIRE(copyBytes.has_value());
   // Stream copy of same-codec/same-container should be close to source
   // size (within 20%).
@@ -126,10 +174,14 @@ TEST_CASE("output estimation respects stream copy") {
 
   Pipeline transcodePipeline = copyPipeline;
   transcodePipeline.videoStreamCopy = false;
-  request.video.bitRate = 1'500'000; // far below the source's rate
-  request.audio.bitRate = 96'000;
+  const ResolvedRatePolicy rate = [&] {
+    ResolvedRatePolicy policy;
+    policy.mode = ResolvedRatePolicy::Mode::Bitrate;
+    policy.bitRate = 1'500'000; // far below the source's rate
+    return policy;
+  }();
   const auto transcodeBytes =
-      estimateOutputBytes(source, transcodePipeline, request);
+      estimateOutputBytes(source, transcodePipeline, inputs, rate);
   REQUIRE(transcodeBytes.has_value());
   CHECK(*transcodeBytes < source.sizeBytes / 4);
 }
@@ -137,10 +189,12 @@ TEST_CASE("output estimation respects stream copy") {
 TEST_CASE("unknown duration makes estimation honestly impossible") {
   MediaInfo source = sampleVideo();
   source.durationSec = 0.0;
-  ConversionRequest request = requestForGoal(GoalKind::Recommended);
   Pipeline pipeline;
   pipeline.container = Container::Mp4;
-  CHECK_FALSE(estimateOutputBytes(source, pipeline, request).has_value());
+  CHECK_FALSE(estimateOutputBytes(source, pipeline,
+                                  inputsFor(Container::Mp4),
+                                  ResolvedRatePolicy{})
+                  .has_value());
 }
 
 TEST_CASE("resolution ladder never upscales and drops under tight budgets") {

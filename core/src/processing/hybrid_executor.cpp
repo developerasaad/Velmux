@@ -37,36 +37,55 @@ IBackend *HybridExecutor::muxBackendFor(const Pipeline &pipeline) const {
 }
 
 bool HybridExecutor::canExecute(const Pipeline &pipeline,
-                                const ConversionRequest &request) const {
-  if (!request.video.enabled || pipeline.videoStreamCopy) {
+                                const JobRequest &request) const {
+  // Only the plain VideoConvert shape rides the v1 interchange: every
+  // other operation's payload carries work the stage contracts cannot
+  // express (trim windows, crop rects, timeline selections, extraction).
+  const auto *payload = std::get_if<job::VideoConvert>(&request.payload);
+  if (payload == nullptr) {
+    return false;
+  }
+  if (pipeline.videoStreamCopy) {
     return false; // remux/stream-copy stays whole-pipeline
   }
-  if (request.video.resolutionHeight.has_value() ||
-      request.video.frameRate.has_value()) {
-    return false; // v1 hybrid carries source geometry and rate
+  // v1 hybrid carries source geometry and rate.
+  if (payload->video.resolutionHeight.has_value() ||
+      payload->video.customWidth.has_value() ||
+      payload->video.customHeight.has_value() ||
+      payload->video.frameRate.has_value()) {
+    return false;
   }
-  if (request.trim.startUs != 0 || request.trim.endUs != -1) {
-    return false; // v1 hybrid does not trim: no executor may silently
-                  // present an untrimmed output as trimmed
+  // The plain-frame interchange has no transform/timing filters.
+  if (payload->adjustments.rotationDegrees != 0 ||
+      payload->adjustments.flipHorizontal ||
+      payload->adjustments.flipVertical ||
+      payload->adjustments.playbackSpeed.has_value() ||
+      payload->adjustments.reverse || payload->adjustments.hdrToSdr) {
+    return false;
   }
-  if ((request.video.crop.has_value() && request.video.crop->active()) ||
-      request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
-      request.video.flipVertical) {
-    return false; // v1 stage contracts carry plain frames: no transform
-                  // filters on the interchange path
+  // Audio: stream-copied by the mux side only. Removal rules are fine
+  // (nothing to carry); selection/external/replacement lanes are
+  // whole-pipeline work.
+  if (!payload->audioTracks.empty()) {
+    for (const AudioTrackRule &rule : payload->audioTracks) {
+      if (rule.externalUri.has_value() || rule.replace) {
+        return false;
+      }
+    }
   }
-  if (request.audio.gainDb.has_value() || request.audio.fadeInMs.has_value() ||
-      request.audio.fadeOutMs.has_value() || request.audio.normalizeLoudness ||
-      request.audio.playbackSpeed.has_value() || request.audio.removeSilence) {
-    return false; // v1 hybrid stream-copies audio: no DSP chain
+  // Subtitles: Remove only (Preserve/Embed/BurnIn need whole-pipeline
+  // backends — refusing here is what keeps "never silently dropped"
+  // true; an empty rule list means preserve-all and is refused too).
+  if (payload->subtitleTracks.empty()) {
+    return false;
   }
-  if (request.audio.enabled && !pipeline.audioStreamCopy) {
+  for (const SubtitleTrackRule &rule : payload->subtitleTracks) {
+    if (rule.policy != SubtitleTrackPolicy::Remove) {
+      return false;
+    }
+  }
+  if (!pipeline.audioStreamCopy) {
     return false; // audio transcode stays whole-pipeline
-  }
-  if (request.subtitles.policy == SubtitlePolicy::Preserve ||
-      request.subtitles.policy == SubtitlePolicy::Extract ||
-      request.subtitles.policy == SubtitlePolicy::BurnIn) {
-    return false; // Preserve/BurnIn/Extract need whole-pipeline backends
   }
   // Stage shape: the decode side owns demux + video processing; the mux
   // side owns encode + mux + bitstream.
@@ -95,20 +114,21 @@ ExecuteResult HybridExecutor::execute(const ExecuteParams &params) {
   ExecuteResult result;
   const auto started = std::chrono::steady_clock::now();
   const Pipeline &pipeline = params.pipeline;
-  const ConversionRequest &request = params.request;
+  const JobRequest &request = params.request;
 
   if (!canExecute(pipeline, request)) {
-    result.error = Error::make(ErrorCode::UnsupportedFeature,
+    result.error = Error::make(ErrorCode::UnsupportedOperation,
                                "the hybrid executor cannot serve this "
                                "pipeline shape",
                                "hybrid");
     return result;
   }
+  const auto &payload = std::get<job::VideoConvert>(request.payload);
   IBackend *decodeSide = decodeBackendFor(pipeline);
   IBackend *muxSide = muxBackendFor(pipeline);
 
   // Source path: hybrid execution needs a local file both sides can open.
-  const std::string sourceUri = request.source.uri;
+  const std::string sourceUri = payload.source.uri;
   const std::string prefix = "file://";
   std::string sourcePath = sourceUri;
   if (sourcePath.rfind(prefix, 0) == 0) {
@@ -126,7 +146,7 @@ ExecuteResult HybridExecutor::execute(const ExecuteParams &params) {
   const std::unique_ptr<IVideoStageDecoder> decoder(
       decodeSide->stages()->createVideoDecoder());
   if (decoder == nullptr) {
-    result.error = Error::make(ErrorCode::UnsupportedFeature,
+    result.error = Error::make(ErrorCode::UnsupportedOperation,
                                "the decode backend cannot create a stage "
                                "decoder",
                                "hybrid");
@@ -138,13 +158,21 @@ ExecuteResult HybridExecutor::execute(const ExecuteParams &params) {
     return result;
   }
 
-  // Audio copy decision: only when the source actually has audio and the
-  // request keeps it.
-  const bool copyAudio = request.audio.enabled;
+  // Audio copy decision: removal rules drop the lane; everything else
+  // keeps the source audio (the mux side stream-copies it).
+  const bool copyAudio = [&payload]() {
+    if (payload.audioTracks.empty()) {
+      return true;
+    }
+    return !std::all_of(payload.audioTracks.begin(), payload.audioTracks.end(),
+                        [](const AudioTrackRule &rule) {
+                          return !rule.include;
+                        });
+  }();
 
   std::unique_ptr<IMuxStage> mux(muxSide->stages()->createMux());
   if (mux == nullptr) {
-    result.error = Error::make(ErrorCode::UnsupportedFeature,
+    result.error = Error::make(ErrorCode::UnsupportedOperation,
                                "the mux backend cannot create a stage muxer",
                                "hybrid");
     return result;
@@ -164,22 +192,52 @@ ExecuteResult HybridExecutor::execute(const ExecuteParams &params) {
     return result;
   }
 
+  // Rate policy from the compression intent (mandate §20): presets map to
+  // the quality scale; Custom honors explicit values; TargetSize cannot
+  // budget honestly on this path (no inspection data) and falls back to
+  // the balanced scale — the planner keeps size-targeted jobs on
+  // whole-pipeline routes whenever one exists.
+  const CompressionIntent &compression = payload.compression;
+  std::int32_t quality = 65; // disabled: high-fidelity default (CRF ~18)
+  std::int64_t bitRate = 0;
+  if (compression.enabled) {
+    switch (compression.preset) {
+      case CompressionPreset::HighQuality:
+        quality = 85;
+        break;
+      case CompressionPreset::Balanced:
+      case CompressionPreset::TargetSize:
+        quality = 60;
+        break;
+      case CompressionPreset::SmallerFile:
+        quality = 35;
+        break;
+      case CompressionPreset::Custom:
+        if (compression.videoBitrate.has_value() &&
+            *compression.videoBitrate > 0) {
+          bitRate = *compression.videoBitrate;
+        } else {
+          quality = std::clamp(compression.quality.value_or(60), 1, 100);
+        }
+        break;
+    }
+  }
+
   backend::StageEncoderConfig encConfig;
   encConfig.codec = pipeline.videoCodec;
   encConfig.width = fmt.width;
   encConfig.height = fmt.height;
   encConfig.frameRate = pipeline.sourceFrameRate;
-  if (request.video.rateControl == RateControl::Bitrate &&
-      request.video.bitRate.has_value()) {
-    encConfig.bitRate = *request.video.bitRate;
+  if (bitRate > 0) {
+    encConfig.bitRate = bitRate;
   } else {
-    encConfig.quality = request.video.quality.value_or(60);
+    encConfig.quality = quality;
   }
   encConfig.globalHeader = mux->wantsGlobalHeader();
   std::unique_ptr<IVideoStageEncoder> encoder(
       muxSide->stages()->createVideoEncoder());
   if (encoder == nullptr) {
-    result.error = Error::make(ErrorCode::UnsupportedFeature,
+    result.error = Error::make(ErrorCode::UnsupportedOperation,
                                "the encode backend cannot create a stage "
                                "encoder",
                                "hybrid");

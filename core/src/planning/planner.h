@@ -6,12 +6,18 @@
 // best. Planning is pure computation over cached registries: no codec
 // enumeration, no probing, no test encoding — warm-path planning stays in
 // the microsecond range (benchmarked in core/tests/planner_tests.cpp).
+//
+// Typed request mapping (mandate §15): every operation's payload is
+// normalized into one internal conversion shape; the capability-gate
+// architecture and cost model below are shape-driven and shared by all
+// operations.
 #pragma once
 
 #include "capabilities/capabilities.h"
 #include "catalog/features.h"
 #include <velmux/jobs.h>
 #include <velmux/media.h>
+#include "compression/compression.h"
 #include "processing/pipeline.h"
 #include "persistence/telemetry_fwd.h"
 
@@ -32,17 +38,21 @@ struct PlannedPipeline {
 };
 
 // The narrow failure key a given (source, request, output codec) targets on
-// a backend: codec + profile + output geometry + pixel format. Computed
-// IDENTICALLY at planning time (to skip routes whose key has a live failure
-// record) and at failure-recording time (job manager), so the two sides
-// always agree on what "this configuration" means.
+// a backend: codec + output geometry. Computed IDENTICALLY at planning
+// time (to skip routes whose key has a live failure record) and at
+// failure-recording time (job manager), so the two sides always agree on
+// what "this configuration" means.
 FailedConfigKey failedConfigKeyFor(BackendId backend, const MediaInfo &source,
-                                   const ConversionRequest &request,
+                                   const JobRequest &request,
                                    VideoCodec outVideoCodec);
 
 struct PlanResult {
   bool feasible = false;
   std::string message; // infeasibility explanation or notes
+  // Stable error code for honest refusals: UnsupportedOperation for the
+  // operations not yet implemented in this build (Split, spatial/sequential
+  // Merge, multi-range Cut, ExtractFrames); None otherwise.
+  ErrorCode errorCode = ErrorCode::None;
   std::optional<PlannedPipeline> best;
   std::vector<PlannedPipeline> alternates; // ranked, best first
   // Planning wall time (telemetry).
@@ -54,9 +64,12 @@ public:
   Planner(const FeatureRegistry &features, const CapabilityRegistry &caps,
           const ITelemetryQuery *telemetry);
 
-  // Plan a conversion. Pure function of (source, request, registries,
-  // telemetry); safe to call from any thread.
-  PlanResult plan(const MediaInfo &source, const ConversionRequest &request);
+  // Plan a typed request against the inspected sources. Pure function of
+  // (request, sources, registries, telemetry); safe to call from any
+  // thread. The Result carries hard input errors (no usable source); the
+  // PlanResult itself carries feasibility, honest refusal codes and notes.
+  Result<PlanResult> plan(const JobRequest &request,
+                          const std::vector<MediaInfo> &sources);
 
   // Cost model weights (tunable for tests/simulation; production defaults
   // live in the .cpp). A hardware stage is not assumed faster when bridging

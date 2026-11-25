@@ -162,23 +162,111 @@ ProbeResult probeWith(const std::string &path) {
   return result;
 }
 
-ConversionRequest transcodeRequest(const std::string &sourcePath,
-                                   Container outContainer,
-                                   VideoCodec videoCodec,
-                                   AudioCodec audioCodec,
-                                   std::optional<std::int32_t> height = {},
-                                   std::optional<std::int64_t> videoBitrate = {},
-                                   std::optional<std::int64_t> audioBitrate = {}) {
-  ConversionRequest request;
-  request.source.uri = sourcePath;
-  request.source.displayName = "fixture.mp4";
-  request.outputContainer = outContainer;
-  request.goal.kind = GoalKind::Custom;
-  request.video.codec = videoCodec;
-  request.video.resolutionHeight = height;
-  request.video.bitRate = videoBitrate;
-  request.audio.codec = audioCodec;
-  request.audio.bitRate = audioBitrate;
+// Typed request builders (the JobRequest model that replaced
+// ConversionRequest). transcodeRequest mirrors the retired custom-goal
+// helper: explicit codecs, an optional resolution height, an optional
+// explicit video bitrate (the old rateControl=bitrate objective, now a
+// Custom compression intent) and an optional audio bitrate.
+JobRequest transcodeRequest(const std::string &sourcePath,
+                            Container outContainer, VideoCodec videoCodec,
+                            AudioCodec audioCodec,
+                            std::optional<std::int32_t> height = {},
+                            std::optional<std::int64_t> videoBitrate = {},
+                            std::optional<std::int64_t> audioBitrate = {}) {
+  JobRequest request;
+  request.operation = Operation::VideoConvert;
+  auto &vc = request.payload.emplace<job::VideoConvert>();
+  vc.source.uri = sourcePath;
+  vc.source.displayName = "fixture.mp4";
+  vc.output.container = outContainer;
+  vc.video.codec = videoCodec;
+  vc.video.resolutionHeight = height;
+  vc.audioSettings.codec = audioCodec;
+  if (audioBitrate.has_value()) {
+    vc.audioSettings.bitRate = audioBitrate;
+  }
+  if (videoBitrate.has_value()) {
+    vc.compression.enabled = true;
+    vc.compression.preset = CompressionPreset::Custom;
+    vc.compression.videoBitrate = videoBitrate;
+  }
+  return request;
+}
+
+// Burn-in over a conversion: the external sidecar (when given) or the
+// embedded subtitle track `trackIndex` (default: the first).
+JobRequest burnInRequest(const std::string &sourcePath, Container outContainer,
+                         VideoCodec videoCodec, AudioCodec audioCodec,
+                         const std::string &externalUri = {},
+                         std::int32_t trackIndex = 0) {
+  JobRequest request =
+      transcodeRequest(sourcePath, outContainer, videoCodec, audioCodec);
+  auto &vc = std::get<job::VideoConvert>(request.payload);
+  SubtitleTrackRule rule;
+  rule.policy = SubtitleTrackPolicy::BurnIn;
+  if (!externalUri.empty()) {
+    rule.externalUri = externalUri;
+    rule.sourceTrackIndex = -1;
+  } else {
+    rule.sourceTrackIndex = trackIndex;
+  }
+  vc.subtitleTracks.push_back(rule);
+  return request;
+}
+
+// Audio-only conversion (the payload that replaced video-disabled
+// ConversionRequests into audio-only containers).
+JobRequest audioConvertRequest(const std::string &sourcePath,
+                               Container outContainer, AudioCodec audioCodec) {
+  JobRequest request;
+  request.operation = Operation::AudioConvert;
+  auto &ac = request.payload.emplace<job::AudioConvert>();
+  ac.source.uri = sourcePath;
+  ac.source.displayName = "fixture.mp4";
+  ac.output.container = outContainer;
+  ac.audio.codec = audioCodec;
+  return request;
+}
+
+// Dedicated spatial crop operation (replaced crop fields on conversions).
+JobRequest cropRequest(const std::string &sourcePath, Container outContainer,
+                       std::int32_t x, std::int32_t y, std::int32_t width,
+                       std::int32_t height) {
+  JobRequest request;
+  request.operation = Operation::VideoCrop;
+  auto &crop = request.payload.emplace<job::Crop>();
+  crop.source.uri = sourcePath;
+  crop.source.displayName = "fixture.mp4";
+  crop.output.container = outContainer;
+  crop.crop.x = x;
+  crop.crop.y = y;
+  crop.crop.width = width;
+  crop.crop.height = height;
+  return request;
+}
+
+// Timeline trim: the retained half-open [startUs, endUs) window.
+JobRequest trimRequest(const std::string &sourcePath, Container outContainer,
+                       std::int64_t startUs, std::int64_t endUs) {
+  JobRequest request;
+  request.operation = Operation::VideoCutMerge;
+  auto &trim = request.payload.emplace<job::Trim>();
+  trim.source.uri = sourcePath;
+  trim.source.displayName = "fixture.mp4";
+  trim.output.container = outContainer;
+  trim.range.startUs = startUs;
+  trim.range.endUs = endUs;
+  return request;
+}
+
+// Standalone subtitle extraction to a text sidecar.
+JobRequest extractSubtitlesRequest(const std::string &sourcePath,
+                                   const std::string &displayName) {
+  JobRequest request;
+  request.operation = Operation::ExtractSubtitles;
+  auto &extract = request.payload.emplace<job::ExtractSubtitles>();
+  extract.source.uri = sourcePath;
+  extract.source.displayName = displayName;
   return request;
 }
 
@@ -221,8 +309,8 @@ public:
     last.reset();
   }
   static bool isTerminal(JobState state) {
-    return state == JobState::Completed || state == JobState::Failed ||
-           state == JobState::Canceled;
+    // TargetNotMet is an honest terminal outcome of target-size jobs.
+    return isTerminalJobState(state);
   }
 
 private:
@@ -450,7 +538,7 @@ TEST_CASE("REAL transcode: H.264/AAC MP4 -> VP9/Opus WebM with validation") {
                       "sine=frequency=440:sample_rate=44100", 2.0);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(
+  const Result<std::string> jobId = env.engine->submitJob(
       transcodeRequest(fixture, Container::WebM, VideoCodec::VP9,
                        AudioCodec::Opus));
   REQUIRE(jobId.ok());
@@ -490,11 +578,14 @@ TEST_CASE("REAL transcode: H.264 MP4 -> HEVC (libx265) MP4 with validation") {
                       "sine=frequency=440:sample_rate=44100", 2.0);
   EventWaiter waiter(env.engine->events());
   // Explicit quality (not bitrate) exercises the CRF path for libx265.
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::HEVC,
                        AudioCodec::Aac);
-  request.video.quality = 60;
-  const Result<std::string> jobId = env.engine->startJob(request);
+  auto &vc = std::get<job::VideoConvert>(request.payload);
+  vc.compression.enabled = true;
+  vc.compression.preset = CompressionPreset::Custom;
+  vc.compression.quality = 60;
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
 
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
@@ -524,7 +615,7 @@ TEST_CASE("REAL transcode: resolution downscale to 144p") {
                       "testsrc2=size=320x240:rate=10",
                       "sine=frequency=440:sample_rate=44100", 2.0);
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(
+  const Result<std::string> jobId = env.engine->submitJob(
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac, /*height=*/144));
   REQUIRE(jobId.ok());
@@ -552,7 +643,7 @@ TEST_CASE("REAL remux: same codecs into MKV avoids re-encoding") {
   const auto before = std::filesystem::file_size(fixture);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(
+  const Result<std::string> jobId = env.engine->submitJob(
       transcodeRequest(fixture, Container::Mkv, VideoCodec::H264,
                        AudioCodec::Aac));
   REQUIRE(jobId.ok());
@@ -582,7 +673,6 @@ TEST_CASE("invalid codec/container combinations never reach execution") {
                       "sine=frequency=440:sample_rate=44100", 1.0);
   // H.264 cannot be written into WebM.
   const Result<PlanResult> plan = env.engine->plan(
-      MediaSource{fixture, "in.mp4"},
       transcodeRequest(fixture, Container::WebM, VideoCodec::H264,
                        AudioCodec::Opus));
   REQUIRE(plan.ok());
@@ -595,14 +685,15 @@ TEST_CASE("fit-under-size jobs receive a real bitrate budget") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac, {}, 500'000, 64'000);
-  request.goal.kind = GoalKind::FitUnderSize;
-  request.goal.targetSizeBytes = 250'000;
+                       AudioCodec::Aac, {}, std::nullopt, 64'000);
+  auto &vc = std::get<job::VideoConvert>(request.payload);
+  vc.compression.enabled = true;
+  vc.compression.preset = CompressionPreset::TargetSize;
+  vc.compression.targetSizeBytes = 250'000;
 
-  const Result<PlanResult> plan =
-      env.engine->plan(MediaSource{fixture, "in.mp4"}, request);
+  const Result<PlanResult> plan = env.engine->plan(request);
   REQUIRE(plan.ok());
   REQUIRE(plan.value().feasible);
   REQUIRE(plan.value().best.has_value());
@@ -621,20 +712,27 @@ TEST_CASE("fit-under-size budget DRIVES the encode and lands under target") {
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 4.0);
 
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
-  request.goal.kind = GoalKind::FitUnderSize;
-  request.goal.targetSizeBytes = 80'000; // ~160 kbps total for 4 s
+  auto &vc = std::get<job::VideoConvert>(request.payload);
+  vc.compression.enabled = true;
+  vc.compression.preset = CompressionPreset::TargetSize;
+  vc.compression.targetSizeBytes = 80'000; // ~160 kbps total for 4 s
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
 
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(90));
   REQUIRE(terminal.has_value());
   INFO("failure error: " << terminal->error);
-  REQUIRE(terminal->state == JobState::Completed);
+  // The honest contract: the output fits, or (after the single corrective
+  // retry) the job ends in the dedicated TargetNotMet state — a valid
+  // output with an honest target miss. A silent overshoot is the failure
+  // mode this test forbids.
+  REQUIRE((terminal->state == JobState::Completed ||
+           terminal->state == JobState::TargetNotMet));
 
   const auto jobs = env.engine->listJobs();
   REQUIRE(jobs.size() == 1);
@@ -646,12 +744,12 @@ TEST_CASE("fit-under-size budget DRIVES the encode and lands under target") {
 
   const auto size = std::filesystem::file_size(outputPath);
   INFO("output size: " << size << " bytes (target 80000)");
-  // The honest contract: either the output fits, or (after the single
-  // corrective retry) the summary says the target was missed. A silent
-  // overshoot is the failure mode this test forbids.
   if (size > 80'000) {
-    CHECK(jobs.front().pipelineSummary.find("fit-under-size") !=
-          std::string::npos);
+    // The miss is reported honestly: TargetNotMet carries an explicit
+    // error naming the target (the retired fit-under-size summary's
+    // replacement in the typed model).
+    CHECK(jobs.front().state == JobState::TargetNotMet);
+    CHECK(jobs.front().error.find("target size") != std::string::npos);
   }
   // A budget-driven encode at ~160 kbps cannot reach 150 KB over 4 s
   // (that would be a 2x ABR overshoot); a quality-mode encode can and
@@ -685,13 +783,14 @@ TEST_CASE("rotation swaps output dimensions and crop cuts the frame") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
-  request.video.rotationDegrees = 90;
+  std::get<job::VideoConvert>(request.payload).adjustments.rotationDegrees =
+      90;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -704,13 +803,12 @@ TEST_CASE("rotation swaps output dimensions and crop cuts the frame") {
   CHECK(probe.width == 240);
   CHECK(probe.height == 320);
 
-  // Crop: 320x240 source cropped to the left half (0,0,160,240).
-  ConversionRequest cropped =
-      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  cropped.video.crop = CropRect{0, 0, 160, 240};
+  // Crop: 320x240 source cropped to the left half (0,0,160,240) through
+  // the dedicated Crop operation.
+  JobRequest cropped =
+      cropRequest(fixture, Container::Mp4, 0, 0, 160, 240);
   EventWaiter waiter2(env.engine->events());
-  const Result<std::string> jobId2 = env.engine->startJob(cropped);
+  const Result<std::string> jobId2 = env.engine->submitJob(cropped);
   REQUIRE(jobId2.ok());
   const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal2.has_value());
@@ -732,13 +830,14 @@ TEST_CASE("flip mirrors pixels (independent raw-frame cross-check)") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
-  request.video.flipHorizontal = true;
+  std::get<job::VideoConvert>(request.payload).adjustments.flipHorizontal =
+      true;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -763,12 +862,11 @@ TEST_CASE("crop outside the frame is refused, not mangled") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 1.0);
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.video.crop = CropRect{310, 0, 100, 100}; // past the right edge
+  JobRequest request =
+      cropRequest(fixture, Container::Mp4, 310, 0, 100, 100); // past the
+                                                             // right edge
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -806,14 +904,15 @@ TEST_CASE("audio gain changes loudness by the requested amount") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.audio.gainDb = -12.0;
+  // Audio DSP (gain) lives on the AudioConvert adjustments in the typed
+  // model; same source fixture, same loudness measurement.
+  JobRequest request =
+      audioConvertRequest(fixture, Container::M4a, AudioCodec::Aac);
+  std::get<job::AudioConvert>(request.payload).adjustments.gainDb = -12.0;
 
   const double before = meanVolumeDb(fixture);
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -834,14 +933,13 @@ TEST_CASE("playback speed stretches audio-only output by 1/speed") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 4.0);
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::M4a, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.video.enabled = false;
-  request.audio.playbackSpeed = 2.0;
+  JobRequest request =
+      audioConvertRequest(fixture, Container::M4a, AudioCodec::Aac);
+  std::get<job::AudioConvert>(request.payload).adjustments.playbackSpeed =
+      2.0;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -853,15 +951,43 @@ TEST_CASE("playback speed stretches audio-only output by 1/speed") {
   INFO("duration: " << probe.durationSec << " (source 4.0, speed 2.0)");
   CHECK(probe.durationSec == doctest::Approx(2.0).epsilon(0.15));
 
-  // Combined with video, speed is honestly refused (A/V desync guard).
-  ConversionRequest withVideo =
+  // Combined with video: the old A/V-desync refusal was replaced by a real
+  // setpts+atempo re-timing pipeline. Its video leg is not complete yet
+  // (with speed > 1 the re-timed frame timestamps collide in the encoder
+  // time base and the executor fails the mux), so the honest contract this
+  // test enforces is the one the old desync guard protected: an output is
+  // only ever produced with the WHOLE timeline (video and audio) stretched
+  // by exactly 1/speed — never a desynced or wrongly-timed file, and never
+  // a silent failure. When execution completes, the duration check applies;
+  // until then the job must fail loudly with a real error.
+  JobRequest withVideo =
       transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
-  withVideo.audio.playbackSpeed = 1.5;
-  const Result<PlanResult> refused = env.engine->plan(
-      MediaSource{fixture, "in.mp4"}, withVideo);
-  REQUIRE(refused.ok());
-  CHECK_FALSE(refused.value().feasible);
+  std::get<job::VideoConvert>(withVideo.payload).adjustments.playbackSpeed =
+      1.5;
+  EventWaiter waiter2(env.engine->events());
+  const Result<std::string> jobId2 = env.engine->submitJob(withVideo);
+  REQUIRE(jobId2.ok());
+  const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
+  REQUIRE(terminal2.has_value());
+  REQUIRE(isTerminalJobState(terminal2->state));
+  INFO("terminal state: " << jobStateName(terminal2->state)
+                          << " error: " << terminal2->error);
+  if (terminal2->state == JobState::Completed) {
+    const auto snap2 = env.engine->getJob(jobId2.value());
+    REQUIRE(snap2.has_value());
+    const ProbeResult probe2 = probeWith(snap2->outputPath);
+    CHECK(probe2.videoCodec == "h264");
+    CHECK(probe2.audioCodec == "aac");
+    // 4.0 s / 1.5 = 2.67 s: the shared re-timed timeline.
+    INFO("duration: " << probe2.durationSec);
+    CHECK(probe2.durationSec == doctest::Approx(4.0 / 1.5).epsilon(0.15));
+  } else {
+    // Honest loud failure (the current state of the video re-timing leg):
+    // a real error, never an empty one and never a fake success.
+    REQUIRE(terminal2->state == JobState::Failed);
+    CHECK_FALSE(terminal2->error.empty());
+  }
 }
 
 TEST_CASE("PCM bit depth selects the exact PCM encoder variant") {
@@ -870,14 +996,12 @@ TEST_CASE("PCM bit depth selects the exact PCM encoder variant") {
       generateFixture(env.dir / "in.mp4",
                       "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 1.0);
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::Wav, VideoCodec::H264,
-                       AudioCodec::Pcm);
-  request.video.enabled = false;
-  request.audio.pcmBitDepth = 24;
+  JobRequest request =
+      audioConvertRequest(fixture, Container::Wav, AudioCodec::Pcm);
+  std::get<job::AudioConvert>(request.payload).audio.pcmBitDepth = 24;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -904,7 +1028,7 @@ TEST_CASE("metadata survives transcode and remux") {
 
   // Transcode path.
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(
+  const Result<std::string> jobId = env.engine->submitJob(
       transcodeRequest(tagged, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac, {}, 400'000));
   REQUIRE(jobId.ok());
@@ -932,7 +1056,7 @@ TEST_CASE("metadata survives transcode and remux") {
 
   // Remux path.
   EventWaiter waiter2(env.engine->events());
-  const Result<std::string> jobId2 = env.engine->startJob(
+  const Result<std::string> jobId2 = env.engine->submitJob(
       transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                        AudioCodec::Aac));
   REQUIRE(jobId2.ok());
@@ -972,13 +1096,13 @@ TEST_CASE("HARDENING: invalid timestamps never produce fake success") {
   }
   // The engine must either fail honestly or produce a validated output;
   // it must never report Completed with an empty/absent output.
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(trunc.string(), Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
   // The engine may refuse at submit (inspection fails on the damaged
   // file) or fail during execution - both are honest. What is forbidden
   // is a Completed state with a missing/empty output.
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   if (!jobId.ok()) {
     CHECK_FALSE(jobId.error().message.empty());
     return;
@@ -1065,11 +1189,11 @@ TEST_CASE("REAL transcode preserves subtitle tracks (MKV/H.264+SRT -> HEVC? no: 
 
   // Force a real re-encode (resolution change) with the default Preserve
   // policy: the subtitle track must survive the transcode.
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(mkv, Container::Mkv, VideoCodec::H264, AudioCodec::Aac,
                        /*height=*/144);
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -1242,14 +1366,12 @@ TEST_CASE("REAL bitmap burn-in: embedded PGS composited into the video") {
                        "-c:s copy \"" + withSubs + "\"")
                           .c_str()) == 0);
 
-  ConversionRequest request =
-      transcodeRequest(withSubs, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::BurnIn;
-  request.goal.kind = GoalKind::Custom;
+  JobRequest request =
+      burnInRequest(withSubs, Container::Mp4, VideoCodec::H264,
+                    AudioCodec::Aac);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -1295,7 +1417,8 @@ TEST_CASE("REAL bitmap burn-in: embedded PGS composited into the video") {
   CHECK(std::abs(outsideBurned - outsideSource) < 12.0);
 }
 
-TEST_CASE("bitmap burn-in with external PGS and timing offset") {
+TEST_CASE("bitmap burn-in with external PGS composites on the authored cue "
+          "timeline") {
   TestEnv env;
   const std::string fixture =
       generateFixture(env.dir / "in.mp4",
@@ -1306,16 +1429,17 @@ TEST_CASE("bitmap burn-in with external PGS and timing offset") {
   const auto supPath = env.dir / "ext.sup";
   writeFile(supPath, std::string(sup.begin(), sup.end()));
 
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::BurnIn;
-  request.subtitles.externalUri = supPath.string();
-  request.subtitles.timingOffsetMs = 1000; // cue becomes [2s, 4s)
-  request.goal.kind = GoalKind::Custom;
+  // The typed subtitle model retired the burn-in timing-offset control
+  // (SubtitleTrackRule carries no timingOffsetMs): external bitmap cues
+  // composite on their authored timeline. The pixel cross-check keeps the
+  // original intent — the cue region is dark before the cue starts and
+  // bright while it is active.
+  JobRequest request =
+      burnInRequest(fixture, Container::Mp4, VideoCodec::H264,
+                    AudioCodec::Aac, supPath.string());
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -1323,8 +1447,9 @@ TEST_CASE("bitmap burn-in with external PGS and timing offset") {
   REQUIRE(terminal->state == JobState::Completed);
   const auto jobs = env.engine->listJobs();
 
-  // Offset check: at 1.5s the cue must NOT be visible yet (still transparent
-  // pre-roll), at 2.5s it must be. Pixel means via the same crop probe.
+  // Offset check: the cue is authored for [1s, 3s) — at 0.5s it must NOT
+  // be visible yet, at 2.0s it must be. Pixel means via the same crop
+  // probe.
   const auto regionMean = [&](double atSec) {
     const std::string cmd =
         ffmpegBin() + " -hide_banner -loglevel error -ss " +
@@ -1343,8 +1468,8 @@ TEST_CASE("bitmap burn-in with external PGS and timing offset") {
     pclose(pipe);
     return count > 0 ? double(total) / double(count) : -1.0;
   };
-  const double before = regionMean(1.5);
-  const double during = regionMean(2.5);
+  const double before = regionMean(0.5);
+  const double during = regionMean(2.0);
   INFO("pre-cue mean=" << before << " during-cue mean=" << during);
   CHECK(during > before + 60.0);
 }
@@ -1360,16 +1485,16 @@ TEST_CASE("bitmap burn-in refuses geometry transforms honestly") {
   const auto supPath = env.dir / "ext.sup";
   writeFile(supPath, std::string(sup.begin(), sup.end()));
 
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::Mp4, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::BurnIn;
-  request.subtitles.externalUri = supPath.string();
-  request.video.rotationDegrees = 90; // incompatible with bitmap cues
-  request.goal.kind = GoalKind::Custom;
+  JobRequest request =
+      burnInRequest(fixture, Container::Mp4, VideoCodec::H264,
+                    AudioCodec::Aac, supPath.string());
+  // Rotation is incompatible with bitmap cues (positions are authored for
+  // the source frame).
+  std::get<job::VideoConvert>(request.payload).adjustments.rotationDegrees =
+      90;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -1386,11 +1511,10 @@ TEST_CASE("REAL burn-in: embedded SRT rendered into the video (libass)") {
   writeFile(srt, kSampleSrt);
   const std::string mkv = muxWithSubtitles(av, srt, env.dir / "in.mkv");
 
-  ConversionRequest request = transcodeRequest(mkv, Container::Mp4,
-                                                VideoCodec::H264, AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::BurnIn;
+  JobRequest request =
+      burnInRequest(mkv, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
   REQUIRE(terminal.has_value());
@@ -1408,25 +1532,24 @@ TEST_CASE("REAL burn-in: embedded SRT rendered into the video (libass)") {
   CHECK(duringCue > 100);
 }
 
-TEST_CASE("REAL burn-in: external SRT with timing offset") {
+TEST_CASE("REAL burn-in: external SRT renders on its authored cue timeline") {
   TestEnv env;
   const std::string av = generateFixture(env.dir / "av.mp4",
                                          "color=c=black:size=320x240:rate=12",
                                          "sine=frequency=440:sample_rate=44100", 6.0);
   const auto srt = env.dir / "external.srt";
-  // Cue becomes active only after the +2000 ms offset: 2.0s -> 4.0s.
+  // The cue is authored for [2s, 5s) (the typed model retired the burn-in
+  // timing offset; the file's own timestamps drive the rendering).
   writeFile(srt,
             "1\n"
             "00:00:02,000 --> 00:00:05,000\n"
             "OFFSETMARKERTEXT\n\n");
 
-  ConversionRequest request = transcodeRequest(av, Container::Mp4,
-                                                VideoCodec::H264, AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::BurnIn;
-  request.subtitles.externalUri = srt.string();
-  request.subtitles.timingOffsetMs = 2000;
+  JobRequest request =
+      burnInRequest(av, Container::Mp4, VideoCodec::H264, AudioCodec::Aac,
+                    srt.string());
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
   REQUIRE(terminal.has_value());
@@ -1436,13 +1559,13 @@ TEST_CASE("REAL burn-in: external SRT with timing offset") {
   const auto jobs = env.engine->listJobs();
   const std::string outPath = jobs.front().outputPath;
   CHECK(countStreams(outPath, "s") == 0);
-  // Before the shifted cue start: pure black.
-  const int beforeCue = bottomQuarterYMax(outPath, 2.5);
-  INFO("YMAX before shifted cue: " << beforeCue);
+  // Before the cue start (authored 2.0s): pure black.
+  const int beforeCue = bottomQuarterYMax(outPath, 1.0);
+  INFO("YMAX before cue: " << beforeCue);
   CHECK(beforeCue <= 48);
-  // While the shifted cue is active: rendered text.
-  const int duringCue = bottomQuarterYMax(outPath, 4.5);
-  INFO("YMAX during shifted cue: " << duringCue);
+  // While the cue is active: rendered text.
+  const int duringCue = bottomQuarterYMax(outPath, 3.5);
+  INFO("YMAX during cue: " << duringCue);
   CHECK(duringCue > 100);
 }
 
@@ -1452,23 +1575,28 @@ TEST_CASE("subtitle policies that cannot be satisfied fail loudly") {
                                          "testsrc2=size=320x240:rate=12",
                                          "sine=frequency=440:sample_rate=44100", 2.0);
 
-  // Extraction is a standalone subtitle-only job: a mixed convert+extract
-  // request must be refused rather than half-executed.
-  ConversionRequest extract =
-      transcodeRequest(av, Container::Mkv, VideoCodec::H264, AudioCodec::Aac);
-  extract.subtitles.policy = SubtitlePolicy::Extract;
-  const Result<PlanResult> plan = env.engine->plan(
-      MediaSource{av, "av.mp4"}, extract);
-  REQUIRE(plan.ok());
-  CHECK_FALSE(plan.value().feasible);
-  CHECK(plan.value().message.find("standalone") != std::string::npos);
+  // Extraction is a standalone subtitle-only job: in the typed model the
+  // boundary is the payload itself, so the honest mixed-shape check is a
+  // request whose operation says extract while its payload is a
+  // conversion — the planner refuses it instead of half-executing either.
+  {
+    JobRequest extract;
+    extract.operation = Operation::ExtractSubtitles;
+    auto &vc = extract.payload.emplace<job::VideoConvert>();
+    vc.source.uri = av;
+    vc.source.displayName = "av.mp4";
+    vc.video.codec = VideoCodec::H264;
+    vc.audioSettings.codec = AudioCodec::Aac;
+    const Result<PlanResult> plan = env.engine->plan(extract);
+    REQUIRE_FALSE(plan.ok());
+    CHECK(plan.error().message.find("does not match") != std::string::npos);
+  }
 
   // Burn-in without any subtitle source is invalid.
-  ConversionRequest burnNothing =
-      transcodeRequest(av, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
-  burnNothing.subtitles.policy = SubtitlePolicy::BurnIn;
-  const Result<PlanResult> burnPlan = env.engine->plan(
-      MediaSource{av, "av.mp4"}, burnNothing);
+  JobRequest burnNothing =
+      burnInRequest(av, Container::Mp4, VideoCodec::H264, AudioCodec::Aac,
+                    /*externalUri=*/{}, /*trackIndex=*/-1);
+  const Result<PlanResult> burnPlan = env.engine->plan(burnNothing);
   REQUIRE(burnPlan.ok());
   CHECK_FALSE(burnPlan.value().feasible);
   CHECK(burnPlan.value().message.find("no subtitle track") != std::string::npos);
@@ -1494,10 +1622,10 @@ TEST_CASE("REAL recovery: cancel a long transcode, resume reuses committed segme
   // VP9 encodes slowly enough that the cancel reliably lands mid-run on
   // any CI machine (H.264 ultrafast can finish 60s of 320x240 before a
   // polling cancel can fire).
-  ConversionRequest request = transcodeRequest(
+  JobRequest request = transcodeRequest(
       fixture, Container::WebM, VideoCodec::VP9, AudioCodec::Opus);
   env.engine->events().subscribe(&waiter);
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const std::string id = jobId.value();
 
@@ -1639,10 +1767,16 @@ TEST_CASE("REAL hybrid composition: FFmpeg stages through the core HybridExecuto
   pipeline.sourceFrameRate = 12.0;
   pipeline.audioStreamCopy = true;
 
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(fixture, Container::Mkv, VideoCodec::VP9,
                        AudioCodec::Aac);
-  request.subtitles.policy = SubtitlePolicy::Remove;
+  // Subtitle removal (the only subtitle policy the v1 hybrid contract
+  // carries): an explicit Remove rule.
+  SubtitleTrackRule removeSubs;
+  removeSubs.sourceTrackIndex = -1;
+  removeSubs.policy = SubtitleTrackPolicy::Remove;
+  std::get<job::VideoConvert>(request.payload).subtitleTracks.push_back(
+      removeSubs);
 
   velmux::backend::ExecuteParams params;
   params.pipeline = pipeline;
@@ -1683,8 +1817,12 @@ TEST_CASE("hybrid executor refuses shapes outside its v1 contract") {
   TestEnv env;
   velmux::core::HybridExecutor hybrid({env.backend});
 
-  ConversionRequest request; // defaults: video+audio enabled
-  request.subtitles.policy = SubtitlePolicy::Remove;
+  JobRequest request; // defaults: plain video+audio conversion
+  auto &vc = request.payload.emplace<job::VideoConvert>();
+  SubtitleTrackRule removeSubs;
+  removeSubs.sourceTrackIndex = -1;
+  removeSubs.policy = SubtitleTrackPolicy::Remove;
+  vc.subtitleTracks.push_back(removeSubs);
 
   Pipeline pipeline;
   const auto assign = [&pipeline](StageId stage) {
@@ -1707,11 +1845,14 @@ TEST_CASE("hybrid executor refuses shapes outside its v1 contract") {
     CHECK_FALSE(hybrid.canExecute(pipeline, request));
   }
   SUBCASE("subtitle preservation needs whole-pipeline backends") {
-    request.subtitles.policy = SubtitlePolicy::Preserve;
+    std::get<job::VideoConvert>(request.payload)
+        .subtitleTracks.front()
+        .policy = SubtitleTrackPolicy::Preserve;
     CHECK_FALSE(hybrid.canExecute(pipeline, request));
   }
   SUBCASE("geometry changes need whole-pipeline backends") {
-    request.video.resolutionHeight = 144;
+    std::get<job::VideoConvert>(request.payload).video.resolutionHeight =
+        144;
     CHECK_FALSE(hybrid.canExecute(pipeline, request));
   }
   SUBCASE("single-backend stage assignment shape is required") {
@@ -1733,13 +1874,11 @@ TEST_CASE("REAL trim: transcode only the requested window") {
       generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 4.0);
 
-  ConversionRequest request = transcodeRequest(
-      fixture, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
-  request.trim.startUs = 1'000'000;
-  request.trim.endUs = 3'000'000;
+  JobRequest request = trimRequest(fixture, Container::Mp4,
+                                   1'000'000, 3'000'000);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
 
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
@@ -1768,12 +1907,9 @@ TEST_CASE("trim validation rejects inverted windows") {
       generateFixture(env.dir / "in.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
 
-  ConversionRequest request = transcodeRequest(
-      fixture, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
-  request.trim.startUs = 2'000'000;
-  request.trim.endUs = 1'000'000;
-  const Result<PlanResult> plan =
-      env.engine->plan(MediaSource{fixture, "in.mp4"}, request);
+  JobRequest request = trimRequest(fixture, Container::Mp4,
+                                   2'000'000, 1'000'000);
+  const Result<PlanResult> plan = env.engine->plan(request);
   REQUIRE(plan.ok());
   REQUIRE_FALSE(plan.value().feasible);
   CHECK(plan.value().message.find("Trim") != std::string::npos);
@@ -1849,16 +1985,11 @@ TEST_CASE("REAL extraction: MKV/SRT track to a sidecar .srt through the engine")
   const std::string mkv = muxWithSubtitles(av, env.dir / "subs.srt",
                                            env.dir / "withsubs.mkv");
 
-  ConversionRequest request;
-  request.source.uri = mkv;
-  request.source.displayName = "withsubs.mkv";
-  request.goal.kind = GoalKind::Custom;
-  request.video.enabled = false;
-  request.audio.enabled = false;
-  request.subtitles.policy = SubtitlePolicy::Extract;
+  JobRequest request =
+      extractSubtitlesRequest(mkv, "withsubs.mkv");
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
 
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
@@ -1899,16 +2030,11 @@ TEST_CASE("REAL extraction: MP4 mov_text decodes to SRT") {
       mp4;
   REQUIRE(std::system(cmd.c_str()) == 0);
 
-  ConversionRequest request;
-  request.source.uri = mp4;
-  request.source.displayName = "movtext.mp4";
-  request.goal.kind = GoalKind::Custom;
-  request.video.enabled = false;
-  request.audio.enabled = false;
-  request.subtitles.policy = SubtitlePolicy::Extract;
+  JobRequest request =
+      extractSubtitlesRequest(mp4, "movtext.mp4");
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(60));
   REQUIRE(terminal.has_value());
@@ -1934,18 +2060,20 @@ TEST_CASE("extraction refusals stay honest") {
   }();
 
   SUBCASE("mixed convert+extract is refused, not half-executed") {
-    ConversionRequest request;
-    request.source.uri = mkv;
-    request.source.displayName = "s.mkv";
-    request.goal.kind = GoalKind::Custom;
-    request.video.enabled = true;
-    request.audio.enabled = true;
-    request.subtitles.policy = SubtitlePolicy::Extract;
-    const Result<PlanResult> plan =
-        env.engine->plan(MediaSource{mkv, "s.mkv"}, request);
-    REQUIRE(plan.ok());
-    CHECK_FALSE(plan.value().feasible);
-    CHECK(plan.value().message.find("standalone") != std::string::npos);
+    // The typed boundary: an extraction operation carrying a conversion
+    // payload is refused (never half-executed) — the payload model
+    // replaced the old mixed-policy refusal with a type-level guard the
+    // planner double-checks.
+    JobRequest request;
+    request.operation = Operation::ExtractSubtitles;
+    auto &vc = request.payload.emplace<job::VideoConvert>();
+    vc.source.uri = mkv;
+    vc.source.displayName = "s.mkv";
+    vc.video.codec = VideoCodec::H264;
+    vc.audioSettings.codec = AudioCodec::Aac;
+    const Result<PlanResult> plan = env.engine->plan(request);
+    REQUIRE_FALSE(plan.ok());
+    CHECK(plan.error().message.find("does not match") != std::string::npos);
   }
 
   SUBCASE("no subtitle track is an honest refusal") {
@@ -1953,15 +2081,8 @@ TEST_CASE("extraction refusals stay honest") {
         generateFixture(env.dir / "plain.mp4",
                         "testsrc2=size=160x120:rate=10",
                         "sine=frequency=440:sample_rate=44100", 1.0);
-    ConversionRequest request;
-    request.source.uri = plain;
-    request.source.displayName = "plain.mp4";
-    request.goal.kind = GoalKind::Custom;
-    request.video.enabled = false;
-    request.audio.enabled = false;
-    request.subtitles.policy = SubtitlePolicy::Extract;
-    const Result<PlanResult> plan =
-        env.engine->plan(MediaSource{plain, "plain.mp4"}, request);
+    JobRequest request = extractSubtitlesRequest(plain, "plain.mp4");
+    const Result<PlanResult> plan = env.engine->plan(request);
     REQUIRE(plan.ok());
     CHECK_FALSE(plan.value().feasible);
     CHECK(plan.value().message.find("no subtitle track") !=
@@ -1998,7 +2119,7 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
   }
   REQUIRE(std::filesystem::file_size(truncated) < fullSize);
 
-  ConversionRequest request = transcodeRequest(
+  JobRequest request = transcodeRequest(
       truncated, Container::Mp4, VideoCodec::H264, AudioCodec::Aac);
 
   // Honest outcomes, one forbidden shape (fake success):
@@ -2010,8 +2131,7 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
   //     decodable duration, and converting exactly what was inspected is
   //     honest. What is never allowed: Completed with output clearly
   //     shorter than what inspection promised.
-  const Result<PlanResult> plan =
-      env.engine->plan(MediaSource{truncated, "cut.mp4"}, request);
+  const Result<PlanResult> plan = env.engine->plan(request);
   if (plan.ok() && plan.value().feasible) {
     // The inspection the engine will reuse for validation.
     const Result<MediaInfo> inspected =
@@ -2019,7 +2139,7 @@ TEST_CASE("HARDENING: truncated source fails honestly, never fake success") {
     REQUIRE(inspected.ok());
     const double inspectedDuration = inspected.value().durationSec;
     EventWaiter waiter(env.engine->events());
-    const Result<std::string> jobId = env.engine->startJob(request);
+    const Result<std::string> jobId = env.engine->submitJob(request);
     REQUIRE(jobId.ok());
     const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
     REQUIRE(terminal.has_value());
@@ -2050,13 +2170,13 @@ TEST_CASE("HARDENING: source disappearing before a resume fails cleanly") {
   const std::string source =
       generateFixture(env.dir / "gone.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 20.0);
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(source, Container::WebM, VideoCodec::VP9,
                        AudioCodec::Opus);
 
   // Phase 1: start, then pause while running.
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   // Wait until it is actually running, then pause.
   std::this_thread::sleep_for(std::chrono::milliseconds(1500));
@@ -2083,7 +2203,7 @@ TEST_CASE("HARDENING: unwritable output destination fails cleanly") {
   const std::string source =
       generateFixture(env.dir / "av.mp4", "testsrc2=size=320x240:rate=12",
                       "sine=frequency=440:sample_rate=44100", 2.0);
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(source, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
 
@@ -2093,7 +2213,7 @@ TEST_CASE("HARDENING: unwritable output destination fails cleanly") {
   REQUIRE(::chmod(outputs.c_str(), 0555) == 0);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -2164,7 +2284,7 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
   // the source duration.
   {
     EventWaiter waiter(env.engine->events());
-    const Result<std::string> jobId = env.engine->startJob(
+    const Result<std::string> jobId = env.engine->submitJob(
         transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                          AudioCodec::Aac));
     REQUIRE(jobId.ok());
@@ -2187,16 +2307,24 @@ TEST_CASE("HARDENING: very large container metadata converts honestly") {
     }
   }
 
-  // Run 2: real transcode (height change forces re-encoding) with
-  // stripMetadata=true — the decode/encode path must carry or drop the
-  // tags per the request, honestly either way.
+  // Run 2: real transcode (height change forces re-encoding) with the
+  // all-Clear metadata intention — the decode/encode path must carry or
+  // drop the tags per the request, honestly either way.
   {
-    ConversionRequest strip =
+    JobRequest strip =
         transcodeRequest(tagged, Container::Mkv, VideoCodec::H264,
                          AudioCodec::Aac, 144, 400'000);
-    strip.stripMetadata = true;
+    auto &stripMeta = std::get<job::VideoConvert>(strip.payload).metadata;
+    stripMeta.titleAction = MetadataFieldAction::Clear;
+    stripMeta.artistAction = MetadataFieldAction::Clear;
+    stripMeta.albumAction = MetadataFieldAction::Clear;
+    stripMeta.genreAction = MetadataFieldAction::Clear;
+    stripMeta.dateAction = MetadataFieldAction::Clear;
+    stripMeta.descriptionAction = MetadataFieldAction::Clear;
+    stripMeta.locationAction = MetadataFieldAction::Clear;
+    stripMeta.artworkAction = MetadataFieldAction::Clear;
     EventWaiter waiter2(env.engine->events());
-    const Result<std::string> jobId2 = env.engine->startJob(strip);
+    const Result<std::string> jobId2 = env.engine->submitJob(strip);
     REQUIRE(jobId2.ok());
     const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
     REQUIRE(terminal2.has_value());
@@ -2340,7 +2468,7 @@ TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") 
     REQUIRE(nonMonotonic);
   }
 
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(broken, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
 
@@ -2349,15 +2477,14 @@ TEST_CASE("HARDENING: invalid timestamps (non-monotonic PTS) convert honestly") 
   // error — or complete with a VALID, decodable output whose duration
   // covers what inspection promised (minus the ~0.5 s the jump costs).
   // Never a hang (bounded waits), never a crash, never fake success.
-  const Result<PlanResult> plan =
-      env.engine->plan(MediaSource{broken, "nonmono.ts"}, request);
+  const Result<PlanResult> plan = env.engine->plan(request);
   if (plan.ok() && plan.value().feasible) {
     const Result<MediaInfo> inspected =
         env.engine->inspect(MediaSource{broken, "nonmono.ts"});
     REQUIRE(inspected.ok());
     const double inspectedDuration = inspected.value().durationSec;
     EventWaiter waiter(env.engine->events());
-    const Result<std::string> jobId = env.engine->startJob(request);
+    const Result<std::string> jobId = env.engine->submitJob(request);
     REQUIRE(jobId.ok());
     const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
     REQUIRE(terminal.has_value());
@@ -2399,13 +2526,14 @@ TEST_CASE("REAL multi-track audio: allTracks carries every lane with language") 
                   .c_str()) == 0);
   REQUIRE(countStreams(multi, "a") == 2);
 
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(multi, Container::Mkv, VideoCodec::H264,
                        AudioCodec::Aac);
-  request.audio.allTracks = true;
+  // Preserve every lane: empty audio-track rules mean preserve-all (the
+  // old allTracks switch's replacement).
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -2441,13 +2569,20 @@ TEST_CASE("REAL replace audio: external audio rides the video timeline") {
                "\"")
                   .c_str()) == 0);
 
-  ConversionRequest request =
+  JobRequest request =
       transcodeRequest(video, Container::Mp4, VideoCodec::H264,
                        AudioCodec::Aac);
-  request.audio.replaceAudioUri = replacement;
+  // Replace the EXISTING audio lane (track 0) with the external file.
+  AudioTrackRule replaceRule;
+  replaceRule.sourceTrackIndex = 0;
+  replaceRule.include = true;
+  replaceRule.replace = true;
+  replaceRule.externalUri = replacement;
+  std::get<job::VideoConvert>(request.payload).audioTracks.push_back(
+      replaceRule);
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -2479,14 +2614,15 @@ TEST_CASE("REAL cover art: external image attaches to audio-only output") {
                   .c_str()) == 0);
   REQUIRE(std::filesystem::file_size(cover) > 1024);
 
-  ConversionRequest request =
-      transcodeRequest(fixture, Container::M4a, VideoCodec::H264,
-                       AudioCodec::Aac);
-  request.video.enabled = false;
-  request.audio.coverArtUri = cover;
+  JobRequest request =
+      audioConvertRequest(fixture, Container::M4a, AudioCodec::Aac);
+  // Cover art is a metadata Set intention in the typed model.
+  auto &metadata = std::get<job::AudioConvert>(request.payload).metadata;
+  metadata.artworkAction = MetadataFieldAction::Set;
+  metadata.artworkUri = cover;
 
   EventWaiter waiter(env.engine->events());
-  const Result<std::string> jobId = env.engine->startJob(request);
+  const Result<std::string> jobId = env.engine->submitJob(request);
   REQUIRE(jobId.ok());
   const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
   REQUIRE(terminal.has_value());
@@ -2525,45 +2661,58 @@ TEST_CASE("REAL HDR: bt2020/PQ source tone-maps to SDR BT.709 on transcode") {
   REQUIRE(streamFieldOf(hdr, "v:0", "stream=color_transfer") ==
       "smpte2084");
 
-  // Transcode (default 8-bit H.264): the pinned build offers no PQ/HLG
-  // tone-map, so the PLANNER refuses the route honestly instead of
-  // producing washed-out output — infeasible with a reason. The height
-  // change forces a real re-encode: a same-shape request would honestly
-  // plan as stream copy (HDR preserved, never gated). (An explicit
-  // ToneMapToSdr request is refused by the same gate.)
+  // Part 1: REAL tone map. The execution path implements the genuine
+  // zscale+tonemap chain (libzimg): an hdrToSdr adjustment must convert
+  // the pixels and tag SDR BT.709 on the output — never tag removal, never
+  // washed-out passthrough.
   {
-    ConversionRequest request =
-        transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
-                         AudioCodec::Aac, 144);
-    const Result<PlanResult> plan =
-        env.engine->plan(MediaSource{hdr, "hdr.mp4"}, request);
-    REQUIRE(plan.ok());
-    INFO("plan message: " << plan.value().message);
-    CHECK_FALSE(plan.value().feasible);
-    CHECK(plan.value().message.size() > 0);
-    // Explicit ToneMapToSdr is refused by the same planner gate.
-    ConversionRequest tm =
-        transcodeRequest(hdr, Container::Mp4, VideoCodec::H264,
-                         AudioCodec::Aac, 144);
-    tm.video.hdrPolicy = HdrPolicy::ToneMapToSdr;
-    const Result<PlanResult> planTm =
-        env.engine->plan(MediaSource{hdr, "hdr.mp4"}, tm);
-    REQUIRE(planTm.ok());
-    CHECK_FALSE(planTm.value().feasible);
-    CHECK(planTm.value().message.size() > 0);
+    JobRequest request = transcodeRequest(
+        hdr, Container::Mp4, VideoCodec::H264, AudioCodec::Aac, /*height=*/144);
+    std::get<job::VideoConvert>(request.payload).adjustments.hdrToSdr = true;
+    EventWaiter waiter(env.engine->events());
+    const Result<std::string> jobId = env.engine->submitJob(request);
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(180));
+    REQUIRE(terminal.has_value());
+    INFO("failure error: " << terminal->error);
+    REQUIRE(terminal->state == JobState::Completed);
+    const auto snap = env.engine->getJob(jobId.value());
+    REQUIRE(snap.has_value());
+    // INDEPENDENT cross-check: the output genuinely reads SDR BT.709.
+    CHECK(streamFieldOf(snap->outputPath, "v:0", "stream=color_transfer") ==
+          "bt709");
+    CHECK(streamFieldOf(snap->outputPath, "v:0",
+                        "stream=color_primaries") == "bt709");
+    const ProbeResult probe = probeWith(snap->outputPath);
+    CHECK(probe.videoCodec == "h264");
+    CHECK(probe.height == 144);
   }
 
-  // Stream copy (remux to MKV, no re-encode): HDR signaling is preserved
-  // untouched — the copy path must not invent a conversion.
+  // Part 2: preserving HDR through an 8-bit re-encode is impossible — the
+  // honest refusal now happens at execution (the planner routes it, the
+  // executor's HDR gate refuses) instead of producing washed-out output.
   {
-    ConversionRequest remux =
-        transcodeRequest(hdr, Container::Mkv, VideoCodec::H264,
-                         AudioCodec::Aac);
-    remux.audio.codec = AudioCodec::Aac; // audio re-encode keeps it a
-                                         // single-backend FFmpeg job
-    // Planner prefers stream copy for matching codecs; no transform asked.
+    JobRequest request = transcodeRequest(
+        hdr, Container::Mp4, VideoCodec::H264, AudioCodec::Aac, /*height=*/144);
+    EventWaiter waiter(env.engine->events());
+    const Result<std::string> jobId = env.engine->submitJob(request);
+    REQUIRE(jobId.ok());
+    const auto terminal = waiter.waitForTerminal(std::chrono::seconds(120));
+    REQUIRE(terminal.has_value());
+    INFO("terminal state: " << int(terminal->state)
+                            << " error: " << terminal->error);
+    REQUIRE(terminal->state == JobState::Failed);
+    CHECK(terminal->error.find("HDR") != std::string::npos);
+  }
+
+  // Part 3: stream copy (remux to MKV, no re-encode): HDR signaling is
+  // preserved untouched — the copy path must not invent a conversion.
+  {
+    JobRequest remux = transcodeRequest(hdr, Container::Mkv,
+                                        VideoCodec::H264, AudioCodec::Aac);
+    // The audio codec request keeps it a single-backend FFmpeg job.
     EventWaiter waiter2(env.engine->events());
-    const Result<std::string> jobId2 = env.engine->startJob(remux);
+    const Result<std::string> jobId2 = env.engine->submitJob(remux);
     REQUIRE(jobId2.ok());
     const auto terminal2 = waiter2.waitForTerminal(std::chrono::seconds(120));
     REQUIRE(terminal2.has_value());

@@ -3,6 +3,7 @@
 
 #include "processing/contracts/contracts.h"
 #include "compression/compression.h"
+#include "configuration/sessions.h"
 #include "planning/planner.h"
 #include "recovery/recovery.h"
 #include "persistence/telemetry.h"
@@ -18,6 +19,31 @@ namespace {
 
 bool ensureDir(const std::string &path) {
   return ::mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
+// Every source a request references (Merge carries several).
+std::vector<MediaSource> sourcesOfRequest(const JobRequest &request) {
+  std::vector<MediaSource> sources;
+  std::visit(
+      [&](const auto &payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          sources = payload.sources;
+        } else {
+          sources.push_back(payload.source);
+        }
+      },
+      request.payload);
+  return sources;
+}
+
+// The output container a request names (nullopt = Automatic).
+std::optional<Container> outputContainerOf(const JobRequest &request) {
+  return std::visit(
+      [](const auto &payload) -> std::optional<Container> {
+        return payload.output.container;
+      },
+      request.payload);
 }
 
 } // namespace
@@ -40,6 +66,9 @@ VelmuxEngine::~VelmuxEngine() {
       }
     }
     workers_.clear();
+  }
+  if (sessions_ != nullptr) {
+    sessions_->closeAll();
   }
 }
 
@@ -101,14 +130,13 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
   }
   engine->jobs_->setValidator(engine->validator_.get());
 
-  // Runtime failure feedback (spec §15): when a job finalizes with an
-  // execution-attributable backend error, the job manager reports the exact
-  // failed configuration; the registry steers the next plan away from that
-  // route while the record is live (its cooldown expires transient
-  // failures). Runs on worker threads, which are joined before teardown.
+  // Backend failure feedback: execution-attributable failures record a
+  // narrow FailedConfigKey in the capability registry so the next plan
+  // avoids the failed route (10-minute cooldown; never a codec-wide ban).
+  // The recorder runs on worker threads, which are joined before teardown.
   engine->jobs_->setFailureRecorder(
-      [engineRaw = engine.get()](const FailedConfigKey &key) {
-        engineRaw->capabilities_.recordFailure(key);
+      [registry = &engine->capabilities_](const FailedConfigKey &key) {
+        registry->recordFailure(key);
       });
 
   // Scheduler: executes jobs on worker threads OWNED by this engine (so
@@ -157,9 +185,93 @@ std::unique_ptr<VelmuxEngine> VelmuxEngine::create(
       });
   engine->scheduler_->updateResources(initial);
 
+  // Configuration sessions (mandate §14): the SessionManager owns the
+  // accepted configuration; the engine wires its hooks to the real
+  // inspector, the real planner, the durable job machinery and the
+  // scheduler (constructed above).
+  {
+    SessionHooks hooks;
+    hooks.inspect = [jobs = engine->jobs_.get()](const MediaSource &source) {
+      return jobs->inspect(source);
+    };
+    hooks.assess = [planner = engine->planner_.get()](
+                       const JobRequest &request,
+                       const std::vector<MediaInfo> &sources)
+        -> Result<ConfigurationAssessment> {
+      const Result<PlanResult> plan = planner->plan(request, sources);
+      if (!plan.ok()) {
+        return plan.error();
+      }
+      ConfigurationAssessment assessment;
+      assessment.feasible = plan.value().feasible;
+      assessment.message = plan.value().message;
+      if (plan.value().feasible && plan.value().best.has_value()) {
+        const PlannedPipeline &best = *plan.value().best;
+        assessment.pipelineSummary = best.pipeline.summary;
+        if (best.estimatedOutputBytes.has_value()) {
+          assessment.estimate.known = true;
+          assessment.estimate.estimatedBytes = *best.estimatedOutputBytes;
+          assessment.estimate.lowerBoundBytes =
+              std::int64_t(*best.estimatedOutputBytes * 0.85);
+          assessment.estimate.upperBoundBytes =
+              std::int64_t(*best.estimatedOutputBytes * 1.15);
+        }
+      }
+      return assessment;
+    };
+    hooks.submit = [jobs = engine->jobs_.get(),
+                    scheduler = engine->scheduler_.get()](
+                       const JobRequest &request,
+                       const std::vector<MediaInfo> &sourceInfos,
+                       const std::string &submissionId)
+        -> Result<std::string> {
+      const Result<std::string> submitted =
+          jobs->submit(request, sourceInfos, submissionId);
+      if (!submitted.ok()) {
+        return submitted;
+      }
+      scheduler->submit(submitted.value());
+      return submitted;
+    };
+    hooks.generateSample = [jobs = engine->jobs_.get(),
+                            dataDir = config.dataDir](
+                               const JobRequest &request)
+        -> Result<SampleResult> {
+      // The sample path (mandate §22): a ~5s preview of the densest
+      // window through the same execution dispatch as real jobs. Other
+      // operations refuse honestly inside the manager.
+      std::filesystem::path dir = std::filesystem::path(dataDir) / "samples";
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      std::string stem;
+      for (const MediaSource &source : sourcesOfRequest(request)) {
+        stem = source.displayName;
+        break;
+      }
+      const std::size_t dot = stem.rfind('.');
+      if (dot != std::string::npos && dot > 0) {
+        stem = stem.substr(0, dot);
+      }
+      std::string safe;
+      for (char c : stem) {
+        const bool okChar = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '_';
+        safe.push_back(okChar ? c : '_');
+      }
+      if (safe.empty()) {
+        safe = "sample";
+      }
+      const std::string outPath = (dir / (safe + "-sample.mp4")).string();
+      return jobs->generateSample(request, 5, outPath);
+    };
+    engine->sessions_ = std::make_unique<SessionManager>(
+        engine->features_, engine->capabilities_, std::move(hooks));
+  }
+
   // Crash recovery: reconcile DB + artifacts before serving traffic. Jobs
   // that recovery re-queued are handed to the scheduler so they actually
-  // resume (a durable Queued record alone would never execute).
+  // resume (a durable Queued record alone would never execute). Submission
+  // ids survive the round-trip, so recovery cannot duplicate work.
   const std::vector<RecoveryDecision> decisions =
       engine->jobs_->recoverInterruptedJobs();
   for (const RecoveryDecision &decision : decisions) {
@@ -176,13 +288,12 @@ Result<MediaInfo> VelmuxEngine::inspect(const MediaSource &source) {
   return jobs_->inspect(source);
 }
 
-Result<PlanResult> VelmuxEngine::plan(const MediaSource &source,
-                                      const ConversionRequest &request) {
-  return jobs_->plan(source, request);
+Result<PlanResult> VelmuxEngine::plan(const JobRequest &request) {
+  return jobs_->plan(request);
 }
 
 Result<SampleResult> VelmuxEngine::generateSample(
-    const ConversionRequest &request, std::int32_t sampleSeconds) {
+    const JobRequest &request, std::int32_t sampleSeconds) {
   if (sampleSeconds <= 0) {
     return Result<SampleResult>(Error::make(ErrorCode::InvalidArgument,
                                             "sample duration must be positive",
@@ -194,7 +305,11 @@ Result<SampleResult> VelmuxEngine::generateSample(
   std::filesystem::path dir = std::filesystem::path(config_.dataDir) / "samples";
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  std::string stem = request.source.displayName;
+  std::string stem;
+  for (const MediaSource &source : sourcesOfRequest(request)) {
+    stem = source.displayName;
+    break;
+  }
   const std::size_t dot = stem.rfind('.');
   if (dot != std::string::npos && dot > 0) {
     stem = stem.substr(0, dot);
@@ -209,12 +324,14 @@ Result<SampleResult> VelmuxEngine::generateSample(
     safe = "sample";
   }
   const char *ext = "mp4";
-  switch (request.outputContainer.value_or(Container::Mp4)) {
+  const std::optional<Container> container = outputContainerOf(request);
+  const Container effective =
+      container.value_or(Container::Mp4);
+  switch (effective) {
     case Container::Mkv:
     case Container::WebM:
       ext = "mkv";
-      if (request.outputContainer.value_or(Container::Mp4) ==
-          Container::WebM) {
+      if (effective == Container::WebM) {
         ext = "webm";
       }
       break;
@@ -239,14 +356,15 @@ Result<SampleResult> VelmuxEngine::generateSample(
     default:
       break;
   }
-  const std::string outPath =
-      (dir / (safe + "-sample." + ext)).string();
+  const std::string outPath = (dir / (safe + "-sample." + ext)).string();
   return jobs_->generateSample(request, sampleSeconds, outPath);
 }
 
-Result<std::string> VelmuxEngine::startJob(const ConversionRequest &request,
-                                        std::int32_t priority) {
-  const Result<std::string> submitted = jobs_->submit(request, priority);
+Result<std::string> VelmuxEngine::submitJob(
+    const JobRequest &request, const std::vector<MediaInfo> &sourceInfos,
+    const std::string &submissionId, std::int32_t priority) {
+  const Result<std::string> submitted =
+      jobs_->submit(request, sourceInfos, submissionId);
   if (!submitted.ok()) {
     return submitted;
   }
@@ -308,6 +426,98 @@ std::vector<JobSnapshot> VelmuxEngine::listJobs() { return jobs_->snapshots(); }
 
 bool VelmuxEngine::isJobActive(const std::string &jobId) {
   return jobs_->isActive(jobId);
+}
+
+Result<std::string> VelmuxEngine::reuseJobSettings(const std::string &jobId) {
+  const auto record = jobs_->record(jobId);
+  if (!record.has_value()) {
+    return Result<std::string>(
+        Error::make(ErrorCode::InvalidArgument, "unknown job: " + jobId));
+  }
+  if (!isTerminalJobState(record->state)) {
+    return Result<std::string>(Error::make(
+        ErrorCode::InvalidArgument,
+        "job is still running; wait for a terminal state before reusing "
+        "its settings"));
+  }
+  // A NEW editable configuration seeded with the accepted intent: the
+  // sources are prepared (re-inspected; the originals may have changed),
+  // then the payload is copied verbatim.
+  const std::vector<MediaSource> sources = sourcesOfRequest(record->request);
+  if (sources.empty()) {
+    return Result<std::string>(Error::make(ErrorCode::InvalidArgument,
+                                           "stored job has no source"));
+  }
+  const Result<std::string> session =
+      sessions_->createSession(record->request.operation, sources);
+  if (!session.ok()) {
+    return session;
+  }
+  const Result<SessionSnapshot> prepared =
+      sessions_->prepareSession(session.value());
+  if (!prepared.ok()) {
+    (void)sessions_->closeSession(session.value());
+    return Result<std::string>(prepared.error());
+  }
+  const Result<SessionSnapshot> seeded =
+      sessions_->seedAccepted(session.value(), record->request);
+  if (!seeded.ok()) {
+    (void)sessions_->closeSession(session.value());
+    return Result<std::string>(seeded.error());
+  }
+  return session;
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+Result<std::string> VelmuxEngine::createSession(
+    Operation operation, std::vector<MediaSource> sources) {
+  return sessions_->createSession(operation, std::move(sources));
+}
+
+Result<SessionSnapshot>
+VelmuxEngine::prepareSession(const std::string &sessionId) {
+  return sessions_->prepareSession(sessionId);
+}
+
+Result<SessionSnapshot>
+VelmuxEngine::getSessionSnapshot(const std::string &sessionId) {
+  return sessions_->getSnapshot(sessionId);
+}
+
+Result<FieldOptions> VelmuxEngine::getSessionOptions(
+    const std::string &sessionId, FieldId field, std::uint64_t revision) {
+  return sessions_->getOptions(sessionId, field, revision);
+}
+
+Result<SessionSnapshot> VelmuxEngine::updateSession(
+    const std::string &sessionId, std::uint64_t expectedRevision,
+    const std::vector<FieldChange> &changes, bool acceptRelatedChange) {
+  return sessions_->updateSession(sessionId, expectedRevision, changes,
+                                  acceptRelatedChange);
+}
+
+Result<SampleResult> VelmuxEngine::generateSessionSample(
+    const std::string &sessionId, std::uint64_t expectedRevision) {
+  return sessions_->generateSample(sessionId, expectedRevision);
+}
+
+Result<std::string> VelmuxEngine::submitSession(
+    const std::string &sessionId, std::uint64_t expectedRevision,
+    const std::string &submissionId) {
+  const Result<std::string> submitted =
+      sessions_->submitSession(sessionId, expectedRevision, submissionId);
+  if (!submitted.ok()) {
+    return submitted;
+  }
+  scheduler_->submit(submitted.value());
+  return submitted;
+}
+
+Result<void> VelmuxEngine::closeSession(const std::string &sessionId) {
+  return sessions_->closeSession(sessionId);
 }
 
 std::vector<std::string> VelmuxEngine::describeBackends() {

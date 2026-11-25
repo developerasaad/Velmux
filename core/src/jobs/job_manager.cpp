@@ -54,8 +54,7 @@ std::string sanitizeFileName(const std::string &name) {
   out.reserve(name.size());
   for (char c : name) {
     const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') || c == '.' || c == '-' ||
-                      c == '_' || c == ' ';
+                      (c >= '0' && c <= '9') || c == '-' || c == '_';
     out.push_back(safe ? c : '_');
   }
   // No path traversal: strip separators entirely (already excluded above)
@@ -96,16 +95,81 @@ bool isExecutionFailure(ErrorCode code) {
 JobSnapshot snapshotOf(const JobRecord &record) {
   JobSnapshot snapshot;
   snapshot.id = record.id;
+  snapshot.submissionId = record.submissionId;
+  snapshot.operation = record.request.operation;
   snapshot.state = record.state;
   snapshot.progress = record.progress;
-  snapshot.sourceName = record.request.source.displayName;
-  snapshot.outputName = record.request.outputName.value_or("");
+  const MediaSource *source = std::visit(
+      [](const auto &payload) -> const MediaSource * {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          return payload.sources.empty() ? nullptr : &payload.sources.front();
+        } else {
+          return &payload.source;
+        }
+      },
+      record.request.payload);
+  snapshot.sourceName = source != nullptr ? source->displayName : "";
+  snapshot.outputName = std::visit(
+      [](const auto &payload) {
+        return payload.output.name.value_or("");
+      },
+      record.request.payload);
   snapshot.outputPath = record.outputPath;
+  snapshot.outputs = record.outputs;
   snapshot.error = record.error;
+  snapshot.errorCode = record.errorCode;
   snapshot.outputSizeBytes = record.outputSizeBytes;
   snapshot.inputSizeBytes = record.inputSizeBytes;
   snapshot.pipelineSummary = record.pipeline.summary;
+  snapshot.createdAtMs = record.createdAtMs;
+  snapshot.finishedAtMs = record.finishedAtMs;
   return snapshot;
+}
+
+// Every source a request references (Merge carries several).
+std::vector<MediaSource> sourcesOf(const JobRequest &request) {
+  std::vector<MediaSource> sources;
+  std::visit(
+      [&](const auto &payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          sources = payload.sources;
+        } else {
+          sources.push_back(payload.source);
+        }
+      },
+      request.payload);
+  return sources;
+}
+
+// True when the request wants a video lane (video-capable operations with
+// a video-bearing source).
+bool wantsVideoOf(const JobRequest &request, const MediaInfo &info) {
+  switch (request.payload.index()) {
+    case 0: // VideoConvert
+    case 2: // Crop
+    case 3: // Trim
+      return info.hasVideo();
+    default:
+      return false;
+  }
+}
+
+// The compression intent of the payload (nullopt for operations without
+// compression).
+const CompressionIntent *compressionOf(const JobRequest &request) {
+  return std::visit(
+      [](const auto &payload) -> const CompressionIntent * {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::VideoConvert> ||
+                      std::is_same_v<Payload, job::AudioConvert> ||
+                      std::is_same_v<Payload, job::ExtractAudio>) {
+          return &payload.compression;
+        }
+        return nullptr;
+      },
+      request.payload);
 }
 
 // Checkpoint coordinator bridging the backend contract to the durable
@@ -152,36 +216,6 @@ private:
 
 } // namespace
 
-namespace {
-
-// Fit-under-size (spec §17): the computed budget DRIVES encoding. The
-// goal-derived bitrate replaces the default quality mode unless the user
-// set an explicit bitrate (explicit user intent is never overridden).
-// Retry determinism: the budget is a pure function of source + request,
-// so a reloaded job computes the same parameters.
-ConversionRequest applyFitUnderSizeBudget(const MediaInfo &info,
-                                           const ConversionRequest &request) {
-  ConversionRequest effective = request;
-  if (request.goal.kind == GoalKind::FitUnderSize &&
-      request.goal.targetSizeBytes > 0 &&
-      request.video.rateControl != RateControl::Bitrate &&
-      !request.video.bitRate.has_value()) {
-    const BitrateBudget budget = computeBitrateBudget(
-        info, request, request.goal.targetSizeBytes);
-    if (budget.feasible && budget.videoBitrate > 0) {
-      effective.video.rateControl = RateControl::Bitrate;
-      effective.video.bitRate = budget.videoBitrate;
-      if (!budget.audioStreamCopy && budget.audioBitrate > 0 &&
-          !effective.audio.bitRate.has_value()) {
-        effective.audio.bitRate = budget.audioBitrate;
-      }
-    }
-  }
-  return effective;
-}
-
-} // namespace
-
 JobManager::JobManager(EngineConfig config, EventBus &events, JobStore &store,
                        CheckpointStore &checkpoints, Planner &planner,
                        TelemetryStore &telemetry)
@@ -221,27 +255,47 @@ Result<MediaInfo> JobManager::inspect(const MediaSource &source) {
       ErrorCode::InspectionFailed, "no backend could inspect this source"));
 }
 
-Result<PlanResult> JobManager::plan(const MediaSource &source,
-                                    const ConversionRequest &request) {
-  const Result<MediaInfo> inspected = inspect(source);
-  if (!inspected.ok()) {
-    return Result<PlanResult>(inspected.error());
+Result<PlanResult> JobManager::plan(const JobRequest &request) {
+  std::vector<MediaInfo> infos;
+  for (const MediaSource &source : sourcesOf(request)) {
+    const Result<MediaInfo> inspected = inspect(source);
+    if (!inspected.ok()) {
+      return Result<PlanResult>(inspected.error());
+    }
+    infos.push_back(inspected.value());
   }
-  PlanResult result = planner_.plan(inspected.value(), request);
-  (void)telemetry_.recordPlanningLatency(result.planningMs);
-  return Result<PlanResult>(std::move(result));
+  Result<PlanResult> result = planner_.plan(request, infos);
+  if (result.ok()) {
+    (void)telemetry_.recordPlanningLatency(result.value().planningMs);
+  }
+  return result;
 }
 
 Result<SampleResult> JobManager::generateSample(
-    const ConversionRequest &request, std::int32_t sampleSeconds,
+    const JobRequest &request, std::int32_t sampleSeconds,
     const std::string &outputPath) {
   if (sampleSeconds <= 0) {
     return Result<SampleResult>(Error::make(ErrorCode::InvalidArgument,
                                             "sample duration must be positive",
                                             "core"));
   }
+  // Only conversion operations preview meaningfully through a short
+  // window (mandate §22); other operations refuse honestly.
+  const bool conversionShape = request.payload.index() == 0 ||
+                               request.payload.index() == 1;
+  if (!conversionShape) {
+    return Result<SampleResult>(
+        Error::make(ErrorCode::UnsupportedOperation,
+                    "sample generation is only available for conversion "
+                    "operations in this build",
+                    "core"));
+  }
+  // Copy, never reference: sourcesOf returns a temporary vector whose
+  // elements die at the end of the full expression (a reference here
+  // dangled and crashed sample generation).
+  const MediaSource source = sourcesOf(request).front();
   // Duration drives the window; a representative sample needs one.
-  const Result<MediaInfo> inspected = inspect(request.source);
+  const Result<MediaInfo> inspected = inspect(source);
   if (!inspected.ok()) {
     return Result<SampleResult>(inspected.error());
   }
@@ -251,8 +305,7 @@ Result<SampleResult> JobManager::generateSample(
         ErrorCode::InspectionFailed,
         "cannot determine the source duration for sampling", "core"));
   }
-  const std::int64_t durationUs =
-      std::int64_t(info.durationSec * 1000000.0);
+  const std::int64_t durationUs = std::int64_t(info.durationSec * 1000000.0);
   const std::int64_t windowLenUs =
       std::min<std::int64_t>(std::int64_t(sampleSeconds) * 1000000,
                              durationUs);
@@ -260,33 +313,28 @@ Result<SampleResult> JobManager::generateSample(
   // Representative window (spec §20): the densest section per a backend's
   // demux-level scan. Mid-file fallback when no backend can pick (avoids
   // the abrupt intro/outro regions by starting a quarter in).
-  std::int64_t startUs =
-      std::max<std::int64_t>((durationUs - windowLenUs) / 4, 0);
+  std::int64_t startUs = std::max<std::int64_t>((durationUs - windowLenUs) / 4, 0);
   std::int64_t endUs = startUs + windowLenUs;
   const std::int32_t windowSeconds =
       std::max<std::int32_t>(std::int32_t(windowLenUs / 1000000), 1);
   for (backend::IBackend *backend : backends_) {
     if (backend->inspector() != nullptr &&
         backend->inspector()->representativeWindow(
-            request.source, windowSeconds, startUs, endUs)) {
+            source, windowSeconds, startUs, endUs)) {
       break;
     }
   }
 
   // Plan against the FULL source so the sample uses exactly the settings
-  // the real job would (goal-derived quality, budget, codec routing), then
-  // execute only the chosen window through the same dispatch as jobs. The
-  // fit-under-size budget applies here too: samples must preview the exact
-  // parameters a real job would use.
-  const ConversionRequest effectiveSampleRequest =
-      applyFitUnderSizeBudget(info, request);
-  const Result<PlanResult> planned = planner_.plan(info, effectiveSampleRequest);
+  // the real job would (preset-derived quality, budget, codec routing),
+  // then execute only the chosen window through the same dispatch as jobs.
+  const Result<PlanResult> planned = planner_.plan(request, {info});
   if (!planned.ok()) {
     return Result<SampleResult>(planned.error());
   }
   if (!planned.value().feasible || !planned.value().best.has_value()) {
     return Result<SampleResult>(Error::make(
-        ErrorCode::UnsupportedFeature,
+        ErrorCode::UnsupportedOperation,
         planned.value().message.empty()
             ? "no compatible pipeline for the requested settings"
             : planned.value().message,
@@ -295,23 +343,21 @@ Result<SampleResult> JobManager::generateSample(
   const Pipeline pipeline = planned.value().best->pipeline;
 
   backend::IBackend *backend = backendFor(pipeline);
-  const bool hybridPath =
-      backend == nullptr && hybrid_ != nullptr &&
-      hybrid_->canExecute(pipeline, effectiveSampleRequest);
+  const bool hybridPath = backend == nullptr && hybrid_ != nullptr &&
+                          hybrid_->canExecute(pipeline, request);
   if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
     return Result<SampleResult>(
-        Error::make(ErrorCode::UnsupportedFeature,
+        Error::make(ErrorCode::UnsupportedOperation,
                     "no backend could execute the planned pipeline", "core"));
   }
 
-  ConversionRequest sampleRequest = effectiveSampleRequest;
-  sampleRequest.trim.startUs = startUs;
-  sampleRequest.trim.endUs = endUs;
-
   backend::ExecuteParams params;
   params.pipeline = pipeline;
-  params.request = sampleRequest;
+  params.request = request;
   params.outputPath = outputPath;
+  // The sample window replaces the request's timeline selection in the
+  // executor's internal execution view (samples preview a slice).
+  params.sampleWindow = TimeRange{startUs, endUs};
   // No checkpoints for samples: single bounded pass, restartable by
   // regenerating (documented limitation, not silent behavior).
   params.jobId = "";
@@ -327,19 +373,11 @@ Result<SampleResult> JobManager::generateSample(
   // streams, geometry, minimum size. Duration stays unchecked — a trimmed
   // window legitimately differs from the source.
   if (validator_ != nullptr) {
-    ValidationExpectation expect;
-    expect.container = pipeline.container;
-    if (sampleRequest.video.enabled && !info.video.empty()) {
-      expect.videoCodec = pipeline.videoCodec;
-      expect.expectedHeight = sampleRequest.video.resolutionHeight.value_or(
-          info.video.front().height);
-    } else {
+    ValidationExpectation expect = expectationFor(request, info, pipeline);
+    expect.expectedDurationSec = 0.0; // a window, not the whole timeline
+    if (request.payload.index() == 1) {
+      // AudioConvert payload: audio-only sample.
       expect.expectVideo = false;
-    }
-    if (sampleRequest.audio.enabled && !info.audio.empty()) {
-      expect.audioCodec = pipeline.audioCodec;
-    } else if (!sampleRequest.audio.enabled) {
-      expect.expectAudio = false;
     }
     const ValidationReport report = validator_->validate(outputPath, expect);
     if (!report.ok) {
@@ -365,23 +403,42 @@ Result<SampleResult> JobManager::generateSample(
   return Result<SampleResult>(std::move(sample));
 }
 
-Result<std::string> JobManager::submit(const ConversionRequest &request,
-                                       std::int32_t priority) {
-  // Priority is honored by the scheduler when the engine hands the queued
-  // job over; the manager itself is priority-agnostic.
-  (void)priority;
+Result<std::string> JobManager::submit(const JobRequest &request,
+                                       const std::vector<MediaInfo> &sourceInfos,
+                                       const std::string &submissionId) {
+  // Durable idempotency (mandate §14.2): a resubmission with the same
+  // submission id returns the existing job's id without creating a
+  // duplicate.
+  if (!submissionId.empty()) {
+    Error error;
+    if (auto existing = store_.findJobBySubmissionId(submissionId, error)) {
+      return Result<std::string>(existing->id);
+    }
+    if (!error.ok()) {
+      return Result<std::string>(error);
+    }
+  }
+
   // Validate source accessibility first: never enqueue phantom jobs.
-  const Result<MediaInfo> inspected = inspect(request.source);
-  if (!inspected.ok()) {
-    return Result<std::string>(inspected.error());
+  std::vector<MediaInfo> infos = sourceInfos;
+  if (infos.empty()) {
+    for (const MediaSource &source : sourcesOf(request)) {
+      const Result<MediaInfo> inspected = inspect(source);
+      if (!inspected.ok()) {
+        return Result<std::string>(inspected.error());
+      }
+      infos.push_back(inspected.value());
+    }
   }
 
   JobRecord record;
   record.id = generateJobId();
+  record.submissionId = submissionId;
   record.state = JobState::Queued;
   record.request = request;
-  record.sourceInfo = inspected.value();
-  record.inputSizeBytes = inspected.value().sizeBytes;
+  record.sourceInfo = infos;
+  record.inputSizeBytes =
+      infos.empty() ? -1 : std::int64_t(infos.front().sizeBytes);
   record.createdAtMs = nowMs();
   record.updatedAtMs = nowMs();
   record.schemaVersion = JobStore::kSchemaVersion;
@@ -402,6 +459,7 @@ Result<void> JobManager::cancel(const std::string &jobId) {
                                     "unknown job: " + jobId));
   }
   if (record->state == JobState::Completed ||
+      record->state == JobState::TargetNotMet ||
       record->state == JobState::Failed ||
       record->state == JobState::Canceled) {
     return Result<void>(Error::make(ErrorCode::InvalidArgument,
@@ -431,7 +489,7 @@ Result<void> JobManager::pause(const std::string &jobId) {
     return Result<void>(Error::make(ErrorCode::InvalidArgument,
                                     "unknown job: " + jobId));
   }
-  if (record->state != JobState::Running && record->state != JobState::Queued &&
+  if (record->state != JobState::Processing && record->state != JobState::Queued &&
       record->state != JobState::Preparing) {
     return Result<void>(Error::make(ErrorCode::InvalidArgument,
                                     "job is not pausable in state " +
@@ -469,6 +527,7 @@ Result<void> JobManager::resume(const std::string &jobId) {
   }
   record->state = JobState::Queued;
   record->error.clear();
+  record->errorCode.clear();
   persistAndEmit(*record, "resume");
   return Result<void>();
 }
@@ -481,13 +540,15 @@ Result<void> JobManager::retry(const std::string &jobId) {
                                     "unknown job: " + jobId));
   }
   if (record->state != JobState::Failed &&
+      record->state != JobState::TargetNotMet &&
       record->state != JobState::Canceled &&
       record->state != JobState::Interrupted) {
-    return Result<void>(
-        Error::make(ErrorCode::InvalidArgument, "job is not retryable"));
+    return Result<void>(Error::make(ErrorCode::InvalidArgument,
+                                    "job is not retryable"));
   }
   record->state = JobState::Queued;
   record->error.clear();
+  record->errorCode.clear();
   record->progress = -1.0;
   persistAndEmit(*record, "retry");
   return Result<void>();
@@ -502,6 +563,7 @@ Result<void> JobManager::remove(const std::string &jobId) {
                                     "unknown job: " + jobId));
   }
   if (record->state != JobState::Completed &&
+      record->state != JobState::TargetNotMet &&
       record->state != JobState::Failed &&
       record->state != JobState::Canceled) {
     return Result<void>(Error::make(
@@ -561,9 +623,9 @@ bool JobManager::isActive(const std::string &jobId) {
 std::vector<RecoveryDecision> JobManager::recoverInterruptedJobs() {
   Error error;
   std::vector<JobRecord> resumable = store_.loadResumableJobs(error);
-  RecoveryPlanner planner;
+  RecoveryPlanner recoveryPlanner;
   std::vector<RecoveryDecision> decisions =
-      planner.reconcile(resumable, checkpoints_, config_.dataDir);
+      recoveryPlanner.reconcile(resumable, checkpoints_, config_.dataDir);
   for (const RecoveryDecision &decision : decisions) {
     Error loadError;
     auto record = store_.loadJob(decision.jobId, loadError);
@@ -574,11 +636,13 @@ std::vector<RecoveryDecision> JobManager::recoverInterruptedJobs() {
       case RecoveryAction::RestartJob:
       case RecoveryAction::ResumeFromCheckpoint: {
         // The execution path resumes from the safest checkpoint; either way
-        // the job re-enters the queue honestly.
+        // the job re-enters the queue honestly. Submission ids survive the
+        // round-trip: recovery re-submits cannot duplicate.
         record->state = JobState::Recovering;
         persistAndEmit(*record, "recovery");
         record->state = JobState::Queued;
         record->error.clear();
+        record->errorCode.clear();
         persistAndEmit(*record, "recovery-queued");
         break;
       }
@@ -648,6 +712,7 @@ void JobManager::cancelAllRunning(const char *reason) {
           (durable->state == JobState::Canceled ||
            durable->state == JobState::Paused ||
            durable->state == JobState::Completed ||
+           durable->state == JobState::TargetNotMet ||
            durable->state == JobState::Failed ||
            durable->state == JobState::Interrupted);
       if (!userHeld) {
@@ -676,6 +741,7 @@ void JobManager::persistAndEmit(JobRecord &record, const char * /*note*/) {
   event.progress = record.progress;
   event.outputSizeBytes = record.outputSizeBytes;
   event.error = record.error;
+  event.errorCode = record.errorCode;
   events_.emit(event);
 }
 
@@ -700,6 +766,7 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   }
   if (record->state == JobState::Canceled ||
       record->state == JobState::Completed ||
+      record->state == JobState::TargetNotMet ||
       record->state == JobState::Failed ||
       record->state == JobState::Paused ||
       record->state == JobState::Interrupted) {
@@ -725,62 +792,88 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   persistAndEmit(*record, "preparing");
 
   // Inspect (or reuse submitted inspection) then plan.
-  MediaInfo info = record->sourceInfo;
+  MediaInfo info;
+  if (!record->sourceInfo.empty()) {
+    info = record->sourceInfo.front();
+  }
   if (info.durationSec <= 0.0 || (info.hasVideo() && info.video.empty())) {
-    const Result<MediaInfo> inspected = inspect(record->request.source);
-    if (!inspected.ok()) {
+    const std::vector<MediaSource> sources = sourcesOf(record->request);
+    std::vector<MediaInfo> inspected;
+    if (!sources.empty()) {
+      const Result<MediaInfo> result = inspect(sources.front());
+      if (!result.ok()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!runStillCurrent(jobId, generation)) {
+          return ExecuteOutcome::Finished; // superseded by a newer run
+        }
+        auto &running = running_[jobId];
+        running.record.state = JobState::Failed;
+        running.record.errorCode = errorCodeName(result.error().code);
+        running.record.error =
+            "Source became unavailable: " + result.error().message;
+        finishFailure(running.record);
+        return ExecuteOutcome::Finished;
+      }
+      inspected.push_back(result.value());
+    }
+    if (inspected.empty()) {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!runStillCurrent(jobId, generation)) {
-        return ExecuteOutcome::Finished; // superseded by a newer run
+        return ExecuteOutcome::Finished;
       }
       auto &running = running_[jobId];
       running.record.state = JobState::Failed;
-      running.record.error =
-          "Source became unavailable: " + inspected.error().message;
+      running.record.errorCode = errorCodeName(ErrorCode::InvalidArgument);
+      running.record.error = "the request carries no source";
       finishFailure(running.record);
       return ExecuteOutcome::Finished;
     }
-    info = inspected.value();
     // Validation compares the output against the inspection the planner
     // used; keep the record consistent so the duration/geometry checks
-    // are live after the store round-trip (they were silently dead when
-    // the reloaded sourceInfo stayed empty).
-    record->sourceInfo = info;
+    // are live after the store round-trip.
+    record->sourceInfo = inspected;
+    info = inspected.front();
   }
 
-  // Fit-under-size: apply the budget before planning so the plan's size
-  // estimate and feasibility message describe what will actually execute.
-  const ConversionRequest effectiveRequest =
-      applyFitUnderSizeBudget(info, record->request);
-
-  PlanResult plan = planner_.plan(info, effectiveRequest);
-  if (!plan.feasible || !plan.best.has_value()) {
+  Result<PlanResult> planned = planner_.plan(record->request, record->sourceInfo);
+  if (!planned.ok() || !planned.value().feasible ||
+      !planned.value().best.has_value()) {
+    std::string message = !planned.ok()
+                              ? planned.error().message
+                              : planned.value().message;
+    const ErrorCode code = !planned.ok()
+                               ? planned.error().code
+                               : planned.value().errorCode;
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
+    running.record.errorCode = errorCodeName(code);
     running.record.error =
-        plan.message.empty() ? "no compatible pipeline" : plan.message;
+        message.empty() ? "no compatible pipeline" : message;
     finishFailure(running.record);
     return ExecuteOutcome::Finished;
   }
+  record->pipeline.planned = true;
 
-  const Pipeline pipeline = plan.best->pipeline;
-  record->pipeline = pipeline;
+  const Pipeline pipeline = planned.value().best->pipeline;
+  record->pipeline.summary = pipeline.summary;
+  record->pipeline.usesHardware = pipeline.usesHardware;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
-    running_[jobId].record.pipeline = pipeline;
+    running_[jobId].record.pipeline.summary = pipeline.summary;
+    running_[jobId].record.pipeline.usesHardware = pipeline.usesHardware;
+    running_[jobId].pipeline = pipeline;
   }
 
   backend::IBackend *backend = backendFor(pipeline);
-  const bool hybridPath =
-      backend == nullptr && hybrid_ != nullptr &&
-      hybrid_->canExecute(pipeline, record->request);
+  const bool hybridPath = backend == nullptr && hybrid_ != nullptr &&
+                          hybrid_->canExecute(pipeline, record->request);
   if ((backend == nullptr || backend->executor() == nullptr) && !hybridPath) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
@@ -788,6 +881,7 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     }
     auto &running = running_[jobId];
     running.record.state = JobState::Failed;
+    running.record.errorCode = errorCodeName(ErrorCode::NoCompatiblePipeline);
     running.record.error = "no backend could execute the planned pipeline";
     finishFailure(running.record);
     return ExecuteOutcome::Finished;
@@ -816,16 +910,16 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
   }
 
   // Output path: sanitized, never overwrites the original.
-  record->outputPath = outputNameFor(*record);
+  record->outputPath = outputNameFor(*record, pipeline);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!runStillCurrent(jobId, generation)) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
     running_[jobId].record.outputPath = record->outputPath;
-    running_[jobId].record.state = JobState::Running;
+    running_[jobId].record.state = JobState::Processing;
   }
-  persistAndEmit(*record, "running");
+  persistAndEmit(*record, "processing");
 
   // The run's cancel token: shared with the control path; the executor
   // observes cooperative cancellation through it.
@@ -840,76 +934,93 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
 
   // Dispatch closure: one executor run (whole-pipeline or hybrid) with
   // checkpoints wired. Used by the first attempt and, when justified, the
-  // fit-under-size corrective retry.
+  // target-size corrective retry.
   const auto dispatchExecution =
-      [&](const ConversionRequest &req) -> backend::ExecuteResult {
-        backend::ExecuteParams params;
-        params.pipeline = pipeline;
-        params.request = req;
-        params.outputPath = record->outputPath;
-        params.jobId = jobId;
-        params.cancel = cancel;
-        params.onProgress =
-            [this, jobId, generation](const backend::ProgressReport &report) {
-              reportProgress(jobId, report.fraction, -1, generation);
-            };
-        CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
-        params.checkpoints = &coordinator;
-        // Recovery input: checkpoints committed by earlier runs of this
-        // job. Fresh jobs have none; paused/resumed/recovered jobs get the
-        // durable set and the executor skips work covered by valid
-        // artifacts.
-        {
-          Error checkpointError;
-          for (const CheckpointRecord &cp :
-               checkpoints_.loadCheckpoints(jobId, checkpointError)) {
-            if (cp.artifactPath.empty()) {
-              continue; // position-only marks carry nothing resumable
-            }
-            backend::CheckpointInfo info2;
-            info2.stage = cp.stage;
-            info2.position = cp.position;
-            info2.artifactPath = cp.artifactPath;
-            params.resumeFrom.push_back(std::move(info2));
-          }
+      [&](const JobRequest &req) -> backend::ExecuteResult {
+    backend::ExecuteParams params;
+    params.pipeline = pipeline;
+    params.request = req;
+    params.outputPath = record->outputPath;
+    params.jobId = jobId;
+    params.cancel = cancel;
+    params.onProgress =
+        [this, jobId, generation](const backend::ProgressReport &report) {
+          reportProgress(jobId, report.fraction, -1, generation);
+        };
+    CheckpointCoordinator coordinator(checkpoints_, jobId, cancel);
+    params.checkpoints = &coordinator;
+    // Recovery input: checkpoints committed by earlier runs of this
+    // job. Fresh jobs have none; paused/resumed/recovered jobs get the
+    // durable set and the executor skips work covered by valid
+    // artifacts.
+    {
+      Error checkpointError;
+      for (const CheckpointRecord &cp :
+           checkpoints_.loadCheckpoints(jobId, checkpointError)) {
+        if (cp.artifactPath.empty()) {
+          continue; // position-only marks carry nothing resumable
         }
-        return hybridPath ? hybrid_->execute(params)
-                          : backend->executor()->execute(params);
-      };
+        backend::CheckpointInfo info2;
+        info2.stage = cp.stage;
+        info2.position = cp.position;
+        info2.artifactPath = cp.artifactPath;
+        params.resumeFrom.push_back(std::move(info2));
+      }
+    }
+    return hybridPath ? hybrid_->execute(params)
+                      : backend->executor()->execute(params);
+  };
 
-  backend::ExecuteResult execResult = dispatchExecution(effectiveRequest);
+  backend::ExecuteResult execResult = dispatchExecution(record->request);
 
-  // Fit-under-size corrective retry (spec §17): encoders cannot guarantee
+  // Target-size corrective retry (mandate §21): encoders cannot guarantee
   // exact output sizes; when the first attempt lands over the target, ONE
-  // re-encode at a proportionally reduced bitrate runs in-place. Bounded to
-  // a single retry; a still-missed target completes honestly with a note —
-  // never a fake guarantee. The retry re-encodes the whole file: the first
-  // attempt's checkpoints describe different encoding decisions.
+  // re-encode at a proportionally reduced bitrate runs in-place. Bounded
+  // to a single retry; a still-missed target completes honestly with
+  // TargetNotMet (valid output, honest state) — never a fake guarantee.
+  // The retry re-encodes the whole file: the first attempt's checkpoints
+  // describe different encoding decisions.
   bool fitRetryRan = false;
   bool fitTargetMissed = false;
-  if (execResult.success &&
-      record->request.goal.kind == GoalKind::FitUnderSize &&
-      record->request.goal.targetSizeBytes > 0 && !cancel->isCancelled()) {
-    const std::int64_t target = record->request.goal.targetSizeBytes;
+  const CompressionIntent *compression = compressionOf(record->request);
+  if (execResult.success && compression != nullptr &&
+      compression->enabled &&
+      compression->preset == CompressionPreset::TargetSize &&
+      compression->targetSizeBytes > 0 && !cancel->isCancelled()) {
+    const std::int64_t target = compression->targetSizeBytes;
     std::int64_t actual = 0;
     if (fileExistsWithSize(record->outputPath, actual) && actual > target) {
-      std::int64_t baseBitrate = effectiveRequest.video.bitRate.value_or(0);
+      // Base bitrate: what the first attempt actually used (the resolved
+      // policy from the same compression intent the executor applies).
+      BudgetInputs budget;
+      budget.outputContainer = pipeline.container;
+      budget.audioEnabled = !pipeline.audioStreamCopy;
+      budget.videoEnabled = wantsVideoOf(record->request, info);
+      const ResolvedRatePolicy base =
+          resolveRatePolicy(info, *compression, budget);
+      std::int64_t baseBitrate = base.mode == ResolvedRatePolicy::Mode::Bitrate
+                                     ? base.bitRate
+                                     : 0;
       if (baseBitrate <= 0) {
-        const BitrateBudget budget = computeBitrateBudget(
-            info, record->request, target);
-        baseBitrate = budget.videoBitrate;
+        const BitrateBudget budgetPlan =
+            computeBitrateBudget(info, budget, target);
+        baseBitrate = budgetPlan.videoBitrate;
       }
       if (baseBitrate > 0) {
         // 10% safety margin under the proportional scale.
-        const double scale =
-            (double(target) / double(actual)) * 0.90;
+        const double scale = (double(target) / double(actual)) * 0.90;
         const std::int64_t newBitrate =
-            std::max<std::int64_t>(
-                std::int64_t(double(baseBitrate) * scale), 10000);
+            std::max<std::int64_t>(std::int64_t(double(baseBitrate) * scale),
+                                   10000);
         if (newBitrate < baseBitrate) {
-          ConversionRequest retryRequest = effectiveRequest;
-          retryRequest.video.rateControl = RateControl::Bitrate;
-          retryRequest.video.bitRate = newBitrate;
+          // The retry request: the accepted payload with an explicit
+          // Custom bitrate (the only path the executor honors verbatim).
+          JobRequest retryRequest = record->request;
+          CompressionIntent *retryCompression =
+              const_cast<CompressionIntent *>(compressionOf(retryRequest));
+          retryCompression->preset = CompressionPreset::Custom;
+          retryCompression->videoBitrate = newBitrate;
+          retryCompression->quality.reset();
           (void)checkpoints_.deleteCheckpoints(jobId);
           fitRetryRan = true;
           execResult = dispatchExecution(retryRequest);
@@ -937,7 +1048,7 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
         execResult.framesProcessed > 0
             ? double(execResult.framesProcessed) / execResult.wallClockSec
             : 0.0;
-    perf.setupMs = plan.best->setupLatencyMs;
+    perf.setupMs = planned.value().best->setupLatencyMs;
     perf.success = execResult.success;
     perf.note = pipeline.summary;
     (void)telemetry_.record(perf);
@@ -955,11 +1066,12 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     // the intended durable state on the running record; finalize exactly
     // that. An active state here means the token fired without a recorded
     // decision — the honest fallback is a terminal cancel.
-    if (running.record.state == JobState::Running ||
+    if (running.record.state == JobState::Processing ||
         running.record.state == JobState::Preparing ||
         running.record.state == JobState::Validating ||
-        running.record.state == JobState::Checkpointing) {
+        running.record.state == JobState::Finalizing) {
       running.record.state = JobState::Canceled;
+      running.record.errorCode = errorCodeName(ErrorCode::Cancelled);
     }
     if (running.record.state == JobState::Canceled) {
       running.record.finishedAtMs = nowMs();
@@ -974,13 +1086,13 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     // Runtime failure feedback (spec §15): an execution-attributable
     // backend error marks the exact failed configuration so the next plan
     // avoids that route. Computed from the same request the plan used
-    // (the fit-under-size budget changes bitrates only, which are not part
+    // (the corrective retry changes bitrates only, which are not part
     // of the narrow key).
     std::optional<FailedConfigKey> failedKey;
     if (isExecutionFailure(execResult.error.code)) {
       failedKey = failedConfigKeyFor(
           attributedBackendFor(pipeline, backend, hybridPath), info,
-          effectiveRequest, pipeline.videoCodec);
+          record->request, pipeline.videoCodec);
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -989,6 +1101,7 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
       }
       auto &running = running_[jobId];
       running.record.state = JobState::Failed;
+      running.record.errorCode = errorCodeName(execResult.error.code);
       running.record.error = execResult.error.message.empty()
                                  ? "execution failed"
                                  : execResult.error.message;
@@ -1002,6 +1115,17 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     return ExecuteOutcome::Finished;
   }
 
+  // Execution finished: the artifacts are finalized (segment scratch
+  // removed by the executor) before output validation reads them.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!runStillCurrent(jobId, generation)) {
+      return ExecuteOutcome::Finished; // superseded by a newer run
+    }
+    running_[jobId].record.state = JobState::Finalizing;
+  }
+  persistAndEmit(*record, "finalizing");
+
   // Validation before completion (never trust pipeline success alone).
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1011,11 +1135,15 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
     running_[jobId].record.state = JobState::Validating;
   }
   persistAndEmit(*record, "validating");
-  if (!validateOutput(*record, generation)) {
+  if (!validateOutput(*record, pipeline, generation)) {
     return ExecuteOutcome::Finished; // finishFailure already ran (or the run
                                      // was superseded)
   }
 
+  // Outputs manifest: the executor's multi-output manifest when filled
+  // (Split / ExtractFrames / batch extraction, later phases); conversion
+  // executors leave it empty and the primary output entry comes from the
+  // output path.
   std::int64_t outputBytes = -1;
   fileExistsWithSize(record->outputPath, outputBytes);
   {
@@ -1024,18 +1152,49 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
       return ExecuteOutcome::Finished; // superseded by a newer run
     }
     auto &running = running_[jobId];
+    if (execResult.outputs.empty()) {
+      if (!record->outputPath.empty()) {
+        JobOutput primary;
+        primary.path = record->outputPath;
+        primary.sizeBytes = outputBytes;
+        primary.kind = pipeline.sidecarExtension.empty() ? "media" : "subtitle";
+        running.record.outputs = {std::move(primary)};
+      }
+    } else {
+      running.record.outputs = execResult.outputs;
+    }
     if (fitRetryRan) {
-      // Honest fit-under-size outcome in the pipeline summary (shown in
+      // Honest target-size outcome in the pipeline summary (shown in
       // history and job details): a retry happened, and whether it landed
       // under the target. Never a fake guarantee.
       running.record.pipeline.summary +=
           fitTargetMissed
-              ? " [fit-under-size: target not reached after retry]"
-              : " [fit-under-size: retried at a lower bitrate]";
+              ? " [target-size: target not reached after retry]"
+              : " [target-size: retried at a lower bitrate]";
     }
-    running.record.state = JobState::Completed;
+    // TargetNotMet (mandate §21/§37): validation succeeded and the output
+    // is GOOD, but an accepted target-size objective was still exceeded
+    // after the corrective retry. Honest completion, never fake success.
+    const bool targetMissed =
+        compression != nullptr && compression->enabled &&
+        compression->preset == CompressionPreset::TargetSize &&
+        compression->targetSizeBytes > 0 && outputBytes > 0 &&
+        outputBytes > compression->targetSizeBytes;
+    running.record.state =
+        targetMissed ? JobState::TargetNotMet : JobState::Completed;
+    if (targetMissed) {
+      running.record.errorCode = errorCodeName(ErrorCode::TargetNotMet);
+      running.record.error =
+          "valid output, but the target size was not reached: " +
+          std::to_string(outputBytes) + " bytes > " +
+          std::to_string(compression->targetSizeBytes) + " bytes";
+    }
     running.record.progress = 1.0;
     running.record.outputSizeBytes = outputBytes;
+    if (!running.record.outputs.empty() &&
+        running.record.outputs.front().path == record->outputPath) {
+      running.record.outputs.front().sizeBytes = outputBytes;
+    }
     running.record.finishedAtMs = nowMs();
     JobRecord final = running.record;
     running_.erase(jobId);
@@ -1050,13 +1209,17 @@ JobManager::ExecuteOutcome JobManager::executeJob(const std::string &jobId) {
 
 void JobManager::finishFailure(JobRecord &record) {
   record.finishedAtMs = nowMs();
+  if (record.errorCode.empty()) {
+    record.errorCode = errorCodeName(ErrorCode::ExecutionFailed);
+  }
   JobRecord final = record;
   const std::string jobId = record.id;
   running_.erase(jobId);
   persistAndEmit(final, "failed");
 }
 
-bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
+bool JobManager::validateOutput(JobRecord &record, const Pipeline &pipeline,
+                                std::uint64_t generation) {
   if (validator_ == nullptr) {
     // No validator wired: honest failure rather than fake success.
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1065,99 +1228,15 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
     }
     auto &running = running_[record.id];
     running.record.state = JobState::Failed;
+    running.record.errorCode = errorCodeName(ErrorCode::InternalError);
     running.record.error = "output validator unavailable";
     finishFailure(running.record);
     return false;
   }
-  ValidationExpectation expect;
-  expect.container = record.pipeline.container;
-  if (!record.pipeline.sidecarExtension.empty()) {
-    // Extraction job: the artifact is a text sidecar; validate cues.
-    // The container-oriented 1 KiB floor would reject valid short
-    // sidecars (a two-cue SRT is ~100 bytes); one cue line is the floor.
-    expect.subtitleSidecar = true;
-    expect.expectVideo = false;
-    expect.expectAudio = false;
-    expect.expectedDurationSec = 0.0;
-    expect.minimumBytes = 32;
-  } else if (record.request.video.enabled) {
-    expect.videoCodec = record.pipeline.videoCodec;
-    if (!record.sourceInfo.video.empty()) {
-      // Transform-aware expected geometry (the executor applies
-      // crop -> rotation -> scale): a correct 90-degree rotation of a
-      // 1920x1080 source is 1080 high, and a cropped output is the crop
-      // height — comparing against the raw source height would fail every
-      // correct transformed output.
-      std::int32_t baseH = record.sourceInfo.video.front().height;
-      std::int32_t baseW = record.sourceInfo.video.front().width;
-      if (record.request.video.crop.has_value() &&
-          record.request.video.crop->active()) {
-        const std::int32_t availW =
-            std::max(0, baseW - record.request.video.crop->x);
-        const std::int32_t availH =
-            std::max(0, baseH - record.request.video.crop->y);
-        baseW = std::clamp(record.request.video.crop->width, 2, availW);
-        baseH = std::clamp(record.request.video.crop->height, 2, availH);
-      }
-      if (record.request.video.rotationDegrees == 90 ||
-          record.request.video.rotationDegrees == 270) {
-        std::swap(baseW, baseH);
-      }
-      expect.expectedHeight =
-          record.request.video.resolutionHeight.value_or(baseH);
-    }
-  } else {
-    expect.expectVideo = false;
-  }
-  if (record.request.audio.enabled) {
-    expect.audioCodec = record.pipeline.audioCodec;
-    if (record.request.audio.sampleRate.has_value()) {
-      expect.expectedSampleRate = *record.request.audio.sampleRate;
-    }
-  } else {
-    expect.expectAudio = false;
-  }
-  // Duration expectation: the source duration minus an active trim window
-  // (a trimmed output is SHORTER by design; the validator used to compare
-  // against the full source and only got away with it while the persisted
-  // sourceInfo was empty and silently disabled this check).
-  expect.expectedDurationSec = record.sourceInfo.durationSec;
-  if (record.request.trim.startUs > 0 ||
-      record.request.trim.endUs >= 0) {
-    const std::int64_t trimStartUs = record.request.trim.startUs;
-    const std::int64_t trimEndUs =
-        record.request.trim.endUs >= 0
-            ? record.request.trim.endUs
-            : std::int64_t(record.sourceInfo.durationSec * 1'000'000.0);
-    if (trimEndUs > trimStartUs) {
-      const double trimmedSec =
-          double(trimEndUs - trimStartUs) / 1'000'000.0;
-      expect.expectedDurationSec = trimmedSec;
-      // Stream-copy trims snap their start to the preceding keyframe;
-      // transcode trims are frame-exact. A generous extra second absorbs
-      // the keyframe snap without opening a fake-success window.
-      expect.durationToleranceSec += 1.0;
-    }
-  }
-  // Audio DSP timeline effects (spec §10): pitch-preserving speed stretches
-  // the duration by exactly 1/speed; silence removal can only shorten.
-  if (record.request.audio.playbackSpeed.has_value() &&
-      *record.request.audio.playbackSpeed > 0.0) {
-    expect.expectedDurationSec /= *record.request.audio.playbackSpeed;
-  }
-  if (record.request.audio.removeSilence) {
-    // Removed silence is content-dependent: no exact expectation is
-    // honest. Upper bound = unstretched duration (+tolerance); a floor of
-    // 10% catches truncated output without demanding exact silence
-    // detection. Encoded via the same expectedDuration path with a wide
-    // tolerance: the validator's check is |actual - expected| <= tol,
-    // so set expected to the midpoint of [0.1, 1.0] x duration and a
-    // tolerance covering the whole band.
-    const double span = expect.expectedDurationSec;
-    expect.expectedDurationSec = span * 0.55;
-    expect.durationToleranceSec += span * 0.45;
-  }
-
+  const MediaInfo &source =
+      record.sourceInfo.empty() ? MediaInfo{} : record.sourceInfo.front();
+  const ValidationExpectation expect =
+      expectationFor(record.request, source, pipeline);
   const ValidationReport report =
       validator_->validate(record.outputPath, expect);
   if (report.ok) {
@@ -1173,6 +1252,7 @@ bool JobManager::validateOutput(JobRecord &record, std::uint64_t generation) {
   }
   auto &running = running_[record.id];
   running.record.state = JobState::Failed;
+  running.record.errorCode = errorCodeName(ErrorCode::OutputValidationFailed);
   running.record.error = "output validation failed: " + problems;
   finishFailure(running.record);
   return false;
@@ -1196,20 +1276,29 @@ backend::IBackend *JobManager::backendFor(const Pipeline &pipeline) {
   return nullptr;
 }
 
-std::string JobManager::outputNameFor(const JobRecord &record) const {
-  const std::string sourceName =
-      sanitizeFileName(record.request.source.displayName);
-  std::string stem = sourceName;
+std::string JobManager::outputNameFor(const JobRecord &record,
+                                      const Pipeline &pipeline) const {
+  const std::string sourceName = std::visit(
+      [](const auto &payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          return payload.sources.empty() ? std::string()
+                                         : payload.sources.front().displayName;
+        } else {
+          return payload.source.displayName;
+        }
+      },
+      record.request.payload);
+  std::string stem = sanitizeFileName(sourceName);
   const std::size_t dot = stem.rfind('.');
   if (dot != std::string::npos && dot > 0) {
     stem = stem.substr(0, dot);
   }
   // Extraction jobs produce a text sidecar whose extension comes from
   // the track's format (planner-decided), not a media container.
-  const std::string ext =
-      !record.pipeline.sidecarExtension.empty()
-          ? record.pipeline.sidecarExtension
-          : containerName(record.pipeline.container);
+  const std::string ext = !pipeline.sidecarExtension.empty()
+                              ? pipeline.sidecarExtension
+                              : containerName(pipeline.container);
   std::string name = stem.empty() ? "velmux-output" : stem;
   name += "-velmux." + ext;
   std::string path = config_.dataDir + "/outputs/" + name;

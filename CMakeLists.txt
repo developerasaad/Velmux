@@ -43,6 +43,8 @@ add_library(velmux_core
   core/src/recovery/recovery.cpp
   core/src/validation/validation.cpp
   core/src/processing/hybrid_executor.cpp
+  core/src/configuration/sessions.cpp
+  core/src/api/serialization.cpp
   core/src/api/engine.cpp
 )
 add_library(velmux::core ALIAS velmux_core)
@@ -142,6 +144,7 @@ if(VELMUX_FFMPEG_FOUND)
   else()
     add_library(velmux_ffmpeg
       core/src/processing/ffmpeg/codec_mapping.cpp
+      core/src/processing/ffmpeg/execution_intent.cpp
       core/src/processing/ffmpeg/ffmpeg_backend.cpp
       core/src/processing/ffmpeg/ffmpeg_stages.cpp
       core/src/processing/ffmpeg/subtitle_tools.cpp

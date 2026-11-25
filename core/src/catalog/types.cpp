@@ -1,4 +1,6 @@
 #include <velmux/types.h>
+#include <velmux/configuration.h>
+#include <velmux/jobs.h>
 
 #include <array>
 #include <cstring>
@@ -189,32 +191,38 @@ std::optional<SubtitleFormat> subtitleFormatFromName(const std::string &name) {
 
 const char *errorCodeName(ErrorCode code) {
   switch (code) {
-    case ErrorCode::None:
-      return "none";
-    case ErrorCode::InvalidArgument:
-      return "invalid-argument";
-    case ErrorCode::SourceUnavailable:
-      return "source-unavailable";
-    case ErrorCode::UnsupportedFeature:
-      return "unsupported-feature";
-    case ErrorCode::NoCompatiblePipeline:
-      return "no-compatible-pipeline";
-    case ErrorCode::InspectionFailed:
-      return "inspection-failed";
-    case ErrorCode::ExecutionFailed:
-      return "execution-failed";
-    case ErrorCode::BackendFailure:
-      return "backend-failure";
-    case ErrorCode::OutputValidationFailed:
-      return "output-validation-failed";
-    case ErrorCode::StorageFull:
-      return "storage-full";
-    case ErrorCode::Cancelled:
-      return "cancelled";
-    case ErrorCode::Interrupted:
-      return "interrupted";
-    case ErrorCode::InternalError:
-      return "internal-error";
+    case ErrorCode::None: return "none";
+    case ErrorCode::InvalidArgument: return "invalid-argument";
+    case ErrorCode::UnknownFormat: return "unknown-format";
+    case ErrorCode::UnsupportedOperation: return "unsupported-operation";
+    case ErrorCode::IncompatibleFormat: return "incompatible-format";
+    case ErrorCode::IncompatibleCodec: return "incompatible-codec";
+    case ErrorCode::EncoderUnavailable: return "encoder-unavailable";
+    case ErrorCode::DecoderUnavailable: return "decoder-unavailable";
+    case ErrorCode::InvalidResolution: return "invalid-resolution";
+    case ErrorCode::InvalidFrameRate: return "invalid-frame-rate";
+    case ErrorCode::InvalidSampleRate: return "invalid-sample-rate";
+    case ErrorCode::InvalidChannelLayout: return "invalid-channel-layout";
+    case ErrorCode::InvalidTrackIdentity: return "invalid-track-identity";
+    case ErrorCode::InvalidTimeRange: return "invalid-time-range";
+    case ErrorCode::InvalidCrop: return "invalid-crop";
+    case ErrorCode::InfeasibleTargetSize: return "infeasible-target-size";
+    case ErrorCode::StaleRevision: return "stale-revision";
+    case ErrorCode::RelatedChangeRequired: return "related-change-required";
+    case ErrorCode::DuplicateSubmission: return "duplicate-submission";
+    case ErrorCode::SourceUnavailable: return "source-unavailable";
+    case ErrorCode::SourceChanged: return "source-changed";
+    case ErrorCode::InspectionFailed: return "inspection-failed";
+    case ErrorCode::NoCompatiblePipeline: return "no-compatible-pipeline";
+    case ErrorCode::ExecutionFailed: return "execution-failed";
+    case ErrorCode::BackendFailure: return "backend-failure";
+    case ErrorCode::OutputValidationFailed: return "output-validation-failed";
+    case ErrorCode::TargetNotMet: return "target-not-met";
+    case ErrorCode::StorageFull: return "storage-full";
+    case ErrorCode::InvalidOutputDestination: return "invalid-output-destination";
+    case ErrorCode::Cancelled: return "cancelled";
+    case ErrorCode::Interrupted: return "interrupted";
+    case ErrorCode::InternalError: return "internal-error";
   }
   return "unknown-error";
 }
@@ -251,6 +259,223 @@ std::optional<PixelFormat> pixelFormatFromName(const std::string &name) {
   for (const auto &entry : kPixelFormatNames) {
     if (name == entry.name) {
       return entry.format;
+    }
+  }
+  return std::nullopt;
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Operation / configuration vocabulary (configuration.h)
+// ---------------------------------------------------------------------------
+
+static constexpr std::array<std::pair<Operation, const char *>, 8>
+    kOperationNames = {{
+        {Operation::VideoConvert, "video-convert"},
+        {Operation::VideoCrop, "video-crop"},
+        {Operation::VideoCutMerge, "video-cutmerge"},
+        {Operation::ExtractAudio, "extract-audio"},
+        {Operation::ExtractFrames, "extract-frames"},
+        {Operation::ExtractSubtitles, "extract-subtitles"},
+        {Operation::AudioConvert, "audio-convert"},
+        {Operation::AudioCutMerge, "audio-cutmerge"},
+}};
+
+const char *operationName(Operation op) {
+  for (const auto &entry : kOperationNames) {
+    if (entry.first == op) {
+      return entry.second;
+    }
+  }
+  return "unknown-operation";
+}
+
+std::optional<Operation> operationFromName(const std::string &name) {
+  for (const auto &entry : kOperationNames) {
+    if (name == entry.second) {
+      return entry.first;
+    }
+  }
+  return std::nullopt;
+}
+
+static constexpr std::array<std::pair<TimelineMode, const char *>, 4>
+    kTimelineModeNames = {{
+        {TimelineMode::Trim, "trim"},
+        {TimelineMode::Cut, "cut"},
+        {TimelineMode::Split, "split"},
+        {TimelineMode::Merge, "merge"},
+}};
+
+const char *timelineModeName(TimelineMode mode) {
+  for (const auto &entry : kTimelineModeNames) {
+    if (entry.first == mode) {
+      return entry.second;
+    }
+  }
+  return "unknown-timeline-mode";
+}
+
+std::optional<TimelineMode> timelineModeFromName(const std::string &name) {
+  for (const auto &entry : kTimelineModeNames) {
+    if (name == entry.second) {
+      return entry.first;
+    }
+  }
+  return std::nullopt;
+}
+
+static constexpr std::array<std::pair<CompressionPreset, const char *>, 5>
+    kCompressionPresetNames = {{
+        {CompressionPreset::HighQuality, "high-quality"},
+        {CompressionPreset::Balanced, "balanced"},
+        {CompressionPreset::SmallerFile, "smaller-file"},
+        {CompressionPreset::TargetSize, "target-size"},
+        {CompressionPreset::Custom, "custom"},
+}};
+
+const char *compressionPresetName(CompressionPreset preset) {
+  for (const auto &entry : kCompressionPresetNames) {
+    if (entry.first == preset) {
+      return entry.second;
+    }
+  }
+  return "unknown-preset";
+}
+
+std::optional<CompressionPreset> compressionPresetFromName(
+    const std::string &name) {
+  for (const auto &entry : kCompressionPresetNames) {
+    if (name == entry.second) {
+      return entry.first;
+    }
+  }
+  return std::nullopt;
+}
+
+static constexpr std::array<std::pair<FieldId, const char *>, 33>
+    kFieldIdNames = {{
+        {FieldId::Format, "format"},
+        {FieldId::Codec, "codec"},
+        {FieldId::Resolution, "resolution"},
+        {FieldId::FrameRate, "frame-rate"},
+        {FieldId::CompressionEnabled, "compression.enabled"},
+        {FieldId::CompressionPreset, "compression.preset"},
+        {FieldId::CompressionQuality, "compression.quality"},
+        {FieldId::CompressionVideoBitrate, "compression.video-bitrate"},
+        {FieldId::CompressionAudioBitrate, "compression.audio-bitrate"},
+        {FieldId::CompressionTargetSize, "compression.target-size"},
+        {FieldId::AudioCodec, "audio.codec"},
+        {FieldId::AudioBitrate, "audio.bitrate"},
+        {FieldId::AudioSampleRate, "audio.sample-rate"},
+        {FieldId::AudioChannels, "audio.channels"},
+        {FieldId::AudioTracks, "audio.tracks"},
+        {FieldId::Subtitles, "subtitles"},
+        {FieldId::Adjustments, "adjustments"},
+        {FieldId::Metadata, "metadata"},
+        {FieldId::OutputName, "output.name"},
+        {FieldId::CropRect, "crop.rect"},
+        {FieldId::TimelineMode, "timeline.mode"},
+        {FieldId::TimelineRanges, "timeline.ranges"},
+        {FieldId::SplitRules, "split.rules"},
+        {FieldId::MergeLayout, "merge.layout"},
+        {FieldId::MergeAudio, "merge.audio"},
+        {FieldId::FrameSelection, "frames.selection"},
+        {FieldId::ImageFormat, "image.format"},
+        {FieldId::ImageQuality, "image.quality"},
+        {FieldId::ImageDimensions, "image.dimensions"},
+        {FieldId::SubtitleTracks, "subtitle.tracks"},
+        {FieldId::SubtitleTarget, "subtitle.target"},
+        {FieldId::ExtractAudioTracks, "extract-audio.tracks"},
+        {FieldId::ExtractAudioRange, "extract-audio.range"},
+}};
+
+const char *fieldIdName(FieldId field) {
+  for (const auto &entry : kFieldIdNames) {
+    if (entry.first == field) {
+      return entry.second;
+    }
+  }
+  return "unknown-field";
+}
+
+std::optional<FieldId> fieldIdFromName(const std::string &name) {
+  for (const auto &entry : kFieldIdNames) {
+    if (name == entry.second) {
+      return entry.first;
+    }
+  }
+  return std::nullopt;
+}
+
+static constexpr std::array<std::pair<ValueOrigin, const char *>, 4>
+    kValueOriginNames = {{
+        {ValueOrigin::Automatic, "automatic"},
+        {ValueOrigin::Default, "default"},
+        {ValueOrigin::Preset, "preset"},
+        {ValueOrigin::User, "user"},
+}};
+
+const char *valueOriginName(ValueOrigin origin) {
+  for (const auto &entry : kValueOriginNames) {
+    if (entry.first == origin) {
+      return entry.second;
+    }
+  }
+  return "unknown-origin";
+}
+
+static constexpr std::array<std::pair<SessionState, const char *>, 5>
+    kSessionStateNames = {{
+        {SessionState::Created, "created"},
+        {SessionState::Preparing, "preparing"},
+        {SessionState::Ready, "ready"},
+        {SessionState::Failed, "failed"},
+        {SessionState::Closed, "closed"},
+}};
+
+const char *sessionStateName(SessionState state) {
+  for (const auto &entry : kSessionStateNames) {
+    if (entry.first == state) {
+      return entry.second;
+    }
+  }
+  return "unknown-session-state";
+}
+
+// Job states (jobs.h) — the old state names stay stable for persistence.
+static constexpr std::array<std::pair<JobState, const char *>, 14>
+    kJobStateNames = {{
+        {JobState::Queued, "queued"},
+        {JobState::Preparing, "preparing"},
+        {JobState::Processing, "running"},
+        {JobState::Pausing, "pausing"},
+        {JobState::Paused, "paused"},
+        {JobState::Canceling, "canceling"},
+        {JobState::Interrupted, "interrupted"},
+        {JobState::Recovering, "recovering"},
+        {JobState::Finalizing, "finalizing"},
+        {JobState::Validating, "validating"},
+        {JobState::Completed, "completed"},
+        {JobState::TargetNotMet, "target-not-met"},
+        {JobState::Failed, "failed"},
+        {JobState::Canceled, "canceled"},
+}};
+
+const char *jobStateName(JobState state) {
+  for (const auto &entry : kJobStateNames) {
+    if (entry.first == state) {
+      return entry.second;
+    }
+  }
+  return "unknown";
+}
+
+std::optional<JobState> jobStateFromName(const std::string &name) {
+  for (const auto &entry : kJobStateNames) {
+    if (name == entry.second) {
+      return entry.first;
     }
   }
   return std::nullopt;

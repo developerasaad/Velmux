@@ -2,8 +2,14 @@
 // React Native TurboModule host would (JSON in, JSON out), against the REAL
 // engine + FFmpeg backend. Output validity is cross-checked with ffprobe,
 // never only with the code that produced the output.
-#define VELMUX_BRIDGE_CXX_HELPERS 1
+//
+// ABI v2: requests travel as the typed JobRequest JSON envelope
+// ({"operation":"video-convert","video-convert":{...}}), submitted through
+// velmux_submit_job; the request codec under test is the core's strict
+// requestFromJson (serialization.cpp) — the same validation path the
+// facade and the durable job store use.
 #include <velmux/abi.h>
+#include "api/serialization.h"
 
 #include <doctest/doctest.h>
 
@@ -112,7 +118,8 @@ std::string jsonStringField(const std::string &json, const std::string &key) {
 }
 
 bool isTerminal(const std::string &state) {
-  return state == "completed" || state == "failed" || state == "canceled";
+  return state == "completed" || state == "failed" || state == "canceled" ||
+         state == "target-not-met";
 }
 
 BridgeJob waitForTerminal(BridgeEnv &env, const std::string &jobId,
@@ -158,65 +165,102 @@ BridgeJob waitForTerminal(BridgeEnv &env, const std::string &jobId,
   return job;
 }
 
+// The typed request JSON the ABI v2 facade accepts: a real transcode with
+// an explicit resolution, bitrate-driven video and concrete audio settings.
+// Mirrors the old flat bridge request (outputContainer mp4, video h264
+// height 144 bitrate 300k, audio aac 64k/44100/stereo, policy preserve).
 std::string validRequest(const std::string &uri) {
-  return std::string("{\"source\":{\"uri\":\"") + uri +
-         "\",\"displayName\":\"sample.mp4\"},"
-         "\"outputContainer\":\"mp4\","
-         "\"goal\":{\"kind\":\"custom\"},"
-         "\"video\":{\"enabled\":true,\"codec\":\"h264\","
-         "\"resolutionHeight\":144,\"rateControl\":\"bitrate\","
-         "\"bitRate\":300000},"
-         "\"audio\":{\"enabled\":true,\"codec\":\"aac\",\"bitRate\":64000,"
-         "\"sampleRate\":44100,\"channels\":2},"
-         "\"subtitles\":{\"policy\":\"preserve\",\"timingOffsetMs\":0},"
-         "\"processingMode\":\"auto\"}";
+  return std::string("{\"operation\":\"video-convert\","
+                     "\"submissionId\":\"u-bridge-sample\","
+                     "\"video-convert\":{"
+                     "\"source\":{\"uri\":\"") +
+         uri + "\",\"name\":\"sample.mp4\"},"
+               "\"output\":{\"name\":null,\"container\":\"mp4\"},"
+               "\"video\":{\"codec\":\"h264\",\"resolutionHeight\":144},"
+               "\"audioSettings\":{\"codec\":\"aac\",\"bitRate\":64000,"
+               "\"sampleRate\":44100,\"channels\":2},"
+               "\"compression\":{\"enabled\":true,\"preset\":\"custom\","
+               "\"targetSizeBytes\":0,\"quality\":null,"
+               "\"videoBitrate\":300000,\"audioBitrate\":null}}}";
 }
 
 } // namespace
 
 TEST_CASE("requestFromJson validates the bridge contract") {
   std::string error;
-  CHECK_FALSE(velmux::bridge::requestFromJson("not json", error).has_value());
+  CHECK_FALSE(velmux::core::requestFromJson("not json", error).has_value());
   CHECK_FALSE(error.empty());
 
-  CHECK_FALSE(
-      velmux::bridge::requestFromJson("{\"source\":{}}", error).has_value());
+  // Missing the operation's payload object.
+  CHECK_FALSE(velmux::core::requestFromJson(
+                  "{\"operation\":\"video-convert\"}", error)
+                  .has_value());
 
-  CHECK_FALSE(velmux::bridge::requestFromJson(
-                  "{\"source\":{\"uri\":\"x\"},\"outputContainer\":\"zzz\"}",
+  // Source without a uri.
+  CHECK_FALSE(velmux::core::requestFromJson(
+                  "{\"operation\":\"video-convert\",\"video-convert\":{"
+                  "\"source\":{\"name\":\"x\"},\"output\":{},\"video\":{}}}",
                   error)
                   .has_value());
 
-  CHECK_FALSE(velmux::bridge::requestFromJson(
-                  "{\"source\":{\"uri\":\"x\"},\"goal\":{\"kind\":"
-                  "\"fitUnderSize\"}}",
+  // Unknown output container.
+  CHECK_FALSE(velmux::core::requestFromJson(
+                  "{\"operation\":\"video-convert\",\"video-convert\":{"
+                  "\"source\":{\"uri\":\"x\",\"name\":\"x\"},"
+                  "\"output\":{\"container\":\"zzz\"},\"video\":{}}}",
                   error)
                   .has_value());
 
-  const auto request = velmux::bridge::requestFromJson(
-      validRequest("/tmp/a.mp4"), error);
-  REQUIRE(request.has_value());
+  // Target-size compression without a usable target (the old
+  // fitUnderSize-without-target refusal).
+  CHECK_FALSE(velmux::core::requestFromJson(
+                  "{\"operation\":\"video-convert\",\"video-convert\":{"
+                  "\"source\":{\"uri\":\"x\",\"name\":\"x\"},"
+                  "\"output\":{},\"video\":{},"
+                  "\"compression\":{\"enabled\":true,"
+                  "\"preset\":\"target-size\",\"targetSizeBytes\":0}}}",
+                  error)
+                  .has_value());
+
+  const auto decoded =
+      velmux::core::requestFromJson(validRequest("/tmp/a.mp4"), error);
+  REQUIRE(decoded.has_value());
   CHECK(error.empty());
-  CHECK(request->source.uri == "/tmp/a.mp4");
-  CHECK(request->outputContainer.has_value());
-  CHECK(*request->outputContainer == velmux::core::Container::Mp4);
-  CHECK(request->goal.kind == velmux::core::GoalKind::Custom);
-  CHECK(request->video.codec == velmux::core::VideoCodec::H264);
-  CHECK(request->video.resolutionHeight.has_value());
-  CHECK(*request->video.resolutionHeight == 144);
-  CHECK(request->video.bitRate == 300000);
-  CHECK(request->audio.channels == 2);
-  CHECK(request->subtitles.policy == velmux::core::SubtitlePolicy::Preserve);
-  CHECK(request->processingMode == velmux::core::ProcessingMode::Auto);
+  CHECK(decoded->submissionId == "u-bridge-sample");
+  CHECK(decoded->request.operation == velmux::core::Operation::VideoConvert);
+  const auto &payload =
+      std::get<velmux::core::job::VideoConvert>(decoded->request.payload);
+  CHECK(payload.source.uri == "/tmp/a.mp4");
+  CHECK(payload.source.displayName == "sample.mp4");
+  REQUIRE(payload.output.container.has_value());
+  CHECK(*payload.output.container == velmux::core::Container::Mp4);
+  REQUIRE(payload.video.codec.has_value());
+  CHECK(*payload.video.codec == velmux::core::VideoCodec::H264);
+  REQUIRE(payload.video.resolutionHeight.has_value());
+  CHECK(*payload.video.resolutionHeight == 144);
+  REQUIRE(payload.compression.videoBitrate.has_value());
+  CHECK(*payload.compression.videoBitrate == 300000);
+  CHECK(payload.audioSettings.channels == 2);
+  REQUIRE(payload.audioSettings.sampleRate.has_value());
+  CHECK(*payload.audioSettings.sampleRate == 44100);
+  CHECK(payload.audioSettings.bitRate == 64000);
+  // No subtitle rules: preserve all (the old default policy).
+  CHECK(payload.subtitleTracks.empty());
 
   // Unicode + escapes survive the round trip.
-  const auto unicode = velmux::bridge::requestFromJson(
-      "{\"source\":{\"uri\":\"/tmp/\xc3\xa9\xe2\x9c\x93.mp4\","
-      "\"displayName\":\"caf\\u00e9 \\\"quoted\\\" movie\"}}",
+  const auto unicode = velmux::core::requestFromJson(
+      "{\"operation\":\"video-convert\",\"video-convert\":{"
+      "\"source\":{\"uri\":\"/tmp/\xc3\xa9\xe2\x9c\x93.mp4\","
+      "\"name\":\"caf\\u00e9 \\\"quoted\\\" movie\"},"
+      "\"output\":{},\"video\":{}}}",
       error);
   REQUIRE(unicode.has_value());
-  CHECK(unicode->source.uri.find("\xc3\xa9\xe2\x9c\x93") != std::string::npos);
-  CHECK(unicode->source.displayName == "caf\303\251 \"quoted\" movie");
+  const auto &unicodePayload =
+      std::get<velmux::core::job::VideoConvert>(unicode->request.payload);
+  CHECK(unicodePayload.source.uri.find("\xc3\xa9\xe2\x9c\x93") !=
+        std::string::npos);
+  CHECK(unicodePayload.source.displayName ==
+        "caf\303\251 \"quoted\" movie");
 }
 
 TEST_CASE("facade: inspect, plan, start, complete, validate via JSON") {
@@ -245,20 +289,38 @@ TEST_CASE("facade: inspect, plan, start, complete, validate via JSON") {
     CHECK(text.find("\"error\"") != std::string::npos);
   }
 
-  SUBCASE("plan is feasible for a real transcode request") {
-    char *plan = velmux_plan(env.engine, validRequest(fixture).c_str());
-    REQUIRE(plan != nullptr);
-    const std::string text = plan;
-    velmux_free_string(plan);
-    CHECK(text.find("\"feasible\":true") != std::string::npos);
-    CHECK(text.find("\"pipelineSummary\"") != std::string::npos);
+  SUBCASE("plan is feasible for a real conversion request") {
+    // ABI v2 plans through configuration sessions: create + prepare runs
+    // the real inspection and the feasibility assessment.
+    char *session = velmux_create_session(
+        env.engine,
+        ("{\"operation\":\"video-convert\",\"sources\":[{\"uri\":\"" +
+         fixture + "\",\"name\":\"in.mp4\"}]}")
+            .c_str());
+    REQUIRE(session != nullptr);
+    const std::string sessionText = session;
+    velmux_free_string(session);
+    CHECK(sessionText.find("\"error\"") == std::string::npos);
+    const std::string sessionId = jsonStringField(sessionText, "sessionId");
+    REQUIRE_FALSE(sessionId.empty());
+
+    char *prepared = velmux_prepare_session(env.engine, sessionId.c_str());
+    REQUIRE(prepared != nullptr);
+    const std::string text = prepared;
+    velmux_free_string(prepared);
+    CHECK(text.find("\"error\"") == std::string::npos);
+    CHECK(text.find("\"state\":\"ready\"") != std::string::npos);
+    CHECK(text.find("\"configurationValid\":true") != std::string::npos);
+    CHECK(text.find("\"estimate\"") != std::string::npos);
+    CHECK(velmux_close_session(env.engine, sessionId.c_str()) == 0);
   }
 
-  SUBCASE("startJob runs a real conversion and poll observes completion") {
-    char *started = velmux_start_job(env.engine, validRequest(fixture).c_str());
+  SUBCASE("submitJob runs a real conversion and poll observes completion") {
+    char *started = velmux_submit_job(env.engine, validRequest(fixture).c_str());
     REQUIRE(started != nullptr);
     const std::string startText = started;
     velmux_free_string(started);
+    INFO("submit response: " << startText);
     CHECK(startText.find("\"error\"") == std::string::npos);
     const std::string jobId = jsonStringField(startText, "jobId");
     CHECK_FALSE(jobId.empty());
@@ -276,7 +338,7 @@ TEST_CASE("facade: inspect, plan, start, complete, validate via JSON") {
   }
 
   SUBCASE("invalid request JSON reports an error object") {
-    char *started = velmux_start_job(env.engine, "{\"bogus\":1}");
+    char *started = velmux_submit_job(env.engine, "{\"bogus\":1}");
     REQUIRE(started != nullptr);
     const std::string text = started;
     velmux_free_string(started);
@@ -310,18 +372,20 @@ TEST_CASE("facade: resource updates and job retry/delete") {
   CHECK(velmux_update_resources(env.engine, "not json") == -1);
   CHECK(velmux_update_resources(env.engine, nullptr) == -1);
 
-  // A fake-but-complete request produces a durable job through JSON.
+  // A real conversion job submitted through the typed JSON (with the
+  // subtitle-removal rule, the v1 policy the facade carries).
   const std::string fixture = generateFixture(env.dir / "in.mp4", 1.0);
   const std::string requestJson = R"({
-    "source": {"uri": ")" + fixture + R"(", "displayName": "in.mp4"},
-    "outputContainer": "mp4",
-    "goal": {"kind": "custom"},
-    "video": {"codec": "h264", "enabled": true},
-    "audio": {"codec": "aac", "enabled": true},
-    "subtitles": {"policy": "remove"},
-    "processingMode": "auto"
+    "operation": "video-convert",
+    "video-convert": {
+      "source": {"uri": ")" + fixture + R"(", "name": "in.mp4"},
+      "output": {"name": null, "container": "mp4"},
+      "video": {"codec": "h264"},
+      "audioSettings": {"codec": "aac"},
+      "subtitleTracks": [{"index": -1, "policy": "remove"}]
+    }
   })";
-  char *started = velmux_start_job(env.engine, requestJson.c_str());
+  char *started = velmux_submit_job(env.engine, requestJson.c_str());
   REQUIRE(started != nullptr);
   const std::string startedText = started;
   velmux_free_string(started);

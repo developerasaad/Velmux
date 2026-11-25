@@ -106,13 +106,91 @@ BackendCapabilities AppleBackend::capabilities() const {
   return caps;
 }
 
+namespace {
+
+// The request shape the native path can serve: the conversion-family
+// payloads (VideoConvert / AudioConvert / ExtractAudio) reduced to the
+// fields the native gates consumed. nullopt = an operation or field this
+// backend refuses (the planner routes those elsewhere).
+struct NativeShape {
+  bool videoActive = false;
+  bool audioActive = false;
+  bool trimActive = false;
+  bool geometryRateChange = false;
+  bool audioFormatChange = false;
+};
+
+std::optional<NativeShape> nativeShapeOf(const JobRequest &request) {
+  NativeShape shape;
+  const auto &payload = request.payload;
+  if (const auto *vc = std::get_if<job::VideoConvert>(&payload)) {
+    shape.videoActive = true;
+    shape.audioActive = true;
+    // Every audio rule a removal (no external, no replacement) drops the
+    // audio lane entirely.
+    if (!vc->audioTracks.empty()) {
+      const bool allRemoved = std::all_of(
+          vc->audioTracks.begin(), vc->audioTracks.end(),
+          [](const AudioTrackRule &rule) {
+            return !rule.include &&
+                   !(rule.externalUri.has_value() && !rule.externalUri->empty());
+          });
+      if (allRemoved) {
+        shape.audioActive = false;
+      }
+    }
+    shape.geometryRateChange =
+        vc->video.resolutionHeight.has_value() ||
+        vc->video.customWidth.has_value() ||
+        vc->video.customHeight.has_value() || vc->video.frameRate.has_value();
+    shape.audioFormatChange = vc->audioSettings.sampleRate.has_value() ||
+                              vc->audioSettings.channels.has_value();
+    // Subtitle work: none of it rides the native path (libass burn-in and
+    // text-track passthrough are FFmpeg's). A BurnIn rule is an explicit
+    // refusal.
+    if (std::any_of(vc->subtitleTracks.begin(), vc->subtitleTracks.end(),
+                    [](const SubtitleTrackRule &rule) {
+                      return rule.policy == SubtitleTrackPolicy::BurnIn;
+                    })) {
+      return std::nullopt;
+    }
+  } else if (const auto *ac = std::get_if<job::AudioConvert>(&payload)) {
+    shape.audioActive = true;
+    shape.audioFormatChange =
+        ac->audio.sampleRate.has_value() || ac->audio.channels.has_value();
+  } else if (const auto *ea = std::get_if<job::ExtractAudio>(&payload)) {
+    shape.audioActive = true;
+    // The native reader keeps the first/default audio track only.
+    if (!ea->trackIndices.empty() &&
+        (ea->trackIndices.size() > 1 || ea->trackIndices.front() != 0)) {
+      return std::nullopt;
+    }
+    shape.trimActive = ea->range.has_value() &&
+                       (ea->range->startUs != 0 || ea->range->endUs >= 0);
+    shape.audioFormatChange =
+        ea->audio.sampleRate.has_value() || ea->audio.channels.has_value();
+  } else {
+    // Crop/Trim/Cut/Split/Merge/ExtractFrames/ExtractSubtitles and every
+    // other operation: not native-path work.
+    return std::nullopt;
+  }
+  return shape;
+}
+
+} // namespace
+
 bool AppleExecutor::canExecute(const Pipeline &pipeline,
-                               const ConversionRequest &request) const {
+                               const JobRequest &request) const {
   if (!backend_->mediaAvailable_) {
     return false;
   }
-  const bool videoActive = request.video.enabled;
-  const bool audioActive = request.audio.enabled;
+  const std::optional<NativeShape> shapeOpt = nativeShapeOf(request);
+  if (!shapeOpt.has_value()) {
+    return false; // operation (or explicit field) this path refuses
+  }
+  const NativeShape &shape = *shapeOpt;
+  const bool videoActive = shape.videoActive;
+  const bool audioActive = shape.audioActive;
   // Pure remux or pure transcode only (mixed copy/transcode has no native
   // path in this milestone).
   if (videoActive && audioActive &&
@@ -120,28 +198,16 @@ bool AppleExecutor::canExecute(const Pipeline &pipeline,
     return false;
   }
   // Geometry and rate changes need the FFmpeg path.
-  if (videoActive && !pipeline.videoStreamCopy) {
-    if (request.video.resolutionHeight.has_value() ||
-        request.video.frameRate.has_value()) {
-      return false;
-    }
+  if (videoActive && !pipeline.videoStreamCopy && shape.geometryRateChange) {
+    return false;
   }
   // Trim is not implemented on the native path; a trimmed request must
   // never execute here — it would silently produce full-length output.
-  if (request.trim.startUs != 0 || request.trim.endUs != -1) {
+  if (shape.trimActive) {
     return false;
   }
   // Audio resampling / downmixing is FFmpeg's job in this milestone.
-  if (audioActive && !pipeline.audioStreamCopy) {
-    if (request.audio.sampleRate.has_value() ||
-        request.audio.channels.has_value()) {
-      return false;
-    }
-  }
-  // Subtitle rendering runs through libass (FFmpeg backend); extraction is
-  // not implemented anywhere yet (rejected by the planner, D-013).
-  if (request.subtitles.policy == SubtitlePolicy::BurnIn ||
-      request.subtitles.policy == SubtitlePolicy::Extract) {
+  if (audioActive && !pipeline.audioStreamCopy && shape.audioFormatChange) {
     return false;
   }
   switch (pipeline.container) {
@@ -172,7 +238,27 @@ bool AppleExecutor::canExecute(const Pipeline &pipeline,
 ExecuteResult AppleExecutor::execute(const ExecuteParams &params) {
   ExecuteResult result;
   const auto started = std::chrono::steady_clock::now();
-  const auto inPath = localPathForUri(params.request.source.uri);
+  const std::optional<NativeShape> shapeOpt =
+      nativeShapeOf(params.request);
+  if (!shapeOpt.has_value()) {
+    result.error = Error::make(
+        ErrorCode::UnsupportedOperation,
+        "the native path serves conversion-family requests only", "apple");
+    return result;
+  }
+  const NativeShape &shape = *shapeOpt;
+  const MediaSource source = std::visit(
+      [](const auto &payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          return payload.sources.empty() ? MediaSource{}
+                                         : payload.sources.front();
+        } else {
+          return payload.source;
+        }
+      },
+      params.request.payload);
+  const auto inPath = localPathForUri(source.uri);
   if (!inPath.has_value()) {
     result.error = Error::make(
         ErrorCode::SourceUnavailable,
@@ -192,16 +278,78 @@ ExecuteResult AppleExecutor::execute(const ExecuteParams &params) {
   ctx.shouldContinue = [&params]() {
     return !params.cancel || !params.cancel->isCancelled();
   };
+  media::NativeTranscodeSpec spec;
+  spec.wantVideo = shape.videoActive;
+  spec.wantAudio = shape.audioActive;
+  // Rate control resolved from the compression intent (mandate §20), the
+  // same derivation the hybrid executor applies (no inspection data on
+  // this path; TargetSize budgets stay on whole-pipeline routes).
+  const CompressionIntent *compression = std::visit(
+      [](const auto &payload) -> const CompressionIntent * {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::VideoConvert> ||
+                      std::is_same_v<Payload, job::AudioConvert> ||
+                      std::is_same_v<Payload, job::ExtractAudio>) {
+          return &payload.compression;
+        } else {
+          return nullptr;
+        }
+      },
+      params.request.payload);
+  spec.videoQuality = 65; // disabled: high-fidelity default
+  if (compression != nullptr && compression->enabled) {
+    switch (compression->preset) {
+      case CompressionPreset::HighQuality:
+        spec.videoQuality = 85;
+        break;
+      case CompressionPreset::Balanced:
+      case CompressionPreset::TargetSize:
+        spec.videoQuality = 60;
+        break;
+      case CompressionPreset::SmallerFile:
+        spec.videoQuality = 35;
+        break;
+      case CompressionPreset::Custom:
+        if (compression->videoBitrate.has_value() &&
+            *compression->videoBitrate > 0) {
+          spec.videoBitRate = *compression->videoBitrate;
+        } else {
+          spec.videoQuality =
+              std::clamp(compression->quality.value_or(60), 1, 100);
+        }
+        break;
+    }
+    if (compression->audioBitrate.has_value() &&
+        *compression->audioBitrate > 0) {
+      spec.audioBitRate = *compression->audioBitrate;
+    }
+  }
+  // Explicit audio settings still win (AudioSettings.bitRate is the
+  // user-facing audio bitrate surface).
+  std::visit(
+      [&](const auto &payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::VideoConvert>) {
+          if (payload.audioSettings.bitRate.has_value()) {
+            spec.audioBitRate = *payload.audioSettings.bitRate;
+          }
+        } else if constexpr (std::is_same_v<Payload, job::AudioConvert> ||
+                             std::is_same_v<Payload, job::ExtractAudio>) {
+          if (payload.audio.bitRate.has_value()) {
+            spec.audioBitRate = *payload.audio.bitRate;
+          }
+        }
+      },
+      params.request.payload);
   const bool pureCopy = params.pipeline.videoStreamCopy ||
                         params.pipeline.audioStreamCopy;
   media::RunResult run;
   if (pureCopy) {
-    run = media::remuxFile(*inPath, params.outputPath,
-                           params.request.video.enabled,
-                           params.request.audio.enabled, ctx);
+    run = media::remuxFile(*inPath, params.outputPath, spec.wantVideo,
+                           spec.wantAudio, ctx);
   } else {
     run = media::transcodeFile(*inPath, params.outputPath, params.pipeline,
-                               params.request, ctx);
+                               spec, ctx);
   }
   const auto elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -263,7 +411,7 @@ RunResult remuxFile(const std::string &, const std::string &, bool, bool,
 
 RunResult transcodeFile(const std::string &, const std::string &,
                         const core::Pipeline &,
-                        const core::ConversionRequest &,
+                        const NativeTranscodeSpec &,
                         const RunContext &) {
   RunResult result;
   result.error = "Apple media APIs are not available in this process";

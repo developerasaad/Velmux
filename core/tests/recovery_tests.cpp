@@ -50,9 +50,11 @@ std::string writeArtifact(const std::filesystem::path &path,
 JobRecord runningJob(const std::string &id) {
   JobRecord record;
   record.id = id;
-  record.state = JobState::Running;
-  record.request.source.uri = "file:///tmp/x.mp4";
-  record.request.source.displayName = "x.mp4";
+  record.state = JobState::Processing;
+  record.request.operation = Operation::VideoConvert;
+  auto &payload = record.request.payload.emplace<job::VideoConvert>();
+  payload.source.uri = "file:///tmp/x.mp4";
+  payload.source.displayName = "x.mp4";
   record.createdAtMs = 1;
   record.updatedAtMs = 2;
   return record;
@@ -141,7 +143,7 @@ TEST_CASE("reconcile decides per job state") {
       runningJob("mid-flight")};
   jobs[0].state = JobState::Completed;
   jobs[1].state = JobState::Queued;
-  jobs[2].state = JobState::Running;
+  jobs[2].state = JobState::Processing;
 
   // No checkpoints for any job: mid-flight restarts, never-started restarts.
   auto decisions = planner.reconcile(jobs, db.checkpoints(),

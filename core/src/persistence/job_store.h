@@ -1,10 +1,12 @@
 // Velmux core — SQLite job persistence.
 //
-// Durable job state (spec §24): stable job ID, schema version, source
-// identity + durable access info, requested settings, media metadata,
-// selected pipeline, backend identities, encoder configuration, checkpoint
-// manifest, artifacts, output state, progress, timestamps, errors,
-// performance observations.
+// Durable job state (spec §24/§37): stable job ID, submission id, schema
+// version, the full typed request (JSON), inspected source info, selected
+// pipeline, output manifest, progress, timestamps, errors, error codes.
+//
+// Schema v4: the request is stored as full-fidelity typed JSON; the legacy
+// k=v pair strings and the goal/processing-mode columns are migrated away
+// in one transaction (every row preserved).
 //
 // Thin RAII wrapper over the sqlite3 C API. On Android/iOS the system
 // SQLite is used; on host the system library.
@@ -80,10 +82,14 @@ public:
   std::vector<JobRecord> loadAllJobs(Error &error);
   // Jobs that were mid-flight when the process disappeared.
   std::vector<JobRecord> loadResumableJobs(Error &error);
+  // Durable idempotency (mandate §14.2): the job created for a submission
+  // id, when one exists.
+  std::optional<JobRecord> findJobBySubmissionId(const std::string &submissionId,
+                                                 Error &error);
   // Removes the job AND its checkpoint rows (cascade).
   Error deleteJob(const std::string &id);
 
-  static constexpr std::int32_t kSchemaVersion = 3;
+  static constexpr std::int32_t kSchemaVersion = 4;
 
 private:
   static JobRecord rowToRecord(sqlite3_stmt &stmt);

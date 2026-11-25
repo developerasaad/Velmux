@@ -33,7 +33,7 @@ public:
   // Cheap structural check: stage shape, request shape, and stage-factory
   // availability. No probing, no test encodes (spec §4.2).
   bool canExecute(const Pipeline &pipeline,
-                  const ConversionRequest &request) const;
+                  const JobRequest &request) const;
 
   backend::ExecuteResult execute(const backend::ExecuteParams &params);
 

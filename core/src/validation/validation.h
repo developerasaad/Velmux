@@ -5,12 +5,15 @@
 // (independent parse of the produced file) and checked against what the
 // user asked for: container parses, required streams exist, expected
 // codecs, duration, timestamp continuity, resolution, sample rate.
+// Per-operation expectations (mandate §39) derive from the typed request.
 #pragma once
 
 #include <velmux/jobs.h>
 #include <velmux/media.h>
+#include "processing/pipeline.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace velmux::backend {
@@ -37,6 +40,7 @@ struct ValidationExpectation {
   bool expectVideo = true;
   bool expectAudio = true;
   std::int32_t expectedHeight = 0; // 0 = unchecked
+  std::int32_t expectedWidth = 0;  // 0 = unchecked (Crop exactness)
   std::int32_t expectedSampleRate = 0; // 0 = unchecked
   double expectedDurationSec = 0.0; // 0 = unchecked
   // Tolerance for duration comparison (container overhead, rounding).
@@ -47,6 +51,10 @@ struct ValidationExpectation {
   // Subtitle-extraction jobs: the output is a text sidecar (SRT/VTT/ASS),
   // not a media container. Validation checks cue structure instead.
   bool subtitleSidecar = false;
+  // Metadata Set intentions read back from the output container tags
+  // (mandate §33): key + expected value. Checked when the inspector can
+  // read tags; skipped honestly otherwise.
+  std::vector<std::pair<std::string, std::string>> expectedTags;
 };
 
 class OutputValidator {
@@ -59,5 +67,13 @@ public:
 private:
   IInspector &inspector_;
 };
+
+// Derives the per-operation expectation from the accepted request, the
+// inspected source and the planned pipeline. Geometry is
+// transform-aware (crop -> rotation -> scale), durations are
+// trim/speed/silence-aware, audio presence follows the track rules.
+ValidationExpectation expectationFor(const JobRequest &request,
+                                     const MediaInfo &source,
+                                     const Pipeline &pipeline);
 
 } // namespace velmux::core

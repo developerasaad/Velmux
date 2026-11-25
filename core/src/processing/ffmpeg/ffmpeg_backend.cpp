@@ -64,6 +64,35 @@ std::optional<std::string> localPathForUri(const std::string &uri) {
 
 namespace {
 
+// Applies metadata set/clear intentions at mux time (mandate §33):
+// Set writes the familiar tag, Clear deletes it (av_dict_set with a null
+// value removes the entry), Unchanged leaves the copied source tag alone.
+// The all-Clear intention is the moral equivalent of the retired
+// stripMetadata control.
+void applyMetadataIntention(AVDictionary **dict,
+                            const MetadataIntention &metadata) {
+  const auto apply = [&](MetadataFieldAction action, const char *key,
+                         const std::string &value) {
+    switch (action) {
+      case velmux::core::MetadataFieldAction::Unchanged:
+        break;
+      case velmux::core::MetadataFieldAction::Set:
+        av_dict_set(dict, key, value.c_str(), 0);
+        break;
+      case velmux::core::MetadataFieldAction::Clear:
+        av_dict_set(dict, key, nullptr, 0);
+        break;
+    }
+  };
+  apply(metadata.titleAction, "title", metadata.title);
+  apply(metadata.artistAction, "artist", metadata.artist);
+  apply(metadata.albumAction, "album", metadata.album);
+  apply(metadata.genreAction, "genre", metadata.genre);
+  apply(metadata.dateAction, "date", metadata.date);
+  apply(metadata.descriptionAction, "description", metadata.description);
+  apply(metadata.locationAction, "location", metadata.location);
+}
+
 // Target duration of one independently finalized transcode segment
 // (spec §25: video transcode -> independently finalized segments). Actual
 // boundaries land on the closest frame; the checkpoint records the real
@@ -82,96 +111,6 @@ void initFfmpegLabel() {
 
 // Shared helpers (avErrorString, makeAvError, qualityToCrf,
 // encoderNameFor) live in ffmpeg_util.h.
-
-// Maps a request-model pixel format (spec §18 advanced controls) to the
-// libavutil pixel format. AV_PIX_FMT_NONE means "unknown" (refused).
-AVPixelFormat avPixFmtFor(core::PixelFormat format) {
-  using core::PixelFormat;
-  switch (format) {
-    case PixelFormat::Yuv420P:
-      return AV_PIX_FMT_YUV420P;
-    case PixelFormat::Yuv422P:
-      return AV_PIX_FMT_YUV422P;
-    case PixelFormat::Yuv444P:
-      return AV_PIX_FMT_YUV444P;
-    case PixelFormat::Yuv420P10Le:
-      return AV_PIX_FMT_YUV420P10LE;
-    case PixelFormat::Yuv422P10Le:
-      return AV_PIX_FMT_YUV422P10LE;
-    case PixelFormat::Yuv444P10Le:
-      return AV_PIX_FMT_YUV444P10LE;
-  }
-  return AV_PIX_FMT_NONE;
-}
-
-// Maps a user-facing profile name to the codec's FF_PROFILE value.
-// Returns -1 when the name is unknown or does not apply to the codec.
-int ffmpegProfileFor(core::VideoCodec codec, const std::string &name) {
-  using core::VideoCodec;
-  // Case-insensitive compare against the accepted spellings.
-  std::string lower;
-  lower.reserve(name.size());
-  for (char c : name) {
-    lower.push_back(char(std::tolower(static_cast<unsigned char>(c))));
-  }
-  switch (codec) {
-    case VideoCodec::H264:
-      if (lower == "baseline") {
-        return FF_PROFILE_H264_BASELINE;
-      }
-      if (lower == "main") {
-        return FF_PROFILE_H264_MAIN;
-      }
-      if (lower == "high") {
-        return FF_PROFILE_H264_HIGH;
-      }
-      if (lower == "high10") {
-        return FF_PROFILE_H264_HIGH_10;
-      }
-      if (lower == "high422") {
-        return FF_PROFILE_H264_HIGH_422;
-      }
-      return -1;
-    case VideoCodec::HEVC:
-      if (lower == "main") {
-        return FF_PROFILE_HEVC_MAIN;
-      }
-      if (lower == "main10") {
-        return FF_PROFILE_HEVC_MAIN_10;
-      }
-      if (lower == "main-still-picture") {
-        return FF_PROFILE_HEVC_MAIN_STILL_PICTURE;
-      }
-      return -1;
-    case VideoCodec::VP9:
-      if (lower == "0" || lower == "profile0") {
-        return FF_PROFILE_VP9_0;
-      }
-      if (lower == "1" || lower == "profile1") {
-        return FF_PROFILE_VP9_1;
-      }
-      if (lower == "2" || lower == "profile2") {
-        return FF_PROFILE_VP9_2;
-      }
-      if (lower == "3" || lower == "profile3") {
-        return FF_PROFILE_VP9_3;
-      }
-      return -1;
-    case VideoCodec::AV1:
-      if (lower == "main") {
-        return FF_PROFILE_AV1_MAIN;
-      }
-      if (lower == "high") {
-        return FF_PROFILE_AV1_HIGH;
-      }
-      if (lower == "professional") {
-        return FF_PROFILE_AV1_PROFESSIONAL;
-      }
-      return -1;
-    default:
-      return -1; // profiles are not meaningful for the remaining codecs
-  }
-}
 
 // Per-track audio pipeline state (multi-track audio, spec §9). Every
 // selected source audio stream gets its own decode -> [DSP] -> resample ->
@@ -215,6 +154,13 @@ struct CodecCleanup {
       AVFormatContext *ctx = audioReplaceIn;
       avformat_close_input(&ctx);
     }
+    for (AVFormatContext *&ctx : externalAudioIns) {
+      if (ctx != nullptr) {
+        AVFormatContext *closing = ctx;
+        avformat_close_input(&closing);
+        ctx = nullptr;
+      }
+    }
     avcodec_free_context(&videoDec);
     avcodec_free_context(&videoEnc);
     if (out != nullptr) {
@@ -235,6 +181,8 @@ struct CodecCleanup {
   AVFormatContext *out = nullptr;
   // Replacement audio input (spec §9 replace-audio); opened lazily.
   AVFormatContext *audioReplaceIn = nullptr;
+  // External audio addition inputs (mandate §23 additions), opened lazily.
+  std::vector<AVFormatContext *> externalAudioIns;
   AVCodecContext *videoDec = nullptr;
   AVCodecContext *videoEnc = nullptr;
   SwsContext *sws = nullptr;
@@ -615,14 +563,113 @@ std::string srtTimestamp(std::int64_t us) {
   return buf;
 }
 
-// Decodes a container-internal text subtitle stream (mov_text, ttml, ...)
-// and writes a valid SRT sidecar. Bitmap decodes (PGS/DVB/VobSub) produce
-// no text rects and fail honestly. Progress and cancellation are honored
-// at packet granularity (demux-level work; there is nothing to
-// checkpoint).
-bool decodeSubtitleStreamToSrt(AVFormatContext *in, int streamIndex,
-                               const std::string &outPath,
-                               const velmux::backend::ExecuteParams &params) {
+// Formats a timestamp as WebVTT time (HH:MM:SS.mmm).
+std::string vttTimestamp(std::int64_t us) {
+  if (us < 0) {
+    us = 0;
+  }
+  const std::int64_t msTotal = us / 1000;
+  const std::int64_t ms = msTotal % 1000;
+  const std::int64_t sTotal = msTotal / 1000;
+  const std::int64_t s = sTotal % 60;
+  const std::int64_t m = (sTotal / 60) % 60;
+  const std::int64_t h = sTotal / 3600;
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%02lld:%02lld:%02lld.%03lld",
+                static_cast<long long>(h), static_cast<long long>(m),
+                static_cast<long long>(s), static_cast<long long>(ms));
+  return buf;
+}
+
+// Formats a timestamp as ASS time (H:MM:SS.cc).
+std::string assTimestamp(std::int64_t us) {
+  if (us < 0) {
+    us = 0;
+  }
+  const std::int64_t cs = (us + 5000) / 10000; // round to centiseconds
+  const std::int64_t c = cs % 100;
+  const std::int64_t sTotal = cs / 100;
+  const std::int64_t s = sTotal % 60;
+  const std::int64_t m = (sTotal / 60) % 60;
+  const std::int64_t h = sTotal / 3600;
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%lld:%02lld:%02lld.%02lld",
+                static_cast<long long>(h), static_cast<long long>(m),
+                static_cast<long long>(s), static_cast<long long>(c));
+  return buf;
+}
+
+// The text sidecar representations the extraction path writes.
+enum class SidecarTarget { Srt, Vtt, Ass };
+
+// Writes one decoded cue in the target representation. Returns false when
+// the stream is unwritable (disk/environment).
+bool writeCue(std::ofstream &out, SidecarTarget target,
+              std::int64_t cueIndex, std::int64_t startUs, std::int64_t endUs,
+              const std::string &text) {
+  switch (target) {
+    case SidecarTarget::Srt:
+      out << cueIndex << "\n"
+          << srtTimestamp(startUs) << " --> " << srtTimestamp(endUs) << "\n"
+          << text << "\n\n";
+      break;
+    case SidecarTarget::Vtt:
+      // VTT cues may carry an identifier line; the running cue number is
+      // a stable, honest one.
+      out << cueIndex << "\n"
+          << vttTimestamp(startUs) << " --> " << vttTimestamp(endUs) << "\n"
+          << text << "\n\n";
+      break;
+    case SidecarTarget::Ass: {
+      // ASS text: newlines become \N; braces would start an override tag
+      // block, so escape them (the decode path already stripped tags).
+      std::string assText;
+      assText.reserve(text.size());
+      for (char c : text) {
+        if (c == '\n') {
+          assText += "\\N";
+        } else {
+          if (c == '{' || c == '}') {
+            assText += '\\';
+          }
+          assText += c;
+        }
+      }
+      out << "Dialogue: 0," << assTimestamp(startUs) << ","
+          << assTimestamp(endUs) << ",Default,,0,0,0,," << assText << "\n";
+      break;
+    }
+  }
+  return out.good();
+}
+
+// The ASS file header: minimal valid v4.00+ script with one default style
+// (players render it with their default font when Arial is unavailable).
+const char *kAssHeader =
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+    "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+    "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+    "MarginL, MarginR, MarginV, Encoding\n"
+    "Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+    "0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n"
+    "\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+    "Effect, Text\n";
+
+// Decodes a container-internal text subtitle stream (mov_text, ttml, ...) and
+// writes a text sidecar (SRT, WebVTT or ASS per `target`). Bitmap decodes
+// (PGS/DVB/VobSub) produce no text rects and fail honestly. Progress and
+// cancellation are honored at packet granularity (demux-level work; there is
+// nothing to checkpoint).
+bool decodeSubtitleStreamToSidecar(AVFormatContext *in, int streamIndex,
+                                   const std::string &outPath,
+                                   SidecarTarget target,
+                                   const velmux::backend::ExecuteParams &params) {
   const AVCodec *codec =
       avcodec_find_decoder(in->streams[streamIndex]->codecpar->codec_id);
   if (codec == nullptr) {
@@ -642,6 +689,11 @@ bool decodeSubtitleStreamToSrt(AVFormatContext *in, int streamIndex,
   if (!out.good()) {
     avcodec_free_context(&dec);
     return false;
+  }
+  if (target == SidecarTarget::Vtt) {
+    out << "WEBVTT\n\n";
+  } else if (target == SidecarTarget::Ass) {
+    out << kAssHeader;
   }
   AVPacket *pkt = av_packet_alloc();
   AVSubtitle sub = {0};
@@ -714,10 +766,9 @@ bool decodeSubtitleStreamToSrt(AVFormatContext *in, int streamIndex,
       }
       if (!text.empty()) {
         ++cueIndex;
-        out << cueIndex << "\n"
-            << srtTimestamp(startUs) << " --> " << srtTimestamp(endUs)
-            << "\n"
-            << text << "\n\n";
+        if (!writeCue(out, target, cueIndex, startUs, endUs, text)) {
+          ok = false;
+        }
       }
       avsubtitle_free(&sub);
     }
@@ -1103,49 +1154,132 @@ bool FfmpegInspector::representativeWindow(const MediaSource &source,
 }
 
 bool FfmpegExecutor::canExecute(const Pipeline &pipeline,
-                                const ConversionRequest &request) const {
+                                const JobRequest &request) const {
   for (const auto &assignment : pipeline.stages) {
     if (assignment.backend != BackendId::Ffmpeg) {
       return false;
     }
   }
-  return !pipeline.stages.empty();
+  if (pipeline.stages.empty()) {
+    return false;
+  }
+  // Conversion-family operations the execution paths serve: VideoConvert,
+  // AudioConvert, Crop, Trim (the trim payload of video-cutmerge),
+  // ExtractAudio and ExtractSubtitles. The four deferred operations
+  // (multi-range Cut, Split, Merge, ExtractFrames) have no executor in
+  // this build — the planner already refuses them with
+  // UnsupportedOperation; canExecute agrees honestly so no route is ever
+  // composed onto this backend.
+  switch (request.payload.index()) {
+    case 0: // VideoConvert
+    case 1: // AudioConvert
+    case 2: // Crop
+    case 3: // Trim
+    case 7: // ExtractAudio
+    case 9: // ExtractSubtitles
+      return true;
+    case 4: // Cut (multi-range): deferred
+    case 5: // Split: deferred
+    case 6: // Merge: deferred
+    case 8: // ExtractFrames: deferred
+      return false;
+    default:
+      return false;
+  }
 }
 
 ExecuteResult FfmpegExecutor::execute(const ExecuteParams &params) {
   // Subtitle-extraction jobs: demux + subtitle processing only, artifact
   // is a text sidecar.
-  if (params.request.subtitles.policy == SubtitlePolicy::Extract) {
+  if (std::holds_alternative<job::ExtractSubtitles>(params.request.payload)) {
     return executeSubtitleExtract(params);
   }
+
+  // Normalize the typed payload into the internal execution view. The
+  // inspection feeding the builder is a demux-level open — the execution
+  // paths open the input anyway; no decoding happens here.
+  const MediaSource *sourceRef = std::visit(
+      [](const auto &payload) -> const MediaSource * {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, job::Merge>) {
+          return payload.sources.empty() ? nullptr : &payload.sources.front();
+        } else if constexpr (!std::is_same_v<Payload, job::Cut> &&
+                             !std::is_same_v<Payload, job::Split> &&
+                             !std::is_same_v<Payload, job::Merge> &&
+                             !std::is_same_v<Payload, job::ExtractFrames>) {
+          return &payload.source;
+        } else {
+          return nullptr;
+        }
+      },
+      params.request.payload);
+  if (sourceRef == nullptr) {
+    ExecuteResult result;
+    result.error = Error::make(ErrorCode::InvalidArgument,
+                               "the request carries no source", "ffmpeg");
+    return result;
+  }
+  MediaInfo source;
+  FfmpegInspector inspector;
+  {
+    const Error inspectError = inspector.inspect(*sourceRef, source);
+    if (!inspectError.ok()) {
+      ExecuteResult result;
+      result.error = inspectError;
+      return result;
+    }
+  }
+  const Result<ExecutionIntent> built =
+      buildIntent(params.request, params.pipeline, source,
+                  params.sampleWindow);
+  if (!built.ok()) {
+    ExecuteResult result;
+    result.error = built.error();
+    return result;
+  }
+  const ExecutionIntent &intent = built.value();
+
   if (params.pipeline.videoStreamCopy && params.pipeline.audioStreamCopy) {
     // Burn-in rewrites video pixels; a copy pipeline can never serve it
     // (the planner enforces this; the executor refuses defensively).
-    if (params.request.subtitles.policy == SubtitlePolicy::BurnIn) {
+    if (intent.subtitles.burnIn) {
       ExecuteResult result;
       result.error = Error::make(
           ErrorCode::InvalidArgument,
           "internal: burn-in cannot run on a stream-copy pipeline", "ffmpeg");
       return result;
     }
-    return executeRemux(params);
+    return executeRemux(params, intent);
   }
-  return executeTranscode(params);
+  return executeTranscode(params, intent);
 }
 
 ExecuteResult FfmpegExecutor::executeSubtitleExtract(
     const ExecuteParams &params) {
   ExecuteResult result;
   initFfmpegLabel();
-  const ConversionRequest &request = params.request;
-  if (params.pipeline.sidecarExtension.empty() || request.video.enabled ||
-      request.audio.enabled) {
+  const auto &request =
+      std::get<job::ExtractSubtitles>(params.request.payload);
+  if (params.pipeline.sidecarExtension.empty()) {
     result.error = Error::make(
         ErrorCode::InvalidArgument,
-        "extraction requests must be subtitle-only with a sidecar pipeline",
+        "extraction requests must carry a sidecar pipeline",
         "ffmpeg");
     return result;
   }
+  // The planner lets exactly one track through in this build (multi-track
+  // sidecar sets are refused there); the executor honors the selected
+  // track or the first subtitle stream.
+  std::int32_t wantedTrack = -1; // subtitle-stream ordinal
+  if (!request.trackIndices.empty()) {
+    wantedTrack = request.trackIndices.front();
+  }
+  // Per-track output representation: empty/Original keeps the source
+  // representation when it stands alone (packet-copy sidecar); an explicit
+  // Srt/Vtt/Ass target converts through the decode path.
+  const SubtitleTextTarget target =
+      request.targets.empty() ? SubtitleTextTarget::Original
+                              : request.targets.front();
   const std::optional<std::string> inPath = localPathFor(request.source);
   if (!inPath.has_value()) {
     result.error = Error::make(ErrorCode::SourceUnavailable,
@@ -1164,11 +1298,17 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
                                "cannot open the source", "ffmpeg");
     return result;
   }
+  // The payload's track indices are SUBTITLE-stream ordinals (the
+  // inspected source's subtitles vector), not global stream indices.
   int subStream = -1;
+  int subOrdinal = 0;
   for (unsigned i = 0; i < in->nb_streams; ++i) {
     if (in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-      subStream = int(i);
-      break;
+      if (wantedTrack < 0 || subOrdinal == wantedTrack) {
+        subStream = int(i);
+        break;
+      }
+      ++subOrdinal;
     }
   }
   if (subStream < 0) {
@@ -1179,17 +1319,25 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
   }
   const AVCodecID cid = in->streams[subStream]->codecpar->codec_id;
 
-  // Copy path: native text formats whose packets ARE the file format.
+  // Copy path: Original target with a native text format whose packets ARE
+  // the file format.
   bool ok = false;
   int sidecarWriteRc = 0;
-  if (subtitleFileExtensionFor(cid) != nullptr) {
+  if (target == SubtitleTextTarget::Original &&
+      subtitleFileExtensionFor(cid) != nullptr) {
     ok = extractSubtitleStreamToFile(*inPath, subStream, params.outputPath,
                                      sidecarWriteRc);
   } else {
-    // Decode path: container-internal text (mov_text, ttml, ...) decodes
-    // to AVSubtitle text rects, written as SRT cues.
-    ok = decodeSubtitleStreamToSrt(in, subStream, params.outputPath,
-                                    params);
+    // Decode path: container-internal text (mov_text, ttml, ...) and
+    // explicit text targets decode to AVSubtitle text rects, written in
+    // the requested representation.
+    const SidecarTarget sidecar = target == SubtitleTextTarget::Vtt
+                                      ? SidecarTarget::Vtt
+                                  : target == SubtitleTextTarget::Ass
+                                      ? SidecarTarget::Ass
+                                      : SidecarTarget::Srt;
+    ok = decodeSubtitleStreamToSidecar(in, subStream, params.outputPath,
+                                       sidecar, params);
   }
   avformat_close_input(&in);
   if (!ok) {
@@ -1201,7 +1349,7 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
                                       params.outputPath);
     } else {
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           std::string("cannot extract subtitle codec ") +
               avcodec_get_name(cid) +
               " (bitmap formats need OCR, which is outside V1)",
@@ -1216,11 +1364,11 @@ ExecuteResult FfmpegExecutor::executeSubtitleExtract(
   return result;
 }
 
-ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
+ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params,
+                                         const ExecutionIntent &intent) {
   ExecuteResult result;
   initFfmpegLabel();
-  const std::optional<std::string> inPath =
-      localPathFor(params.request.source);
+  const std::optional<std::string> inPath = localPathFor(intent.source);
   if (!inPath.has_value()) {
     result.error = Error::make(ErrorCode::SourceUnavailable,
                                "unsupported source URI", "ffmpeg");
@@ -1256,29 +1404,36 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   // header, its encoded packet written right after it.
   AVPacket *coverPkt = nullptr;
   int coverOutIndex = -1;
-  // Explicit track selection (spec §9): keep only the selected audio
-  // stream; allTracks (and the default) keep every audio stream.
+  // Track selection (mandate §23): the intent's ordinals name the audio
+  // lanes that survive. Ordinals count INSPECTED audio tracks (the
+  // inspector skips streams whose codec is outside the catalog), matching
+  // how the request model identifies tracks.
   int audioOrdinal = 0;
-  const bool selectSingleAudioTrack =
-      params.request.audio.enabled &&
-      params.request.audio.sourceTrackIndex >= 0 &&
-      !params.request.audio.allTracks;
   for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
     const AVStream *inStream = cleanup.in->streams[i];
     const AVMediaType type = inStream->codecpar->codec_type;
     if (type == AVMEDIA_TYPE_AUDIO) {
-      ++audioOrdinal;
+      if (audioCodecFromAv(inStream->codecpar->codec_id).has_value()) {
+        ++audioOrdinal;
+      } else {
+        continue; // not an inspected lane; never a selection target
+      }
     }
-    const bool keepVideo = type == AVMEDIA_TYPE_VIDEO &&
-                           params.request.video.enabled;
-    const bool keepAudio = type == AVMEDIA_TYPE_AUDIO &&
-                           params.request.audio.enabled &&
-                           (!selectSingleAudioTrack ||
-                            audioOrdinal - 1 ==
-                                params.request.audio.sourceTrackIndex);
+    const bool keepVideo = type == AVMEDIA_TYPE_VIDEO && intent.wantsVideo;
+    bool keepAudio = false;
+    if (type == AVMEDIA_TYPE_AUDIO && intent.wantsAudio) {
+      if (intent.audioSourceOrdinals.empty() &&
+          !intent.replaceAudioUri.empty()) {
+        keepAudio = false; // replaced wholesale (transcode path serves it)
+      } else {
+        keepAudio = std::find(intent.audioSourceOrdinals.begin(),
+                              intent.audioSourceOrdinals.end(),
+                              audioOrdinal - 1) !=
+                    intent.audioSourceOrdinals.end();
+      }
+    }
     const bool keepSub = type == AVMEDIA_TYPE_SUBTITLE &&
-                         params.request.subtitles.policy ==
-                             SubtitlePolicy::Preserve;
+                         intent.subtitles.keepSubtitles;
     if (!keepVideo && !keepAudio && !keepSub) {
       continue;
     }
@@ -1315,27 +1470,27 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
     inIndexOfOut.push_back(int(i));
   }
 
-  // Metadata preservation (spec): container-level + per-stream tags copy
-  // through the remux unchanged. stripMetadata (advanced control) drops
-  // them instead.
-  if (!params.request.stripMetadata) {
-    av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
+  // Metadata (mandate §33): container-level + per-stream tags copy
+  // through the remux unchanged, then the familiar-field set/clear
+  // intentions apply on the container dictionary (the moral equivalent
+  // of the retired stripMetadata control is the all-Clear intention).
+  av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
+               AV_DICT_DONT_OVERWRITE);
+  for (std::size_t k = 0; k < inIndexOfOut.size() &&
+                           k < cleanup.out->nb_streams;
+       ++k) {
+    av_dict_copy(&cleanup.out->streams[k]->metadata,
+                 cleanup.in->streams[std::size_t(inIndexOfOut[k])]
+                     ->metadata,
                  AV_DICT_DONT_OVERWRITE);
-    for (std::size_t k = 0; k < inIndexOfOut.size() &&
-                             k < cleanup.out->nb_streams;
-         ++k) {
-      av_dict_copy(&cleanup.out->streams[k]->metadata,
-                   cleanup.in->streams[std::size_t(inIndexOfOut[k])]
-                       ->metadata,
-                   AV_DICT_DONT_OVERWRITE);
-    }
   }
+  applyMetadataIntention(&cleanup.out->metadata, intent.metadata);
 
   // External cover art (spec §10): attached before the header (the
   // single packet rides the codecpar extradata).
-  if (params.request.audio.coverArtUri.has_value()) {
+  if (intent.coverArtUri.has_value()) {
     const std::optional<std::string> coverPath =
-        localPathForUri(*params.request.audio.coverArtUri);
+        localPathForUri(*intent.coverArtUri);
     if (!coverPath.has_value()) {
       result.error = Error::make(ErrorCode::SourceUnavailable,
                                  "cover art URI is not a local path",
@@ -1393,8 +1548,8 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   // Trim window (spec §15/§16): seek to the keyframe at/before the start
   // (stream copy cannot re-time compressed data, so the output begins
   // there — the honest keyframe-snapped trim) and stop at the end gate.
-  const bool remuxTrimmed = params.request.trim.active();
-  if (remuxTrimmed && params.request.trim.startUs > 0) {
+  const bool remuxTrimmed = intent.trim.active();
+  if (remuxTrimmed && intent.trim.startUs > 0) {
     int seekStream = 0;
     for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
       if (cleanup.in->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -1403,7 +1558,7 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
       }
     }
     const std::int64_t target = av_rescale_q(
-        params.request.trim.startUs, AVRational{1, 1000000},
+        intent.trim.startUs, AVRational{1, 1000000},
         cleanup.in->streams[std::size_t(seekStream)]->time_base);
     if (avformat_seek_file(cleanup.in, seekStream, INT64_MIN, target,
                            INT64_MAX, AVSEEK_FLAG_BACKWARD) < 0) {
@@ -1418,7 +1573,7 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
       av_packet_unref(cleanup.packet);
       break;
     }
-    if (remuxTrimmed && params.request.trim.endUs >= 0) {
+    if (remuxTrimmed && intent.trim.endUs >= 0) {
       const AVStream *pktStream =
           cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
       const std::int64_t pktUs =
@@ -1426,7 +1581,7 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
               ? -1
               : av_rescale_q(cleanup.packet->pts, pktStream->time_base,
                              AVRational{1, 1000000});
-      if (pktUs >= 0 && pktUs >= params.request.trim.endUs) {
+      if (pktUs >= 0 && pktUs >= intent.trim.endUs) {
         av_packet_unref(cleanup.packet);
         break; // past the window: stream copy is done
       }
@@ -1485,19 +1640,9 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
         av_rescale_q(outPacket->duration, srcStream->time_base,
                      cleanup.out->streams[outIndex]->time_base);
     outPacket->pos = -1;
-    // Timing offset on preserved subtitle tracks (spec §14: adjust
-    // subtitle timing — applied, never silently ignored).
-    if (outPacket->pts != AV_NOPTS_VALUE &&
-        params.request.subtitles.timingOffsetMs != 0 &&
-        std::find(outIndexOfSub.begin(), outIndexOfSub.end(), outIndex) !=
-            outIndexOfSub.end()) {
-      outPacket->pts += av_rescale_q(
-          params.request.subtitles.timingOffsetMs, AVRational{1, 1000},
-          cleanup.out->streams[outIndex]->time_base);
-      if (outPacket->pts < 0) {
-        outPacket->pts = 0;
-      }
-    }
+    // Preserved subtitle cues ride through with their source timing (the
+    // v2 request model carries no per-track timing offset; the shift
+    // machinery stays available for burn-in material).
 
     const int writeRc = av_interleaved_write_frame(cleanup.out, outPacket);
     if (writeRc < 0) {
@@ -1543,19 +1688,19 @@ ExecuteResult FfmpegExecutor::executeRemux(const ExecuteParams &params) {
   return result;
 }
 
-ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
+ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params,
+                                             const ExecutionIntent &intent) {
   // Decide between the single-pass path (short jobs, exotic containers,
   // unknown duration) and the segmented path (long jobs: independently
   // finalized, validated, committed segments + assembly; resumable).
-  const ConversionRequest &request = params.request;
+  const Pipeline &pipeline = params.pipeline;
 
-  bool segmentable = request.video.enabled &&
-                     params.pipeline.videoStreamCopy == false;
+  bool segmentable = intent.wantsVideo && pipeline.videoStreamCopy == false;
   std::int64_t durationUs = 0;
   std::string inPathStr;
   if (segmentable) {
     // Cheap metadata-only open: the source duration decides.
-    if (const std::optional<std::string> inPath = localPathFor(request.source);
+    if (const std::optional<std::string> inPath = localPathFor(intent.source);
         inPath.has_value()) {
       inPathStr = *inPath;
       AVFormatContext *probe = nullptr;
@@ -1571,16 +1716,16 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
     }
     // Trim window: the SEGMENTABLE decision and the segment tiling use the
     // window length, not the whole source length.
-    if (request.trim.active() && durationUs > 0) {
+    if (intent.trim.active() && durationUs > 0) {
       const std::int64_t start =
-          std::min<std::int64_t>(std::max<std::int64_t>(request.trim.startUs, 0),
+          std::min<std::int64_t>(std::max<std::int64_t>(intent.trim.startUs, 0),
                                  durationUs);
-      const std::int64_t end = request.trim.endUs >= 0
-                                   ? std::min(request.trim.endUs, durationUs)
+      const std::int64_t end = intent.trim.endUs >= 0
+                                   ? std::min(intent.trim.endUs, durationUs)
                                    : durationUs;
       durationUs = std::max<std::int64_t>(end - start, 0);
     }
-    switch (params.pipeline.container) {
+    switch (pipeline.container) {
       case Container::Mp4:
       case Container::Mkv:
       case Container::WebM:
@@ -1599,35 +1744,35 @@ ExecuteResult FfmpegExecutor::executeTranscode(const ExecuteParams &params) {
       segmentable = false;
     }
   }
-  if (request.trim.active() && !segmentable) {
+  if (intent.trim.active() && !segmentable) {
     // Trimmed single-pass: honor the window directly. Timestamps stay on
     // the source timeline (matched-source-timestamp comparison, spec §20).
     // endUs < 0 (open-ended) passes the probed duration, or INT64_MAX
     // when unknown — executeTranscodeRange's packet gate stops at EOF
     // regardless.
     const std::int64_t start =
-        std::max<std::int64_t>(request.trim.startUs, 0);
-    const std::int64_t end = request.trim.endUs >= 0
-                                 ? request.trim.endUs
+        std::max<std::int64_t>(intent.trim.startUs, 0);
+    const std::int64_t end = intent.trim.endUs >= 0
+                                 ? intent.trim.endUs
                                  : (durationUs > 0 ? durationUs
                                                    : INT64_MAX);
-    return executeTranscodeRange(params, start, end, true);
+    return executeTranscodeRange(params, intent, start, end, true);
   }
   if (segmentable && !params.jobId.empty()) {
-    return executeTranscodeSegmented(params);
+    return executeTranscodeSegmented(params, intent);
   }
-  return executeTranscodeRange(params, 0, 0, false);
+  return executeTranscodeRange(params, intent, 0, 0, false);
 }
 
 ExecuteResult FfmpegExecutor::executeTranscodeRange(
-    const ExecuteParams &params, std::int64_t rangeStartUs,
-    std::int64_t rangeEndUs, bool rangeActive, bool isSegmentRun) {
+    const ExecuteParams &params, const ExecutionIntent &intent,
+    std::int64_t rangeStartUs, std::int64_t rangeEndUs, bool rangeActive,
+    bool isSegmentRun) {
   ExecuteResult result;
   initFfmpegLabel();
-  const ConversionRequest &request = params.request;
   const Pipeline &pipeline = params.pipeline;
 
-  const std::optional<std::string> inPath = localPathFor(request.source);
+  const std::optional<std::string> inPath = localPathFor(intent.source);
   if (!inPath.has_value()) {
     result.error = Error::make(ErrorCode::SourceUnavailable,
                                "unsupported source URI", "ffmpeg");
@@ -1648,23 +1793,30 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
 
   int videoIn = -1;
   std::vector<int> audioStreams; // selected main-input audio streams
-  std::vector<int> audioOrdinals; // subtitle-free ordinal per selection
+  // Input stream indices of the INSPECTED audio tracks, in inspected
+  // order: MediaInfo ordinals skip streams whose codec is outside the
+  // Velmux catalog (mirroring the inspector's construction), so a
+  // request-side ordinal maps through this list, not the raw stream list.
+  std::vector<int> inspectedAudioStreams;
   for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
     const AVMediaType type = cleanup.in->streams[i]->codecpar->codec_type;
     if (type == AVMEDIA_TYPE_VIDEO && videoIn < 0) {
       videoIn = int(i);
-    } else if (type == AVMEDIA_TYPE_AUDIO) {
-      audioOrdinals.push_back(int(i));
+    } else if (type == AVMEDIA_TYPE_AUDIO &&
+               audioCodecFromAv(cleanup.in->streams[i]->codecpar->codec_id)
+                   .has_value()) {
+      inspectedAudioStreams.push_back(int(i));
     }
   }
-  // Track selection policy (spec §9): replacement audio wins; allTracks
-  // selects every audio stream; an explicit index selects that track;
-  // otherwise the first.
+  // Track selection policy (mandate §23): the replacement wins (the main
+  // input's audio is ignored); otherwise the intent's ordinals name the
+  // retained main-input lanes (empty = none survive); external additions
+  // open their own inputs below and ride as extra lanes.
   const std::optional<std::string> replacePath =
-      request.audio.enabled && request.audio.replaceAudioUri.has_value()
-          ? localPathForUri(*request.audio.replaceAudioUri)
+      intent.wantsAudio && !intent.replaceAudioUri.empty()
+          ? localPathForUri(intent.replaceAudioUri)
           : std::nullopt;
-  if (request.audio.enabled && replacePath.has_value()) {
+  if (intent.wantsAudio && replacePath.has_value()) {
     // Replacement input: opened here, its first audio stream feeds the
     // (single) audio pipeline. The main input's audio is ignored.
     if (avformat_open_input(&cleanup.audioReplaceIn, replacePath->c_str(),
@@ -1696,13 +1848,39 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       return result;
     }
     audioStreams.push_back(-1); // marker: the replacement input's track
-  } else if (request.audio.enabled && request.audio.allTracks) {
-    audioStreams = audioOrdinals;
-  } else if (request.audio.enabled && !audioOrdinals.empty()) {
-    const int pick = request.audio.sourceTrackIndex >= 0
-                         ? request.audio.sourceTrackIndex
-                         : 0;
-    audioStreams.push_back(audioOrdinals[std::size_t(pick)]);
+  } else if (intent.wantsAudio) {
+    // Request ordinals are inspected-track ordinals; map them to stream
+    // indices. Out-of-range ordinals were already refused by the builder.
+    for (std::int32_t ordinal : intent.audioSourceOrdinals) {
+      if (ordinal >= 0 && ordinal < std::int32_t(inspectedAudioStreams.size())) {
+        audioStreams.push_back(inspectedAudioStreams[std::size_t(ordinal)]);
+      }
+    }
+  }
+  // External additions (mandate §23): each URI opens its own input; its
+  // first audio stream becomes an extra processing lane aligned with the
+  // output timeline (the intent builder refuses additions on stream-copy
+  // pipelines, so these always re-encode).
+  for (const std::string &uri : intent.externalAudioUris) {
+    const std::optional<std::string> extPath = localPathForUri(uri);
+    if (!extPath.has_value()) {
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "external audio URI is not a local path",
+                                 "ffmpeg");
+      return result;
+    }
+    AVFormatContext *extIn = nullptr;
+    if (avformat_open_input(&extIn, extPath->c_str(), nullptr, nullptr) != 0 ||
+        avformat_find_stream_info(extIn, nullptr) < 0) {
+      if (extIn != nullptr) {
+        avformat_close_input(&extIn);
+      }
+      result.error = Error::make(ErrorCode::SourceUnavailable,
+                                 "cannot open the external audio file",
+                                 "ffmpeg");
+      return result;
+    }
+    cleanup.externalAudioIns.push_back(extIn);
   }
 
   // Range playback: seek to the keyframe at/before the range start; decoded
@@ -1720,8 +1898,24 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                                  "ffmpeg");
       return result;
     }
-    // The replacement input keeps its own timeline: seek it too so
+    // External inputs keep their own timelines: seek them too so
     // segmented runs do not re-read from zero every segment.
+    for (AVFormatContext *extIn : cleanup.externalAudioIns) {
+      int extAudio = -1;
+      for (unsigned i = 0; i < extIn->nb_streams; ++i) {
+        if (extIn->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+          extAudio = int(i);
+          break;
+        }
+      }
+      if (extAudio >= 0) {
+        const std::int64_t extTarget = av_rescale_q(
+            rangeStartUs, AVRational{1, 1000000},
+            extIn->streams[std::size_t(extAudio)]->time_base);
+        avformat_seek_file(extIn, extAudio, INT64_MIN, extTarget, INT64_MAX,
+                           AVSEEK_FLAG_BACKWARD);
+      }
+    }
     if (cleanup.audioReplaceIn != nullptr) {
       int repAudio = -1;
       for (unsigned i = 0; i < cleanup.audioReplaceIn->nb_streams; ++i) {
@@ -1797,16 +1991,17 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   double outFrameDurUs = 0.0;
   double fpsNextOutUs = 0.0;
   double srcFrameDurUs = 33333.0; // 30 fps fallback when unknown
-  // HDR -> SDR tone mapping (spec §9): decided after the decoder and
-  // encoder exist; drives the colorspace filter in the video graph.
+  // HDR -> SDR tone mapping (mandate §25 hdrToSdr): decided after the
+  // decoder and encoder exist; drives the zscale/tonemap chain in the
+  // video graph (real conversion, never tag removal).
   bool toneMap = false;
-  if (videoIn >= 0 && request.video.enabled) {
+  if (videoIn >= 0 && intent.wantsVideo) {
     const AVStream *inVideo = cleanup.in->streams[videoIn];
     const AVCodec *decCodec =
         avcodec_find_decoder(inVideo->codecpar->codec_id);
     if (decCodec == nullptr) {
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           std::string("no FFmpeg decoder for input video codec: ") +
               avcodec_get_name(inVideo->codecpar->codec_id),
           "ffmpeg");
@@ -1843,7 +2038,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
     if (encCodec == nullptr) {
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           std::string("no FFmpeg encoder for output video codec: ") +
               codecName(pipeline.videoCodec),
           "ffmpeg");
@@ -1856,16 +2051,16 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     // (odd multiples of 90 swap width/height); scale fits inside the
     // transformed rectangle preserving aspect.
     const bool wantsCrop =
-        request.video.crop.has_value() && request.video.crop->active();
-    const bool wantsRotation = request.video.rotationDegrees == 90 ||
-                               request.video.rotationDegrees == 270;
+        intent.video.crop.has_value() && intent.video.crop->active();
+    const bool wantsRotation = intent.video.rotationDegrees == 90 ||
+                               intent.video.rotationDegrees == 270;
     std::int32_t baseH = cleanup.videoDec->height;
     std::int32_t baseW = cleanup.videoDec->width;
     if (wantsCrop) {
       // The crop rectangle must fit entirely inside the source frame:
       // silently clamping a user rect to the overlap would produce a
       // different crop than requested (mangling, not tolerance).
-      const CropRect &crop = *request.video.crop;
+      const CropRect &crop = *intent.video.crop;
       const bool cropValid =
           crop.x >= 0 && crop.y >= 0 &&
           crop.x + crop.width <= cleanup.videoDec->width &&
@@ -1883,7 +2078,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     if (wantsRotation) {
       std::swap(baseW, baseH);
     }
-    std::int32_t outH2 = request.video.resolutionHeight.value_or(baseH);
+    std::int32_t outH2 = intent.video.resolutionHeight.value_or(baseH);
     if (baseH > 0) {
       outH2 = std::min(outH2, baseH);
     }
@@ -1899,10 +2094,10 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     // Frame-rate conversion (spec §9): a requested output rate re-times
     // the video onto a constant output grid (duplication/dropping in the
     // frame loop below); the encoder carries the OUTPUT rate.
-    fpsConvert = request.video.frameRate.has_value() &&
-                 *request.video.frameRate > 0.0 &&
-                 *request.video.frameRate < 1000.0;
-    outFps = fpsConvert ? *request.video.frameRate : 0.0;
+    fpsConvert = intent.video.frameRate.has_value() &&
+                 *intent.video.frameRate > 0.0 &&
+                 *intent.video.frameRate < 1000.0;
+    outFps = fpsConvert ? *intent.video.frameRate : 0.0;
     if (fpsConvert) {
       outFrameDurUs = 1000000.0 / outFps;
     }
@@ -1923,132 +2118,75 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       cleanup.videoEnc->framerate = AVRational{30, 1};
       cleanup.videoEnc->time_base = AVRational{1, 30};
     }
+    // Playback speed (mandate §25) compresses frame timestamps by 1/speed,
+    // so the effective output frame rate is fps * speed. The encoder rate
+    // and time base must reflect that: with the source rate kept, two
+    // re-timed frames collide on one time-base tick (non-monotonic pts)
+    // and the muxer rejects the stream.
+    if (intent.video.playbackSpeed.has_value() &&
+        *intent.video.playbackSpeed > 0.0 &&
+        *intent.video.playbackSpeed != 1.0) {
+      const double effectiveFps =
+          av_q2d(cleanup.videoEnc->framerate) * *intent.video.playbackSpeed;
+      if (effectiveFps > 0.0 && effectiveFps < 1000.0) {
+        cleanup.videoEnc->framerate = av_d2q(effectiveFps, 1001000);
+        cleanup.videoEnc->time_base = av_inv_q(cleanup.videoEnc->framerate);
+      }
+    }
     cleanup.videoEnc->pix_fmt = AV_PIX_FMT_YUV420P;
-    // ---- Advanced encoder controls (spec §18) ------------------------------
-    // Pixel format: verify the concrete encoder accepts it before opening
-    // (honest refusal, never a silent fallback to 4:2:0 8-bit).
-    if (request.video.pixelFormat.has_value()) {
-      const AVPixelFormat wanted = avPixFmtFor(*request.video.pixelFormat);
-      if (wanted == AV_PIX_FMT_NONE) {
-        result.error = Error::make(ErrorCode::InvalidArgument,
-                                   "unknown output pixel format", "ffmpeg");
-        return result;
-      }
-      bool supported = false;
-      if (encCodec->pix_fmts != nullptr) {
-        for (int i = 0; encCodec->pix_fmts[i] != AV_PIX_FMT_NONE; ++i) {
-          if (encCodec->pix_fmts[i] == wanted) {
-            supported = true;
-            break;
-          }
-        }
-      }
-      if (!supported) {
-        result.error = Error::make(
-            ErrorCode::UnsupportedFeature,
-            std::string("encoder ") + encCodec->name +
-                " does not support pixel format " +
-                pixelFormatName(*request.video.pixelFormat),
-            "ffmpeg");
-        return result;
-      }
-      cleanup.videoEnc->pix_fmt = wanted;
-    }
-    // Profile: codec-specific FF_PROFILE values. Unknown names are request
-    // errors, never silently ignored.
-    if (request.video.profile.has_value()) {
-      const int profile =
-          ffmpegProfileFor(pipeline.videoCodec, *request.video.profile);
-      if (profile < 0) {
-        result.error = Error::make(
-            ErrorCode::InvalidArgument,
-            "unknown or inapplicable profile \"" + *request.video.profile +
-                "\" for codec " + codecName(pipeline.videoCodec),
-            "ffmpeg");
-        return result;
-      }
-      cleanup.videoEnc->profile = profile;
-    }
-    // Level: libx264 takes the level as a private option ("4.0", "31", ...);
-    // the generic form is the numeric level_idc (major*10 + minor).
-    if (request.video.level.has_value()) {
-      const std::string &levelStr = *request.video.level;
-      bool applied = false;
-      if (std::string(encCodec->name) == "libx264") {
-        applied = av_opt_set(cleanup.videoEnc->priv_data, "level",
-                             levelStr.c_str(), 0) >= 0;
-      }
-      if (!applied) {
-        double levelNum = 0.0;
-        if (std::sscanf(levelStr.c_str(), "%lf", &levelNum) == 1 &&
-            levelNum > 0.0 && levelNum < 100.0) {
-          cleanup.videoEnc->level = int(levelNum * 10.0 + 0.5);
-          applied = true;
-        }
-      }
-      if (!applied) {
-        result.error = Error::make(
-            ErrorCode::InvalidArgument,
-            "cannot parse level \"" + levelStr + "\"", "ffmpeg");
-        return result;
-      }
-    }
-    // GOP size and B-frame count (advanced controls, spec §18).
-    if (request.video.gopSize.has_value()) {
-      cleanup.videoEnc->gop_size = *request.video.gopSize;
-    }
-    if (request.video.bFrames.has_value()) {
-      cleanup.videoEnc->max_b_frames = *request.video.bFrames;
-    }
-    // ---- HDR handling (spec §9) ---------------------------------------------
+    // ---- HDR handling (mandate §25 hdrToSdr) -----------------------------
     // Source HDR signal from the decoder context (tagging authority: the
     // demuxer fills codecpar, avcodec_parameters_to_context carried it).
     const bool sourceHdr =
         cleanup.videoDec->color_trc == AVCOL_TRC_SMPTE2084 ||
         cleanup.videoDec->color_trc == AVCOL_TRC_ARIB_STD_B67 ||
         cleanup.videoDec->color_primaries == AVCOL_PRI_BT2020;
-    // Tone-map decision: the pinned build has NO PQ/HLG-capable converter
-    // (the colorspace filter only handles SDR gamma curves and the tonemap
-    // filter needs float pixels that only zscale produces — libzimg is not
-    // wired yet), so a tone-map would always fail the filter graph at
-    // config time. The capability is reported false (planner refuses
-    // explicit ToneMapToSdr) and this path refuses the AUTO case honestly
-    // instead of encoding PQ pixels unconverted (washed-out output).
-    const bool outputCanCarryHdr =
-        cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV420P10LE ||
-        cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV422P10LE ||
-        cleanup.videoEnc->pix_fmt == AV_PIX_FMT_YUV444P10LE;
-    if (sourceHdr && !pipeline.videoStreamCopy && !outputCanCarryHdr) {
+    if (sourceHdr && intent.video.hdrToSdr) {
+      // Genuine HDR -> SDR tone mapping through the real zscale/tonemap
+      // filter chain (libzimg present in this build; capabilities() only
+      // reports hdrToneMapping after probing both filters).
+      toneMap = true;
+    } else if (sourceHdr && !pipeline.videoStreamCopy) {
+      // Preservation was requested but this 8-bit path cannot carry HDR
+      // honestly: refuse instead of encoding PQ/HLG pixels unconverted
+      // (washed-out output). Stream copy keeps the bitstream intact.
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
-          "HDR to SDR tone mapping is not available in this build; keep an "
-          "HDR-capable output (10-bit / stream copy) or preserve HDR in a "
-          "compatible container",
+          ErrorCode::UnsupportedOperation,
+          "this HDR source cannot be preserved through an 8-bit "
+          "re-encode; enable HDR to SDR conversion or keep a stream-copy "
+          "route",
           "ffmpeg");
       return result;
     }
-    if (sourceHdr) {
-      // Preserve the source HDR signaling on the output stream (10-bit
-      // outputs carry PQ/HLG honestly).
+    if (sourceHdr && !toneMap) {
+      // Preserve the source HDR signaling on the output stream (only the
+      // stream-copy path reaches here).
       cleanup.videoEnc->color_primaries = cleanup.videoDec->color_primaries;
       cleanup.videoEnc->color_trc = cleanup.videoDec->color_trc;
       cleanup.videoEnc->colorspace = cleanup.videoDec->colorspace;
       cleanup.videoEnc->color_range = cleanup.videoDec->color_range;
     }
+    if (toneMap) {
+      // The converted output is SDR BT.709 by construction; tag it
+      // honestly so downstream consumers read the right colorimetry.
+      cleanup.videoEnc->color_primaries = AVCOL_PRI_BT709;
+      cleanup.videoEnc->color_trc = AVCOL_TRC_BT709;
+      cleanup.videoEnc->colorspace = AVCOL_SPC_BT709;
+      cleanup.videoEnc->color_range = AVCOL_RANGE_MPEG; // TV/narrow
+    }
     if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
       cleanup.videoEnc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
-    if (request.video.rateControl == RateControl::Bitrate &&
-        request.video.bitRate.has_value()) {
-      cleanup.videoEnc->bit_rate = *request.video.bitRate;
-      cleanup.videoEnc->rc_max_rate = *request.video.bitRate;
-      cleanup.videoEnc->rc_buffer_size = *request.video.bitRate * 2;
+    // Resolved rate control (mandate §20): the intent carries the policy
+    // the compression derivation produced (bitrate budget or quality
+    // scale).
+    if (intent.rate.bitrateMode && intent.rate.bitRate > 0) {
+      cleanup.videoEnc->bit_rate = intent.rate.bitRate;
+      cleanup.videoEnc->rc_max_rate = intent.rate.bitRate;
+      cleanup.videoEnc->rc_buffer_size = intent.rate.bitRate * 2;
     } else {
-      // Quality-driven (CRF-style): explicit quality or goal-derived.
-      const std::int32_t qualityPct =
-          request.video.quality.has_value()
-              ? *request.video.quality
-              : std::int32_t(qualityFactorForGoal(request.goal.kind) * 100.0);
+      // Quality-driven (CRF-style).
+      const std::int32_t qualityPct = intent.rate.quality;
       const int crf = qualityToCrf(pipeline.videoCodec, qualityPct);
       av_opt_set(cleanup.videoEnc->priv_data, "crf",
                  std::to_string(crf).c_str(), 0);
@@ -2068,22 +2206,25 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     outVideo->time_base = cleanup.videoEnc->time_base;
 
     // Unified video filter graph: burn-in rendering AND/OR geometry
-    // transforms (crop -> rotation -> flips -> scale -> [subtitles]).
-    const bool wantsBurnIn =
-        request.subtitles.policy == SubtitlePolicy::BurnIn;
+    // transforms AND/OR timing transforms AND/OR tone mapping
+    // (crop -> rotation -> flips -> scale -> [speed] -> [reverse] ->
+    //  [subtitles]).
+    const bool wantsBurnIn = intent.subtitles.burnIn;
     const bool wantsTransform =
-        wantsCrop || request.video.rotationDegrees != 0 ||
-        request.video.flipHorizontal || request.video.flipVertical;
-    if (wantsBurnIn || wantsTransform || toneMap) {
-      // Resolve the burn-in source: explicit external file, else the first
-      // embedded subtitle stream.
+        wantsCrop || intent.video.rotationDegrees != 0 ||
+        intent.video.flipHorizontal || intent.video.flipVertical;
+    const bool wantsTiming = intent.video.playbackSpeed.has_value() ||
+                             intent.video.reverse;
+    if (wantsBurnIn || wantsTransform || wantsTiming || toneMap) {
+      // Resolve the burn-in source: explicit external file, else the
+      // selected embedded subtitle stream (default: the first).
       std::string subPath;
       int subGlobalIndex = -1; // stream index in the input container
       int subOrdinal = -1;     // subtitle-stream ordinal (the filter's `si`)
       if (wantsBurnIn) {
-      if (request.subtitles.externalUri.has_value()) {
+      if (!intent.subtitles.burnInExternal.empty()) {
         const std::optional<std::string> ext =
-            localPathForUri(*request.subtitles.externalUri);
+            localPathForUri(intent.subtitles.burnInExternal);
         if (!ext.has_value()) {
           result.error = Error::make(ErrorCode::SourceUnavailable,
                                      "external subtitle URI is not a local path",
@@ -2092,11 +2233,18 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         }
         subPath = *ext;
       } else {
+        // The burn-in track is an inspected subtitle ordinal (-1 = first).
+        int wantedSubOrdinal = intent.subtitles.burnInTrack;
+        int seenSubs = 0;
         for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
           if (cleanup.in->streams[i]->codecpar->codec_type ==
               AVMEDIA_TYPE_SUBTITLE) {
-            subGlobalIndex = int(i);
-            break;
+            if (wantedSubOrdinal < 0 || seenSubs == wantedSubOrdinal) {
+              subGlobalIndex = int(i);
+              subOrdinal = seenSubs;
+              break;
+            }
+            ++seenSubs;
           }
         }
         if (subGlobalIndex < 0) {
@@ -2108,15 +2256,6 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           return result;
         }
         subPath = *inPath;
-        // The subtitles filter's `si` option counts SUBTITLE streams only:
-        // convert the global stream index into its subtitle ordinal.
-        for (int s = 0; s < subGlobalIndex; ++s) {
-          if (cleanup.in->streams[s]->codecpar->codec_type ==
-              AVMEDIA_TYPE_SUBTITLE) {
-            ++subOrdinal;
-          }
-        }
-        ++subOrdinal; // this stream is the (ordinal+1)-th subtitle stream
       }
       } // wantsBurnIn (subtitle source resolution)
 
@@ -2146,7 +2285,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         if (isBitmapSubtitleCodec(subCodecId)) {
           if (wantsTransform) {
             result.error = Error::make(
-                ErrorCode::UnsupportedFeature,
+                ErrorCode::UnsupportedOperation,
                 "bitmap subtitle burn-in cannot be combined with crop/"
                 "rotation/flip in V1 (cue positions are authored for the "
                 "source frame)",
@@ -2155,19 +2294,19 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           }
           if (toneMap) {
             result.error = Error::make(
-                ErrorCode::UnsupportedFeature,
+                ErrorCode::UnsupportedOperation,
                 "bitmap subtitle burn-in cannot be combined with HDR->SDR "
                 "tone mapping in V1 (the overlay graph composites 8-bit "
                 "SDR cues)",
                 "ffmpeg");
             return result;
           }
-          if (request.video.pixelFormat.has_value() &&
-              *request.video.pixelFormat != core::PixelFormat::Yuv420P) {
+          if (wantsTiming) {
             result.error = Error::make(
-                ErrorCode::UnsupportedFeature,
-                "bitmap subtitle burn-in requires 8-bit 4:2:0 output in V1 "
-                "(the overlay graph composites yuv420 cues)",
+                ErrorCode::UnsupportedOperation,
+                "bitmap subtitle burn-in cannot be combined with playback "
+                "speed or reverse in V1 (cue timing is authored for the "
+                "source timeline)",
                 "ffmpeg");
             return result;
           }
@@ -2181,9 +2320,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                   : 0;
           if (!loader.load(subPath, cleanup.videoDec->width,
                            cleanup.videoDec->height, outW, outH, durationUs,
-                           request.subtitles.timingOffsetMs, cueReason)) {
+                           0, cueReason)) {
             result.error = Error::make(
-                ErrorCode::UnsupportedFeature,
+                ErrorCode::UnsupportedOperation,
                 "bitmap burn-in failed: " + cueReason, "ffmpeg");
             return result;
           }
@@ -2193,7 +2332,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           }
         } else if (!isBurnableSubtitleCodec(subCodecId)) {
           result.error = Error::make(
-              ErrorCode::UnsupportedFeature,
+              ErrorCode::UnsupportedOperation,
               std::string("burn-in of subtitle format ") +
                   avcodec_get_name(subCodecId) + " is not supported",
               "ffmpeg");
@@ -2201,74 +2340,11 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         }
       }
 
-      // Timing offset: materialize a shifted copy before rendering
-      // (spec §14: adjust subtitle timing — never silently ignored).
-      // Bitmap cues took the offset inside the loader.
-      if (wantsBurnIn && !bitmapBurn &&
-          request.subtitles.timingOffsetMs != 0) {
-        const std::filesystem::path outFs(params.outputPath);
-        const std::string stem = outFs.stem().string();
-        if (subGlobalIndex >= 0) {
-          const AVCodecID subCodec =
-              cleanup.in->streams[subGlobalIndex]->codecpar->codec_id;
-          const char *ext = subtitleFileExtensionFor(subCodec);
-          if (ext == nullptr) {
-            result.error = Error::make(
-                ErrorCode::UnsupportedFeature,
-                "a timing offset cannot be applied to this embedded subtitle "
-                "codec yet",
-                "ffmpeg");
-            return result;
-          }
-          const std::string extracted =
-              (outFs.parent_path() / ("." + stem + "-subs" + ext)).string();
-          int subsWriteRc = 0;
-          if (!extractSubtitleStreamToFile(*inPath, subGlobalIndex,
-                                           extracted, subsWriteRc)) {
-            result.error =
-                subsWriteRc != 0
-                    ? outputWriteError(subsWriteRc,
-                                       "cannot write the timing-offset "
-                                       "subtitle artifact",
-                                       extracted)
-                    : Error::make(ErrorCode::ExecutionFailed,
-                                  "cannot extract the embedded subtitle "
-                                  "stream for timing adjustment",
-                                  "ffmpeg");
-            return result;
-          }
-          cleanup.tempFiles.push_back(extracted);
-          subPath = extracted;
-          subGlobalIndex = -1; // now a standalone file
-          subOrdinal = -1;
-        }
-        auto subExtOf = [](const std::string &p) {
-          const auto dot = p.rfind('.');
-          return dot == std::string::npos ? std::string(".srt")
-                                          : p.substr(dot);
-        };
-        const std::string shifted =
-            (outFs.parent_path() / ("." + stem + "-shifted" + subExtOf(subPath)))
-                .string();
-        std::string shiftReason;
-        if (!subtitles::shiftSubtitleFile(
-                subPath, shifted, request.subtitles.timingOffsetMs,
-                shiftReason)) {
-          result.error = Error::make(
-              ErrorCode::UnsupportedFeature,
-              "cannot apply the subtitle timing offset: " + shiftReason,
-              "ffmpeg");
-          return result;
-        }
-        cleanup.tempFiles.push_back(shifted);
-        subPath = shifted;
-      }
-
       const FontSource fontSource = wantsBurnIn ? findFontSource()
                                                 : FontSource{};
       if (wantsBurnIn && fontSource.dir.empty()) {
         result.error = Error::make(
-            ErrorCode::UnsupportedFeature,
+            ErrorCode::UnsupportedOperation,
             "no fonts directory found for subtitle rendering "
             "(set VELMUX_FONTS_DIR)",
             "ffmpeg");
@@ -2394,22 +2470,28 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
           return result;
         }
       } else {
-      // Graph description: crop -> rotation -> flips -> scale, then the
-      // subtitles filter when burning in. Order matters: crop uses
-      // source-frame coordinates; rotation swaps dimensions; the scale
-      // lands on the encoder's (transform-aware) target geometry.
+      // Graph description: [tone-map,] crop -> rotation -> flips -> scale
+      // -> [subtitles] -> [setpts speed] -> [reverse]. Order matters: crop
+      // uses source-frame coordinates; rotation swaps dimensions; the
+      // scale lands on the encoder's (transform-aware) target geometry;
+      // subtitles render on the SOURCE timeline (cues are authored there)
+      // before the timing transforms re-time the burned frames.
       std::string graphDesc;
-      // (HDR -> SDR tone mapping is not offered in this build — see the
-      // encoder-setup refusal above; HDR preservation via copy/10-bit is
-      // handled without a filter.)
+      if (toneMap) {
+        // HDR -> SDR (mandate §25): the real zscale/tonemap chain (libzimg).
+        graphDesc +=
+            "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+            "tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,"
+            "format=yuv420p,";
+      }
       if (wantsCrop) {
-        const CropRect &crop = *request.video.crop;
+        const CropRect &crop = *intent.video.crop;
         graphDesc += "crop=w=" + std::to_string(baseW) +
                      ":h=" + std::to_string(baseH) +
                      ":x=" + std::to_string(crop.x) +
                      ":y=" + std::to_string(crop.y) + ",";
       }
-      switch (request.video.rotationDegrees) {
+      switch (intent.video.rotationDegrees) {
         case 90:
           graphDesc += "transpose=1,";
           break;
@@ -2422,10 +2504,10 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         default:
           break;
       }
-      if (request.video.flipHorizontal) {
+      if (intent.video.flipHorizontal) {
         graphDesc += "hflip,";
       }
-      if (request.video.flipVertical) {
+      if (intent.video.flipVertical) {
         graphDesc += "vflip,";
       }
       graphDesc +=
@@ -2436,6 +2518,30 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         if (subOrdinal >= 0) {
           graphDesc += ":si=" + std::to_string(subOrdinal);
         }
+      }
+      // Timing transforms (mandate §25): playback speed re-times the
+      // burned/scaled frames (setpts=PTS/speed); reverse flips the
+      // presentation order (whole-stream buffering, real filter).
+      // Filters are comma-separated: a leading separator is required
+      // whenever the graph does not already end on one.
+      const auto appendFilter = [&graphDesc](const char *filter) {
+        if (!graphDesc.empty() && graphDesc.back() != ',') {
+          graphDesc += ',';
+        }
+        graphDesc += filter;
+      };
+      if (intent.video.playbackSpeed.has_value() &&
+          *intent.video.playbackSpeed > 0.0) {
+        char speedBuf[64];
+        std::snprintf(speedBuf, sizeof(speedBuf), "setpts=PTS/%.4f",
+                      *intent.video.playbackSpeed);
+        appendFilter(speedBuf);
+      }
+      if (intent.video.reverse) {
+        appendFilter("reverse");
+      }
+      if (!graphDesc.empty() && graphDesc.back() == ',') {
+        graphDesc.pop_back();
       }
       // SRT-like sources render with libass's default style (family
       // "Arial"), which never matches the fontsdir contents on a provider-
@@ -2453,9 +2559,49 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                    subPath.compare(subPath.size() - 4, 4, ".ssa") == 0 ||
                    subPath.compare(subPath.size() - 4, 4, ".ASS") == 0 ||
                    subPath.compare(subPath.size() - 4, 4, ".SSA") == 0)));
-      if (subIsAss == false && wantsBurnIn && !fontSource.family.empty()) {
-        graphDesc += ":force_style='FontName=" +
-                     escapeFilterPath(fontSource.family) + "'";
+      // Burn-in appearance (mandate §24): force_style carries the font
+      // family, size, color and vertical position. SRT-like sources need
+      // the family redirected to the discovered font (libass defaults to
+      // "Arial", which provider-less static builds cannot match); ASS/SSA
+      // keep their authored styling, but explicit appearance fields still
+      // override (the user asked for them).
+      if (wantsBurnIn) {
+        std::string style;
+        if (subIsAss == false && !fontSource.family.empty()) {
+          style += "FontName=" + escapeFilterPath(fontSource.family);
+        }
+        if (intent.subtitles.fontSize.has_value()) {
+          if (!style.empty()) {
+            style += ",";
+          }
+          style += "FontSize=" + std::to_string(*intent.subtitles.fontSize);
+        }
+        if (intent.subtitles.color.has_value() &&
+            intent.subtitles.color->size() == 7 &&
+            (*intent.subtitles.color)[0] == '#') {
+          // "#RRGGBB" -> ASS PrimaryColour &H00BBGGRR (BGR order).
+          const std::string &hex = *intent.subtitles.color;
+          if (!style.empty()) {
+            style += ",";
+          }
+          style += "PrimaryColour=&H00" + hex.substr(5, 2) + hex.substr(3, 2) +
+                   hex.substr(1, 2);
+        }
+        if (intent.subtitles.position.has_value()) {
+          // 0..100 vertical position -> ASS numpad alignment bands
+          // (bottom / middle / top, centered).
+          const std::int32_t alignment =
+              *intent.subtitles.position < 33
+                  ? 2
+                  : *intent.subtitles.position <= 66 ? 5 : 8;
+          if (!style.empty()) {
+            style += ",";
+          }
+          style += "Alignment=" + std::to_string(alignment);
+        }
+        if (!style.empty()) {
+          graphDesc += ":force_style='" + style + "'";
+        }
       }
       AVFilterInOut *outputs = avfilter_inout_alloc();
       AVFilterInOut *inputs = avfilter_inout_alloc();
@@ -2512,20 +2658,36 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
 
   // ---- Audio setup (multi-track, spec §9) -----------------------------------
   // One pipeline per selected audio stream (selection happened above:
-  // replacement audio / allTracks / explicit index / first). Stream-copy
+  // replacement audio / kept ordinals / external additions). Stream-copy
   // lanes pass packets straight to the output stream; processing lanes
   // decode, run the DSP chain, resample and encode.
+  // The DSP chain runs when the operation carries audio adjustments, or
+  // when the VIDEO operation's timing transforms need the audio timeline
+  // to follow (atempo for playback speed, areverse for reverse).
+  const bool audioSpeedWanted =
+      (intent.audioDsp.has_value() &&
+       intent.audioDsp->playbackSpeed.has_value()) ||
+      intent.video.playbackSpeed.has_value();
+  const bool audioReverseWanted =
+      (intent.audioDsp.has_value() && intent.audioDsp->reverse) ||
+      intent.video.reverse;
   const bool wantsAudioDspChain =
-      request.audio.gainDb.has_value() ||
-      request.audio.fadeInMs.has_value() ||
-      request.audio.fadeOutMs.has_value() ||
-      request.audio.normalizeLoudness ||
-      request.audio.playbackSpeed.has_value() ||
-      request.audio.removeSilence;
-  for (const int aIn : audioStreams) {
+      audioSpeedWanted || audioReverseWanted ||
+      (intent.audioDsp.has_value() &&
+       (intent.audioDsp->gainDb.has_value() ||
+        intent.audioDsp->fadeInMs.has_value() ||
+        intent.audioDsp->fadeOutMs.has_value() ||
+        intent.audioDsp->normalize || intent.audioDsp->removeSilence));
+  // The per-lane setup, shared by main-input, replacement and addition
+  // lanes (the addition inputs are appended after the main selection).
+  std::vector<int> setupAudioStreams = audioStreams;
+  for (std::size_t e = 0; e < cleanup.externalAudioIns.size(); ++e) {
+    setupAudioStreams.push_back(-2 - int(e)); // addition-input marker
+  }
+  for (const int aIn : setupAudioStreams) {
     cleanup.audio.emplace_back();
     AudioTrack &track = cleanup.audio.back();
-    if (aIn < 0) {
+    if (aIn == -1) {
       // Replacement-input marker: its first audio stream.
       track.input = cleanup.audioReplaceIn;
       for (unsigned i = 0; i < cleanup.audioReplaceIn->nb_streams; ++i) {
@@ -2542,6 +2704,25 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         av_frame_free(&videoFrame);
         return result;
       }
+    } else if (aIn <= -2) {
+      // Addition-input marker: its first audio stream becomes an extra
+      // output track (aligned with the output timeline).
+      track.input =
+          cleanup.externalAudioIns[std::size_t(-2 - aIn)];
+      for (unsigned i = 0; i < track.input->nb_streams; ++i) {
+        if (track.input->streams[i]->codecpar->codec_type ==
+            AVMEDIA_TYPE_AUDIO) {
+          track.inStream = int(i);
+          break;
+        }
+      }
+      if (track.inStream < 0) {
+        result.error = Error::make(ErrorCode::InvalidArgument,
+                                   "the external audio has no track",
+                                   "ffmpeg");
+        av_frame_free(&videoFrame);
+        return result;
+      }
     } else {
       track.input = cleanup.in;
       track.inStream = aIn;
@@ -2550,13 +2731,16 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
 
     // Stream-copy lane (fixes the mixed transcode+audio-copy case: the
     // planner's "audio copy" promise is honored literally). Requirements
-    // mirror the planner's canStreamCopyAudio.
+    // mirror the planner's canStreamCopyAudio. Addition lanes never copy
+    // (their input codec is not the pipeline's source).
+    const bool additionLane = track.input != cleanup.in &&
+                              track.input != cleanup.audioReplaceIn;
     const bool copyable =
-        pipeline.audioStreamCopy && !wantsAudioDspChain &&
-        !request.audio.sampleRate.has_value() &&
-        !request.audio.channels.has_value() &&
-        !request.audio.bitRate.has_value() &&
-        !request.audio.pcmBitDepth.has_value() &&
+        pipeline.audioStreamCopy && !wantsAudioDspChain && !additionLane &&
+        !intent.audioSettings.sampleRate.has_value() &&
+        !intent.audioSettings.channels.has_value() &&
+        !intent.audioSettings.bitRate.has_value() &&
+        !intent.audioSettings.pcmBitDepth.has_value() &&
         inAudio->codecpar->codec_id == avCodecFor(pipeline.audioCodec);
     if (copyable) {
       track.copy = true;
@@ -2574,7 +2758,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         avcodec_find_decoder(inAudio->codecpar->codec_id);
     if (decCodec == nullptr) {
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           std::string("no FFmpeg decoder for input audio codec: ") +
               avcodec_get_name(inAudio->codecpar->codec_id),
           "ffmpeg");
@@ -2595,8 +2779,8 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     // PCM encoder variant; lossless codecs ignore it.
     std::string pcmOverride;
     if (pipeline.audioCodec == AudioCodec::Pcm &&
-        request.audio.pcmBitDepth.has_value()) {
-      switch (*request.audio.pcmBitDepth) {
+        intent.audioSettings.pcmBitDepth.has_value()) {
+      switch (*intent.audioSettings.pcmBitDepth) {
         case 24:
           pcmOverride = "pcm_s24le";
           break;
@@ -2618,7 +2802,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
     if (encCodec == nullptr) {
       result.error = Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           std::string("no FFmpeg encoder for output audio codec: ") +
               codecName(pipeline.audioCodec),
           "ffmpeg");
@@ -2627,7 +2811,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     }
     track.enc = avcodec_alloc_context3(encCodec);
     track.enc->sample_rate =
-        request.audio.sampleRate.value_or(track.dec->sample_rate);
+        intent.audioSettings.sampleRate.value_or(track.dec->sample_rate);
     if (track.enc->sample_rate <= 0) {
       track.enc->sample_rate = 48000;
     }
@@ -2655,7 +2839,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         track.enc->sample_rate = best;
       }
     }
-    const std::int32_t channels = request.audio.channels.value_or(
+    const std::int32_t channels = intent.audioSettings.channels.value_or(
         track.dec->ch_layout.nb_channels);
     av_channel_layout_default(&track.enc->ch_layout,
                               std::clamp(channels, 1, 8));
@@ -2674,7 +2858,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     const std::int64_t defaultAudioBitrate =
         track.dec->bit_rate > 0 ? track.dec->bit_rate : 128000;
     track.enc->bit_rate =
-        request.audio.bitRate.value_or(
+        intent.audioSettings.bitRate.value_or(
             std::clamp<std::int64_t>(defaultAudioBitrate, 64000, 320000));
     if (cleanup.out->oformat->flags & AVFMT_GLOBALHEADER) {
       track.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -2794,11 +2978,12 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
                  AV_OPT_SEARCH_CHILDREN);
 
       std::string desc;
-      if (request.audio.gainDb.has_value()) {
+      const auto dsp = intent.audioDsp; // copy: fields read below
+      if (dsp.has_value() && dsp->gainDb.has_value()) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "volume=volume=%.2fdB:"
                                         "precision=double,",
-                      *request.audio.gainDb);
+                      *dsp->gainDb);
         desc += buf;
       }
       // Total audio span for fade positioning (trim window or source).
@@ -2817,39 +3002,49 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
               ? double(rangeEndUs - rangeStartUs) / 1000000.0
               : spanSec;
       const bool firstWindow =
-          !rangeActive || rangeStartUs <= request.trim.startUs;
+          !rangeActive || rangeStartUs <= intent.trim.startUs;
       const bool lastWindow =
-          !rangeActive || request.trim.endUs < 0 ||
-          rangeEndUs >= request.trim.endUs;
-      if (request.audio.fadeInMs.has_value() && *request.audio.fadeInMs > 0 &&
-          firstWindow) {
+          !rangeActive || intent.trim.endUs < 0 ||
+          rangeEndUs >= intent.trim.endUs;
+      if (dsp.has_value() && dsp->fadeInMs.has_value() &&
+          *dsp->fadeInMs > 0 && firstWindow) {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "afade=t=in:st=0:d=%.3f,",
-                      double(*request.audio.fadeInMs) / 1000.0);
+                      double(*dsp->fadeInMs) / 1000.0);
         desc += buf;
       }
-      if (request.audio.fadeOutMs.has_value() && *request.audio.fadeOutMs > 0 &&
-          lastWindow && windowSec > 0.0) {
+      if (dsp.has_value() && dsp->fadeOutMs.has_value() &&
+          *dsp->fadeOutMs > 0 && lastWindow && windowSec > 0.0) {
         char buf[96];
         std::snprintf(buf, sizeof(buf),
                       "afade=t=out:st=%.3f:d=%.3f,",
                       std::max(0.0, windowSec -
-                                       double(*request.audio.fadeOutMs) /
+                                       double(*dsp->fadeOutMs) /
                                            1000.0),
-                      double(*request.audio.fadeOutMs) / 1000.0);
+                      double(*dsp->fadeOutMs) / 1000.0);
         desc += buf;
       }
-      if (request.audio.normalizeLoudness) {
+      if (dsp.has_value() && dsp->normalize) {
         desc += "loudnorm=I=-16:TP=-1.5:LRA=11,";
       }
-      if (request.audio.playbackSpeed.has_value() &&
-          *request.audio.playbackSpeed > 0.0) {
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "atempo=%.4f,",
-                      *request.audio.playbackSpeed);
-        desc += buf;
+      // Playback speed (mandate §25/§32): video operations carry the speed
+      // on the video adjustments; audio operations carry it on the audio
+      // adjustments. Pitch is preserved (atempo).
+      if (audioSpeedWanted) {
+        const double speed =
+            intent.video.playbackSpeed.has_value()
+                ? *intent.video.playbackSpeed
+                : dsp->playbackSpeed.value_or(1.0);
+        if (speed > 0.0) {
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "atempo=%.4f,", speed);
+          desc += buf;
+        }
       }
-      if (request.audio.removeSilence) {
+      if (audioReverseWanted) {
+        desc += "areverse,";
+      }
+      if (dsp.has_value() && dsp->removeSilence) {
         // Remove mid-stream silences longer than 100 ms below -45 dB,
         // keeping 50 ms of each for natural transitions.
         desc += "silenceremove=stop_periods=-1:stop_duration=0.1:"
@@ -2902,13 +3097,13 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   }
 
   // ---- Subtitle preservation during transcode ------------------------------
-  // The planner guarantees (Preserve) that every source subtitle track's
-  // codec is muxable into the target container, so the tracks are copied
-  // verbatim alongside the re-encoded A/V streams (spec §14: never
-  // silently discard subtitles during ordinary conversion).
+  // The planner guarantees (Preserve/Embed rules) that every preserved
+  // source subtitle track's codec is muxable into the target container, so
+  // the tracks are copied verbatim alongside the re-encoded A/V streams
+  // (spec §14: never silently discard subtitles during ordinary conversion).
   std::vector<int> subInOfOut;
   std::vector<int> subOutIndex;
-  if (request.subtitles.policy == SubtitlePolicy::Preserve) {
+  if (intent.subtitles.keepSubtitles) {
     for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
       const AVStream *st = cleanup.in->streams[i];
       if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
@@ -2926,15 +3121,14 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       subOutIndex.push_back(int(cleanup.out->nb_streams) - 1);
     }
   }
-  // Timing offset applied to preserved tracks, in output time base.
-  std::int64_t subOffsetOutUnits = 0;
-  if (!subInOfOut.empty() && request.subtitles.timingOffsetMs != 0) {
-    const AVRational outTb =
-        cleanup.out->streams[std::size_t(subOutIndex.front())]->time_base;
-    subOffsetOutUnits =
-        av_rescale_q(request.subtitles.timingOffsetMs, AVRational{1, 1000},
-                     outTb);
-  }
+  // Playback speed scales preserved subtitle timing (mandate §25: video,
+  // audio and subtitle timing stay consistent): cue pts are multiplied by
+  // 1/speed in the output time base when packets are written below.
+  const bool subSpeedScale = intent.video.playbackSpeed.has_value() &&
+                             intent.video.playbackSpeed > 0.0 &&
+                             *intent.video.playbackSpeed != 1.0;
+  const double subSpeedFactor =
+      subSpeedScale ? 1.0 / *intent.video.playbackSpeed : 1.0;
 
   // ---- Attached pictures / cover art (spec §10) ----------------------------
   // Attached pictures are metadata, not timeline content: preserved from
@@ -2943,7 +3137,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   // exactly one copy).
   std::vector<std::pair<int, int>> picInOut; // input idx -> output idx
   const bool picsIncluded = !isSegmentRun || rangeStartUs <= 0;
-  if (request.audio.preserveCoverArt && picsIncluded) {
+  if (intent.preserveCoverArt && picsIncluded) {
     for (unsigned i = 0; i < cleanup.in->nb_streams; ++i) {
       const AVStream *st = cleanup.in->streams[i];
       if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
@@ -2964,9 +3158,9 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
   // header, its encoded packet written right after it.
   AVPacket *coverPkt = nullptr;
   int coverOutIndex = -1;
-  if (request.audio.coverArtUri.has_value() && picsIncluded) {
+  if (intent.coverArtUri.has_value() && picsIncluded) {
     const std::optional<std::string> coverPath =
-        localPathForUri(*request.audio.coverArtUri);
+        localPathForUri(*intent.coverArtUri);
     if (!coverPath.has_value()) {
       result.error = Error::make(ErrorCode::SourceUnavailable,
                                  "cover art URI is not a local path",
@@ -2990,16 +3184,14 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
     coverPkt = coverPacket; // written right after the header below
   }
 
-  // Metadata preservation (spec video ops: "metadata preservation where
-  // possible"): container-level and per-stream tags copy through the
-  // transcode. Re-encoding changes the essence, never the descriptive
-  // metadata (title/artist/creation date...). Encoder-written entries
-  // (extradata-adjacent tags) do not exist yet at header time.
-  // stripMetadata (advanced control) drops them instead.
-  if (!request.stripMetadata) {
-    av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
-                 AV_DICT_DONT_OVERWRITE);
-  }
+  // Metadata (mandate §33): container-level and per-stream tags copy
+  // through the transcode (re-encoding changes the essence, never the
+  // descriptive metadata); the familiar-field set/clear intentions then
+  // apply on the container dictionary (the all-Clear intention is the
+  // moral equivalent of the retired stripMetadata control).
+  av_dict_copy(&cleanup.out->metadata, cleanup.in->metadata,
+               AV_DICT_DONT_OVERWRITE);
+  applyMetadataIntention(&cleanup.out->metadata, intent.metadata);
   {
     if (videoIn >= 0 && videoOut >= 0) {
       av_dict_copy(&cleanup.out->streams[std::size_t(videoOut)]->metadata,
@@ -3377,28 +3569,35 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       av_frame_free(&dsp);
     }
   };
-  // ---- Replacement-audio pump (spec §9 replace audio) ----------------------
-  // Feeds replacement packets interleaved with the main timeline so the
+  // ---- External-audio pump (replacement + additions, spec §9/mandate §23) -
+  // Feeds external-input packets interleaved with the main timeline so the
   // muxer sees monotonically increasing dts. av_read_frame cannot unread,
   // so the one packet read too far ahead is held and consumed first on
-  // the next pump.
-  AudioTrack *replaceTrackOfInput = nullptr;
+  // the next pump. Each external lane (the replacement and every addition)
+  // holds its own read-ahead packet.
+  struct ExternalLane {
+    AudioTrack *track = nullptr;
+    AVFormatContext *input = nullptr;
+    AVPacket *heldPkt = nullptr;
+    std::int64_t heldUs = -1;
+  };
+  std::vector<ExternalLane> externalLanes;
   for (AudioTrack &track : cleanup.audio) {
-    if (track.input == cleanup.audioReplaceIn &&
-        cleanup.audioReplaceIn != nullptr) {
-      replaceTrackOfInput = &track;
-      break;
+    if (track.input == cleanup.in || track.input == nullptr) {
+      continue; // main-input lane
     }
+    ExternalLane lane;
+    lane.track = &track;
+    lane.input = track.input;
+    externalLanes.push_back(lane);
   }
-  AVPacket *heldReplacePkt = nullptr;
-  std::int64_t heldReplaceUs = -1;
-  const auto feedReplacementPacket = [&](AVPacket *pkt) {
-    AudioTrack &track = *replaceTrackOfInput;
+  const auto feedExternalPacket = [&](ExternalLane &lane, AVPacket *pkt) {
+    AudioTrack &track = *lane.track;
     if (track.copy) {
       AVPacket *outPacket = av_packet_alloc();
       av_packet_move_ref(outPacket, pkt);
       const AVStream *srcStream =
-          cleanup.audioReplaceIn->streams[std::size_t(outPacket->stream_index)];
+          lane.input->streams[std::size_t(outPacket->stream_index)];
       const AVRounding rounding = static_cast<AVRounding>(
           AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
       outPacket->pts = av_rescale_q_rnd(
@@ -3437,52 +3636,53 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
       }
     }
   };
-  const auto pumpReplacementUpTo = [&](std::int64_t upToUs) {
-    if (cleanup.audioReplaceIn == nullptr || replaceTrackOfInput == nullptr ||
-        writeFailed) {
+  const auto pumpExternalLanesUpTo = [&](std::int64_t upToUs) {
+    if (externalLanes.empty() || writeFailed) {
       return;
     }
     // Range gate: nothing beyond the segment/window end.
     const std::int64_t limitUs =
         rangeBounded ? std::min(upToUs, rangeEndUs) : upToUs;
-    for (;;) {
-      std::int64_t nextUs = -1;
-      if (heldReplacePkt != nullptr) {
-        nextUs = heldReplaceUs;
-      }
-      if (nextUs >= 0 && nextUs > limitUs && limitUs != INT64_MAX) {
-        return; // still too far ahead; keep holding
-      }
-      AVPacket *pkt = heldReplacePkt;
-      if (pkt == nullptr) {
-        pkt = av_packet_alloc();
-        if (av_read_frame(cleanup.audioReplaceIn, pkt) < 0) {
-          av_packet_free(&pkt);
-          return; // replacement EOF
+    for (ExternalLane &lane : externalLanes) {
+      for (;;) {
+        std::int64_t nextUs = -1;
+        if (lane.heldPkt != nullptr) {
+          nextUs = lane.heldUs;
         }
-        if (pkt->stream_index != replaceTrackOfInput->inStream) {
-          av_packet_unref(pkt);
-          av_packet_free(&pkt);
-          continue; // not the selected replacement track
+        if (nextUs >= 0 && nextUs > limitUs && limitUs != INT64_MAX) {
+          break; // still too far ahead; keep holding
         }
-        const AVStream *repStream = cleanup.audioReplaceIn->streams[
-            std::size_t(pkt->stream_index)];
-        heldReplaceUs =
-            pkt->pts == AV_NOPTS_VALUE
-                ? -1
-                : av_rescale_q(pkt->pts, repStream->time_base,
-                               AVRational{1, 1000000});
-      }
-      if (limitUs != INT64_MAX && heldReplaceUs > limitUs) {
-        heldReplacePkt = pkt; // hold for the next pump
-        return;
-      }
-      feedReplacementPacket(pkt);
-      av_packet_free(&pkt);
-      heldReplacePkt = nullptr;
-      heldReplaceUs = -1;
-      if (writeFailed) {
-        return;
+        AVPacket *pkt = lane.heldPkt;
+        if (pkt == nullptr) {
+          pkt = av_packet_alloc();
+          if (av_read_frame(lane.input, pkt) < 0) {
+            av_packet_free(&pkt);
+            break; // external lane EOF
+          }
+          if (pkt->stream_index != lane.track->inStream) {
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+            continue; // not the selected external track
+          }
+          const AVStream *repStream = lane.input->streams[
+              std::size_t(pkt->stream_index)];
+          lane.heldUs =
+              pkt->pts == AV_NOPTS_VALUE
+                  ? -1
+                  : av_rescale_q(pkt->pts, repStream->time_base,
+                                 AVRational{1, 1000000});
+        }
+        if (limitUs != INT64_MAX && lane.heldUs > limitUs) {
+          lane.heldPkt = pkt; // hold for the next pump
+          break;
+        }
+        feedExternalPacket(lane, pkt);
+        av_packet_free(&pkt);
+        lane.heldPkt = nullptr;
+        lane.heldUs = -1;
+        if (writeFailed) {
+          return;
+        }
       }
     }
   };
@@ -3806,8 +4006,11 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         if (outPacket->pts != AV_NOPTS_VALUE) {
           std::int64_t pts = av_rescale_q_rnd(outPacket->pts,
                                               srcStream->time_base,
-                                              dstStream->time_base, rounding) +
-                             subOffsetOutUnits;
+                                              dstStream->time_base, rounding);
+          if (subSpeedScale) {
+            // Playback speed scales preserved cue timing (1/speed).
+            pts = std::int64_t(double(pts) * subSpeedFactor);
+          }
           if (rangeBounded) {
             // Segment-local timeline for preserved subtitles.
             const std::int64_t startDst = av_rescale_q(
@@ -3815,7 +4018,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
             pts -= startDst;
           }
           if (pts < 0) {
-            pts = 0; // offset clamps cue starts, never emits negative pts
+            pts = 0; // clamps cue starts, never emits negative pts
           }
           outPacket->pts = pts;
         }
@@ -3840,10 +4043,11 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
         }
       }
     }
-    // Replacement audio pacing: keep the replacement input interleaved
-    // with the main timeline (up to 1 s ahead), never a post-video batch —
-    // the muxer needs monotonically increasing dts across streams.
-    if (cleanup.audioReplaceIn != nullptr && !writeFailed) {
+    // External audio pacing (replacement + additions): keep the external
+    // inputs interleaved with the main timeline (up to 1 s ahead), never a
+    // post-video batch — the muxer needs monotonically increasing dts
+    // across streams.
+    if (!externalLanes.empty() && !writeFailed) {
       const AVStream *mainStream =
           cleanup.in->streams[std::size_t(cleanup.packet->stream_index)];
       const std::int64_t mainUs =
@@ -3852,17 +4056,20 @@ ExecuteResult FfmpegExecutor::executeTranscodeRange(
               : av_rescale_q(cleanup.packet->pts, mainStream->time_base,
                              AVRational{1, 1000000});
       if (mainUs >= 0) {
-        pumpReplacementUpTo(mainUs + 1000000);
+        pumpExternalLanesUpTo(mainUs + 1000000);
       }
     }
     av_packet_unref(cleanup.packet);
   }
 
-  // Replacement audio tail: after the main input ends, feed everything
+  // External audio tail: after the main input ends, feed everything
   // remaining (bounded by the range when segmenting).
-  pumpReplacementUpTo(INT64_MAX);
-  av_packet_free(&heldReplacePkt);
-  heldReplacePkt = nullptr;
+  pumpExternalLanesUpTo(INT64_MAX);
+  for (ExternalLane &lane : externalLanes) {
+    av_packet_free(&lane.heldPkt);
+    lane.heldPkt = nullptr;
+    lane.heldUs = -1;
+  }
 
   // Bitmap burn-in: flush the overlay input FIRST (eof_action=pass lets
   // remaining main frames through the overlay once its stream ends), then
@@ -4226,13 +4433,13 @@ AVStream *addCoverArtStream(AVFormatContext *out, const std::string &path,
 }
 
 ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
-    const ExecuteParams &params) {
+    const ExecuteParams &params, const ExecutionIntent &intent) {
   ExecuteResult result;
   initFfmpegLabel();
   // Whole-job duration (the decision path verified it is known and long).
   std::int64_t totalUs = 0;
   {
-    const std::optional<std::string> inPath = localPathFor(params.request.source);
+    const std::optional<std::string> inPath = localPathFor(intent.source);
     if (!inPath.has_value()) {
       result.error = Error::make(ErrorCode::SourceUnavailable,
                                  "unsupported source URI", "ffmpeg");
@@ -4251,7 +4458,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
     if (totalUs <= 0) {
       // Duration became unknown between the decision and now: fall back to
       // a single honest pass (no checkpoints, no resume).
-      return executeTranscodeRange(params, 0, 0, false);
+      return executeTranscodeRange(params, intent, 0, 0, false);
     }
   }
 
@@ -4260,13 +4467,13 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
   // stay in source-timeline microseconds (the durable coordinate system
   // D-017 established).
   const std::int64_t trimStart =
-      params.request.trim.active()
+      intent.trim.active()
           ? std::min<std::int64_t>(
-                std::max<std::int64_t>(params.request.trim.startUs, 0), totalUs)
+                std::max<std::int64_t>(intent.trim.startUs, 0), totalUs)
           : 0;
   const std::int64_t windowEnd =
-      params.request.trim.endUs >= 0
-          ? std::min(params.request.trim.endUs, totalUs)
+      intent.trim.endUs >= 0
+          ? std::min(intent.trim.endUs, totalUs)
           : totalUs;
   const std::int64_t windowLen =
       std::max<std::int64_t>(windowEnd - trimStart, 0);
@@ -4393,7 +4600,7 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
           params.onProgress(global);
         };
     const ExecuteResult seg =
-        executeTranscodeRange(segParams, segStart, segEnd, true, true);
+        executeTranscodeRange(segParams, intent, segStart, segEnd, true, true);
     if (!seg.success) {
       // Partial segment files are never committed: remove and surface the
       // error; committed segments stay durable for the next resume.
@@ -4471,6 +4678,12 @@ ExecuteResult FfmpegExecutor::executeTranscodeSegmented(
 Error FfmpegBackend::initialize() {
   initFfmpegLabel();
   implementationLabel_ = g_ffmpegVersion;
+  // HDR tone-map availability (mandate §25): probe the ACTUAL avfilter
+  // registry at startup — both zscale (libzimg colorspace converter) and
+  // tonemap must exist for the real conversion chain. Never a hardcoded
+  // claim; capability follows the compiled library.
+  hdrToneMappingAvailable_ = avfilter_get_by_name("zscale") != nullptr &&
+                             avfilter_get_by_name("tonemap") != nullptr;
   return {};
 }
 
@@ -4509,10 +4722,10 @@ BackendCapabilities FfmpegBackend::capabilities() const {
   // Cover art: attached pictures carry through; external images embed as
   // attached-picture streams.
   caps.coverArt = true;
-  // HDR -> SDR tone mapping: NOT offered (the pinned filter set has no
-  // PQ/HLG-capable converter — needs libzimg; documented in D-056). HDR
-  // PRESERVATION works via stream copy and 10-bit transcodes.
-  caps.hdrToneMapping = false;
+  // HDR -> SDR tone mapping: real when the compiled avfilter carries BOTH
+  // zscale (libzimg) and tonemap — probed at initialize(). HDR
+  // PRESERVATION works via stream copy regardless.
+  caps.hdrToneMapping = hdrToneMappingAvailable_;
 
   const auto &features = FeatureRegistry::instance();
 

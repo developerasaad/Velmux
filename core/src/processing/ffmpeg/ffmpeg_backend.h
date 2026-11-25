@@ -6,15 +6,20 @@
 //   1. Remux / stream copy: demux -> (bitstream filter when required) -> mux.
 //   2. Transcode: demux -> decode -> scale/resample -> encode -> mux.
 //
-// Subtitle handling: preserve/remove/extract are remux-time stream
+// Execution model: execute() normalizes the typed JobRequest payload into
+// an ExecutionIntent (execution_intent.h) at the top — the remux/transcode
+// paths consume the intent, never the payload.
+//
+// Subtitle handling: preserve/remove ride through as remux-time stream
 // operations; burn-in goes through libavfilter's subtitles filter (libass)
-// and is exercised once the mobile artifacts land — the host path implements
-// it through the filter graph when the input provides subtitles.
+// for text and a pre-decoded overlay graph for bitmap cues; extraction is
+// its own sidecar operation.
 #pragma once
 
 #include "processing/contracts/contracts.h"
 #include <velmux/types.h>
 
+#include "processing/ffmpeg/execution_intent.h"
 #include "processing/ffmpeg/ffmpeg_stages.h"
 
 #include <string>
@@ -38,29 +43,34 @@ public:
 class FfmpegExecutor final : public velmux::backend::IPipelineExecutor {
 public:
   bool canExecute(const velmux::core::Pipeline &pipeline,
-                  const velmux::core::ConversionRequest &request) const override;
+                  const velmux::core::JobRequest &request) const override;
   velmux::backend::ExecuteResult
   execute(const velmux::backend::ExecuteParams &params) override;
 
 private:
-  velmux::backend::ExecuteResult executeRemux(const velmux::backend::ExecuteParams &params);
-  // Subtitle-extraction job: first text subtitle track to a sidecar file
-  // (stream copy for native text formats, decode+re-encode to SRT for
+  velmux::backend::ExecuteResult
+  executeRemux(const velmux::backend::ExecuteParams &params,
+               const ExecutionIntent &intent);
+  // Subtitle-extraction job: selected text subtitle track(s) to sidecar
+  // files (stream copy for native text formats, decode+re-encode for
   // container-internal text like MP4 mov_text).
   velmux::backend::ExecuteResult
   executeSubtitleExtract(const velmux::backend::ExecuteParams &params);
   velmux::backend::ExecuteResult
-  executeTranscode(const velmux::backend::ExecuteParams &params);
+  executeTranscode(const velmux::backend::ExecuteParams &params,
+                   const ExecutionIntent &intent);
   // Single pass over [rangeStartUs, rangeEndUs) of the source; used directly
   // for whole-file transcodes and once per segment by the segmented path.
   velmux::backend::ExecuteResult
   executeTranscodeRange(const velmux::backend::ExecuteParams &params,
+                        const ExecutionIntent &intent,
                         std::int64_t rangeStartUs, std::int64_t rangeEndUs,
                         bool rangeActive, bool isSegmentRun = false);
   // Long-job path: transcode in independently finalized, validated and
   // committed segments, then assemble. Resumes from committed artifacts.
   velmux::backend::ExecuteResult
-  executeTranscodeSegmented(const velmux::backend::ExecuteParams &params);
+  executeTranscodeSegmented(const velmux::backend::ExecuteParams &params,
+                            const ExecutionIntent &intent);
 };
 
 class FfmpegBackend final : public velmux::backend::IBackend {
@@ -83,6 +93,9 @@ private:
   FfmpegExecutor executor_;
   velmux::ffmpeg::FfmpegStageBackend stageBackend_;
   std::string implementationLabel_;
+  // Probed at initialize() from the real avfilter registry (see
+  // initialize()); capabilities().hdrToneMapping reports it.
+  bool hdrToneMappingAvailable_ = false;
 };
 
 } // namespace velmux::ffmpeg

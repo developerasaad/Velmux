@@ -799,10 +799,10 @@ struct MuxTrackState {
 
 RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
                         const Pipeline &pipeline,
-                        const ConversionRequest &request,
+                        const NativeTranscodeSpec &spec,
                         const RunContext &ctx) {
   RunResult result;
-  const bool wantVideo = request.video.enabled;
+  const bool wantVideo = spec.wantVideo;
   AMediaExtractor *extractor = AMediaExtractor_new();
   AMediaCodec *videoDecoder = nullptr;
   AMediaCodec *videoEncoder = nullptr;
@@ -856,19 +856,19 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     return result;
   }
   const TrackSelection selection =
-      selectTracks(extractor, wantVideo, request.audio.enabled);
+      selectTracks(extractor, wantVideo, spec.wantAudio);
   if (wantVideo && selection.video < 0) {
     result.error = "the source has no video track";
     cleanup();
     return result;
   }
-  if (!wantVideo && request.audio.enabled && selection.audio < 0) {
+  if (!wantVideo && spec.wantAudio && selection.audio < 0) {
     result.error = "the source has no audio track";
     cleanup();
     return result;
   }
   const bool videoActive = wantVideo && selection.video >= 0;
-  const bool audioActive = request.audio.enabled && selection.audio >= 0;
+  const bool audioActive = spec.wantAudio && selection.audio >= 0;
   if (!videoActive && !audioActive) {
     result.error = "no track to process";
     cleanup();
@@ -930,14 +930,11 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     AMediaFormat_setInt32(encoderFormat, AMEDIAFORMAT_KEY_FRAME_RATE,
                           int32_t(videoFrameRate));
     std::int64_t bitRate = 0;
-    if (request.video.rateControl == RateControl::Bitrate &&
-        request.video.bitRate.has_value()) {
-      bitRate = *request.video.bitRate;
+    if (spec.videoBitRate > 0) {
+      bitRate = spec.videoBitRate;
     } else {
       // Quality-driven: bits-per-pixel heuristic in a sane AVC range.
-      const double quality = request.video.quality.has_value()
-                                 ? double(*request.video.quality) / 100.0
-                                 : 0.6;
+      const double quality = double(spec.videoQuality) / 100.0;
       bitRate = std::int64_t(double(videoWidth) * double(videoHeight) *
                              videoFrameRate * (0.04 + 0.12 * quality));
       bitRate = std::clamp<std::int64_t>(bitRate, 300000, 40000000);
@@ -1012,7 +1009,8 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     AMediaFormat_setInt32(encoderFormat, AMEDIAFORMAT_KEY_CHANNEL_COUNT,
                           audioChannels);
     const std::int64_t audioBitRate =
-        request.audio.bitRate.value_or(std::int64_t(audioChannels) * 64000);
+        spec.audioBitRate > 0 ? spec.audioBitRate
+                              : std::int64_t(audioChannels) * 64000;
     AMediaFormat_setInt32(encoderFormat, AMEDIAFORMAT_KEY_BIT_RATE,
                           int32_t(std::min<std::int64_t>(
                               audioBitRate,
@@ -1468,7 +1466,7 @@ RunResult remuxFile(const std::string &, const std::string &, bool, bool,
 
 RunResult transcodeFile(const std::string &, const std::string &,
                         const core::Pipeline &,
-                        const core::ConversionRequest &,
+                        const NativeTranscodeSpec &,
                         const RunContext &) {
   RunResult result;
   result.error = "Android media APIs are not available in this process";

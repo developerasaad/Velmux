@@ -61,6 +61,18 @@ struct RunResult {
   std::int64_t bytesWritten = 0;
 };
 
+// The execution-relevant subset of a conversion request the native
+// transcoder consumes (the contracts layer resolves the compression
+// intent into concrete rate control; the AVFoundation internals never
+// see the typed payload).
+struct NativeTranscodeSpec {
+  bool wantVideo = true;
+  bool wantAudio = true;
+  std::int64_t videoBitRate = 0;  // bits/s; 0 = quality mode
+  std::int32_t videoQuality = 60; // 0..100 user scale (quality mode)
+  std::int64_t audioBitRate = 0;  // bits/s; 0 = codec default
+};
+
 // Stream copy through AVAssetExportSession (passthrough preset).
 RunResult remuxFile(const std::string &inPath, const std::string &outPath,
                     bool wantVideo, bool wantAudio, const RunContext &ctx);
@@ -68,7 +80,7 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
 // Real transcode: AVAssetReader -> AVAssetWriter (VideoToolbox / AAC).
 RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
                         const core::Pipeline &pipeline,
-                        const core::ConversionRequest &request,
+                        const NativeTranscodeSpec &spec,
                         const RunContext &ctx);
 
 } // namespace velmux::apple::media

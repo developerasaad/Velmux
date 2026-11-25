@@ -455,7 +455,7 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
 
 RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
                         const Pipeline &pipeline,
-                        const ConversionRequest &request,
+                        const NativeTranscodeSpec &spec,
                         const RunContext &ctx) {
   RunResult result;
   const auto local = localPathForUri(inPath);
@@ -493,20 +493,20 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
   AVAssetTrack *audioTrack = nil;
   for (AVAssetTrack *track in asset.tracks) {
     if (videoTrack == nil && track.mediaType == AVMediaTypeVideo &&
-        request.video.enabled) {
+        spec.wantVideo) {
       videoTrack = track;
     } else if (audioTrack == nil && track.mediaType == AVMediaTypeAudio &&
-               request.audio.enabled) {
+               spec.wantAudio) {
       audioTrack = track;
     }
   }
-  const bool wantVideo = request.video.enabled && videoTrack != nil;
-  const bool wantAudio = request.audio.enabled && audioTrack != nil;
+  const bool wantVideo = spec.wantVideo && videoTrack != nil;
+  const bool wantAudio = spec.wantAudio && audioTrack != nil;
   if (!wantVideo && !wantAudio) {
     result.error = "no track to process";
     return result;
   }
-  if (request.video.enabled && videoTrack == nil) {
+  if (spec.wantVideo && videoTrack == nil) {
     result.error = "the source has no video track";
     return result;
   }
@@ -540,13 +540,10 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     const double frameRate =
         videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0;
     std::int64_t bitRate = 0;
-    if (request.video.rateControl == RateControl::Bitrate &&
-        request.video.bitRate.has_value()) {
-      bitRate = *request.video.bitRate;
+    if (spec.videoBitRate > 0) {
+      bitRate = spec.videoBitRate;
     } else {
-      const double quality = request.video.quality.has_value()
-                                 ? double(*request.video.quality) / 100.0
-                                 : 0.6;
+      const double quality = double(spec.videoQuality) / 100.0;
       const double area = double(videoTrack.naturalSize.width) *
                           double(videoTrack.naturalSize.height);
       bitRate = std::int64_t(area * frameRate * (0.04 + 0.12 * quality));
@@ -623,7 +620,8 @@ RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
     [reader addOutput:audioOutput];
 
     const std::int64_t audioBitRate =
-        request.audio.bitRate.value_or(std::int64_t(channels) * 64000);
+        spec.audioBitRate > 0 ? spec.audioBitRate
+                              : std::int64_t(channels) * 64000;
     NSDictionary *audioSettings = @{
       AVFormatIDKey : @(outFormat),
       AVSampleRateKey : @(sampleRate),

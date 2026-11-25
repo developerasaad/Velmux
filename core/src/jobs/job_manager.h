@@ -2,16 +2,20 @@
 //
 // Owns the job lifecycle state machine and durable persistence. The React
 // Native UI (and every other frontend) observes JobSnapshots and submits
-// ConversionRequests; it never owns job state.
+// typed JobRequests; it never owns job state.
 //
-// State machine (spec §35 Queue):
-//   queued -> preparing -> running -> validating -> completed
-//                     |        |         |
-//                     |        |         +-> failed (validation failed)
-//                     |        +-> checkpointing -> running
-//                     |        +-> paused -> running
-//                     |        +-> failed / canceled / interrupted
-//                     +-> recovering -> running (from safest checkpoint)
+// State machine (mandate §37 Queue):
+//   queued -> preparing -> processing -> validating -> completed
+//                        |        |         |
+//                        |        |         +-> failed (validation failed)
+//                        |        +-> finalizing -> validating (post-execution
+//                        |             artifact finalization/checkpoints)
+//                        |        +-> paused -> processing
+//                        |        +-> failed / canceled / interrupted
+//                        +-> recovering -> processing (from safest checkpoint)
+//   validating -> completed | target-not-met | failed
+//   target-not-met: a VALID output that exceeded an accepted target-size
+//   objective after the corrective retry (honest completion, never fake).
 #pragma once
 
 #include "processing/contracts/contracts.h"
@@ -69,23 +73,29 @@ public:
   // Inspect through the first backend that can. Fast, no decoding.
   Result<MediaInfo> inspect(const MediaSource &source);
 
-  // Plan without creating a job (estimate + feasibility for the UI).
-  Result<PlanResult> plan(const MediaSource &source,
-                          const ConversionRequest &request);
+  // Inspect the request's sources, then plan the typed request.
+  Result<PlanResult> plan(const JobRequest &request);
 
   // Sample generation (spec §20): synchronously produce a short preview
-  // of the REQUESTED settings over a representative window. Not a durable
-  // job — bounded work, no checkpoints, no queue. Runs on the calling
-  // thread; hosts call it off the UI thread. Cancellation is not wired in
-  // v1 (samples are short by construction).
-  Result<SampleResult> generateSample(const ConversionRequest &request,
+  // of the REQUESTED settings over a representative window. Only
+  // VideoConvert / AudioConvert payloads produce samples (other
+  // operations honestly refuse). Not a durable job — bounded work, no
+  // checkpoints, no queue. Runs on the calling thread; hosts call it off
+  // the UI thread. Cancellation is not wired in v1 (samples are short by
+  // construction).
+  Result<SampleResult> generateSample(const JobRequest &request,
                                       std::int32_t sampleSeconds,
                                       const std::string &outputPath);
 
   // Create a durable job; persists before returning. The job enters the
-  // queue; the scheduler starts it when resources allow.
-  Result<std::string> submit(const ConversionRequest &request,
-                             std::int32_t priority = 5);
+  // queue; the scheduler starts it when resources allow. `sourceInfos`
+  // carries submit-time inspection results (the session's prepared
+  // sources); when empty the manager inspects. `submissionId` gives
+  // durable idempotency (mandate §14.2): when a job with that submission
+  // id already exists, its id is returned and NO new job is created.
+  Result<std::string> submit(const JobRequest &request,
+                             const std::vector<MediaInfo> &sourceInfos,
+                             const std::string &submissionId = "");
 
   // Control.
   Result<void> cancel(const std::string &jobId);
@@ -116,8 +126,9 @@ public:
 
   // Result of one scheduler-driven execution run.
   enum class ExecuteOutcome {
-    // The job reached a decision (completed / failed / canceled / paused
-    // by the control path, or was superseded by a newer run).
+    // The job reached a decision (completed / target-not-met / failed /
+    // canceled / paused by the control path, or was superseded by a newer
+    // run).
     Finished,
     // The dispatch gate deferred the job (hardware codecs saturated,
     // spec §21). The durable state is Queued again; the caller re-queues.
@@ -159,6 +170,7 @@ public:
 private:
   struct RunningJob {
     JobRecord record;
+    Pipeline pipeline; // full planned pipeline (codecs, container, sidecar)
     std::shared_ptr<backend::CancelToken> cancel;
     // Identifies one execution run of this job. A pause->resume or retry
     // starts a new run and replaces the entry; the superseded worker must
@@ -168,15 +180,18 @@ private:
 
   void persistAndEmit(JobRecord &record, const char *transitionNote);
   void finishFailure(JobRecord &record);
-  bool validateOutput(JobRecord &record, std::uint64_t generation);
+  bool validateOutput(JobRecord &record, const Pipeline &pipeline,
+                      std::uint64_t generation);
   // True (call under mutex_) when the running entry still belongs to the
   // given execution run. A pause->resume or retry replaces the entry; a late
   // wakeup from the superseded run must not clobber the new run's state.
   bool runStillCurrent(const std::string &jobId,
                        std::uint64_t generation) const;
-  std::optional<Pipeline> planPipelineFor(const JobRecord &record);
+  std::optional<Pipeline> planPipelineFor(JobRecord &record,
+                                          const MediaInfo &info);
   backend::IBackend *backendFor(const Pipeline &pipeline);
-  std::string outputNameFor(const JobRecord &record) const;
+  std::string outputNameFor(const JobRecord &record,
+                            const Pipeline &pipeline) const;
 
   std::function<bool(const std::string &jobId, const Pipeline &pipeline)>
       dispatchGate_;

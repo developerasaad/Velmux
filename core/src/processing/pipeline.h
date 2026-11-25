@@ -45,6 +45,6 @@ struct Pipeline {
   std::vector<BackendId> involvedBackends() const;
 };
 
-struct ConversionRequest; // job.h
+struct JobRequest; // jobs.h
 
 } // namespace velmux::core

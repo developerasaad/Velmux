@@ -70,6 +70,18 @@ struct RunResult {
   std::int64_t bytesWritten = 0;
 };
 
+// The execution-relevant subset of a conversion request the native
+// transcoder consumes (the contracts layer resolves the compression
+// intent into concrete rate control; the NDK internals never see the
+// typed payload).
+struct NativeTranscodeSpec {
+  bool wantVideo = true;
+  bool wantAudio = true;
+  std::int64_t videoBitRate = 0;  // bits/s; 0 = quality mode
+  std::int32_t videoQuality = 60; // 0..100 user scale (quality mode)
+  std::int64_t audioBitRate = 0;  // bits/s; 0 = codec default
+};
+
 // Stream copy: extractor -> muxer, no codecs. Copies the first video and
 // first audio track with their formats (rotation preserved through the
 // muxer orientation hint).
@@ -83,7 +95,7 @@ RunResult remuxFile(const std::string &inPath, const std::string &outPath,
 // against the actual source formats.
 RunResult transcodeFile(const std::string &inPath, const std::string &outPath,
                         const core::Pipeline &pipeline,
-                        const core::ConversionRequest &request,
+                        const NativeTranscodeSpec &spec,
                         const RunContext &ctx);
 
 } // namespace velmux::android::media

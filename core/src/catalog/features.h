@@ -14,52 +14,6 @@
 
 namespace velmux::core {
 
-enum class Operation : std::uint16_t {
-  // Video
-  VideoCodecConversion,
-  BitrateControl,
-  QualityCompression,
-  TargetSizeCompression,
-  ResolutionConversion,
-  FrameRateConversion,
-  Crop,
-  Rotation,
-  Flip,
-  Trim,
-  RemoveAudio,
-  ReplaceAudio,
-  ExtractAudio,
-  MultipleAudioTracks,
-  FastRemux,
-  StreamCopy,
-  BatchProcessing,
-  MetadataPreservation,
-  HdrPreservation,
-  HdrToSdr,
-  SubtitlePreservation,
-  SubtitleBurnIn,
-  MultipleLanguageTracks,
-  OutputValidation,
-  // Audio
-  AudioCodecConversion,
-  AudioBitrateControl,
-  SampleRateConversion,
-  ChannelLayout,
-  PcmBitDepth,
-  Gain,
-  LoudnessNormalization,
-  FadeInOut,
-  PlaybackSpeed,
-  TimeStretch,
-  SilenceRemoval,
-  CoverArt,
-  // Subtitles
-  SubtitleExtract,
-  SubtitleAddExternal,
-  SubtitleTimingAdjust,
-  SubtitleTextConversion,
-};
-
 struct VideoCodecFeature {
   VideoCodec codec;
   CodecSupport support;

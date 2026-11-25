@@ -148,6 +148,17 @@ public:
     (void)endUs;
     return false;
   }
+  // Reads the container-level metadata tags (mandate §33: Set intentions
+  // are validated by reading them back). Default: this backend cannot
+  // read tags; the check is skipped honestly, never faked.
+  virtual core::Error
+  readTags(const core::MediaSource &source,
+           std::vector<std::pair<std::string, std::string>> &tags) {
+    (void)source;
+    (void)tags;
+    return core::Error::make(core::ErrorCode::UnsupportedOperation,
+                             "tag reading not supported by this backend");
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -156,7 +167,7 @@ public:
 
 struct ExecuteParams {
   core::Pipeline pipeline;       // complete stage assignment (policy decided)
-  core::ConversionRequest request; // what the user asked for
+  core::JobRequest request;      // what the user asked for (typed payload)
   std::string outputPath;        // final output location (core-owned)
   // Stable identity of the job across runs (retries/resumes produce the
   // same id). Executors use it to keep recovery artifacts (e.g. transcode
@@ -172,6 +183,11 @@ struct ExecuteParams {
   // and reuse them instead of redoing it. Artifacts must be cheaply
   // re-validated (open + duration sanity) before being trusted.
   std::vector<CheckpointInfo> resumeFrom;
+  // Sample-generation window override (core-internal: the engine samples a
+  // ~5s preview of the densest section through the same execution path).
+  // Empty for real jobs; when set it replaces the request's timeline
+  // selection in the executor's internal execution view.
+  std::optional<core::TimeRange> sampleWindow;
 };
 
 struct ExecuteResult {
@@ -181,6 +197,10 @@ struct ExecuteResult {
   double wallClockSec = 0.0;
   std::int64_t framesProcessed = 0;
   std::int64_t bytesWritten = 0;
+  // Multi-output manifest (Split / ExtractFrames / batch extraction fill
+  // this). Conversion executors leave it empty; the job manager fills the
+  // primary output entry from outputPath.
+  std::vector<core::JobOutput> outputs;
 };
 
 // Whole-pipeline executor: runs every stage of `pipeline` that is assigned
@@ -193,7 +213,7 @@ public:
   // Can this backend execute every stage assigned to it in `pipeline` for
   // `request`? Must be cheap (no probing, no test encodes).
   virtual bool canExecute(const core::Pipeline &pipeline,
-                          const core::ConversionRequest &request) const = 0;
+                          const core::JobRequest &request) const = 0;
   virtual ExecuteResult execute(const ExecuteParams &params) = 0;
 };
 

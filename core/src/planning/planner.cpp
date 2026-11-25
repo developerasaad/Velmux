@@ -56,43 +56,401 @@ bool backendServesWholePipeline(const CapabilityRegistry &caps,
       case StageId::VideoProcessing:
       case StageId::AudioProcessing:
       case StageId::SubtitleProcessing:
+        if (const BackendCapabilities *bc = caps.capabilitiesOf(backend)) {
+          if (assignment.stage == StageId::VideoProcessing && !bc->videoScaling) {
+            return false;
+          }
+          if (assignment.stage == StageId::AudioProcessing &&
+              (!bc->audioResampling && !bc->audioDsp)) {
+            return false;
+          }
+        } else {
+          return false;
+        }
         break;
     }
   }
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Normalized conversion shape: every typed payload reduces to this view the
+// capability gates and cost model consume (spec §2 mapping).
+// ---------------------------------------------------------------------------
+
+struct Shape {
+  MediaSource source;
+  Container outputContainer = Container::Mp4;
+  bool wantsVideo = true;
+  bool wantsAudio = true;
+  // nullopt = Automatic: preserve the compatible source codec.
+  std::optional<VideoCodec> videoCodec;
+  std::optional<AudioCodec> audioCodec;
+  std::optional<std::int32_t> resolutionHeight;
+  std::optional<double> frameRate;
+  CropIntent crop;
+  bool hasCrop = false;
+  std::int32_t rotationDegrees = 0;
+  bool flipHorizontal = false;
+  bool flipVertical = false;
+  std::optional<double> playbackSpeed;
+  bool reverse = false;
+  bool hdrToSdr = false;
+  // Retained timeline intervals (empty = the whole timeline).
+  std::vector<TimeRange> trimRanges;
+  // Audio lane management (mandate §23).
+  bool allSourceAudioTracks = false;  // keep every source lane
+  std::int32_t audioTrackIndex = -1;  // explicit single-track selection
+  std::optional<std::string> replaceAudioUri;
+  bool hasExternalAudio = false;      // external addition lanes exist
+  std::optional<std::string> coverArtUri;
+  bool preserveCoverArt = true;
+  // Audio DSP (audio-only operations, mandate §32).
+  std::optional<double> gainDb;
+  std::optional<std::int32_t> fadeInMs;
+  std::optional<std::int32_t> fadeOutMs;
+  bool normalize = false;
+  bool removeSilence = false;
+  std::optional<double> audioSpeed;
+  // Subtitle lanes.
+  bool subtitleExtract = false;  // the ExtractSubtitles operation
+  bool burnIn = false;           // a burn-in rule exists
+  bool keepSubtitles = false;    // a preserved/embedded source track remains
+  bool stripMetadata = false;    // the all-Clear intention
+  CompressionIntent compression;
+  BudgetInputs budget;
+};
+
+// True when the metadata intention clears every familiar field (the moral
+// equivalent of the retired stripMetadata control).
+bool isFullStrip(const MetadataIntention &metadata) {
+  const auto cleared = [](MetadataFieldAction action) {
+    return action == MetadataFieldAction::Clear;
+  };
+  return cleared(metadata.titleAction) && cleared(metadata.artistAction) &&
+         cleared(metadata.albumAction) && cleared(metadata.genreAction) &&
+         cleared(metadata.dateAction) && cleared(metadata.descriptionAction) &&
+         cleared(metadata.locationAction) && cleared(metadata.artworkAction);
+}
+
+void fillAudioSettingsShape(const AudioSettings &settings, Shape &shape) {
+  shape.audioCodec = settings.codec;
+  shape.budget.audio = settings;
+}
+
+void fillCompressionShape(const CompressionIntent &compression,
+                          const MetadataIntention &metadata, Shape &shape) {
+  shape.compression = compression;
+  shape.stripMetadata = isFullStrip(metadata);
+}
+
+// VideoConvert (mandate §19/§23/§24/§25): field mapping into the shape.
+Error shapeForVideoConvert(const job::VideoConvert &request,
+                           const std::vector<MediaInfo> &sources,
+                           const MediaInfo &source, Shape &shape) {
+  shape.source = request.source;
+  shape.outputContainer =
+      request.output.container.value_or(source.container);
+  shape.videoCodec = request.video.codec;
+  shape.resolutionHeight = request.video.resolutionHeight.has_value()
+                               ? request.video.resolutionHeight
+                               : request.video.customHeight;
+  shape.frameRate = request.video.frameRate.has_value()
+                        ? std::optional<double>(
+                              request.video.frameRate->toDouble())
+                        : std::nullopt;
+  // Track management (mandate §23): empty rules = preserve all.
+  const std::int32_t audioTrackCount = std::int32_t(source.audio.size());
+  std::vector<std::int32_t> keptTracks;
+  for (const AudioTrackRule &rule : request.audioTracks) {
+    if (rule.sourceTrackIndex >= audioTrackCount ||
+        rule.sourceTrackIndex < -1) {
+      return Error::make(ErrorCode::InvalidTrackIdentity,
+                         "audio track index " +
+                             std::to_string(rule.sourceTrackIndex) +
+                             " is outside this source (0.." +
+                             std::to_string(audioTrackCount - 1) + ").");
+    }
+    if (rule.externalUri.has_value() && !rule.externalUri->empty()) {
+      if (rule.replace) {
+        if (rule.sourceTrackIndex < 0 && audioTrackCount > 0) {
+          return Error::make(
+              ErrorCode::InvalidArgument,
+              "replacing audio requires an explicit source track index.");
+        }
+        shape.replaceAudioUri = rule.externalUri;
+      } else {
+        shape.hasExternalAudio = true; // external addition lane
+      }
+      continue;
+    }
+    if (!rule.include) {
+      continue; // removal rule: the track does not survive
+    }
+    if (rule.sourceTrackIndex < 0) {
+      shape.allSourceAudioTracks = true; // default track = all-preserve
+      continue;
+    }
+    keptTracks.push_back(rule.sourceTrackIndex);
+  }
+  if (request.audioTracks.empty()) {
+    shape.allSourceAudioTracks = true;
+  } else if (!shape.replaceAudioUri.has_value()) {
+    // Replacement (v1) replaces the whole audio lane; otherwise the kept
+    // set decides. A multi-keep selects every kept lane (the executor
+    // filters the exact set from the intent's rules).
+    if (shape.allSourceAudioTracks) {
+      // keep all
+    } else if (keptTracks.empty()) {
+      shape.wantsAudio = shape.hasExternalAudio; // everything removed
+    } else if (keptTracks.size() == 1) {
+      shape.audioTrackIndex = keptTracks.front();
+    } else {
+      shape.allSourceAudioTracks = true;
+    }
+  }
+  // Subtitle lanes (mandate §24): empty = preserve all.
+  const std::int32_t subTrackCount = std::int32_t(source.subtitles.size());
+  for (const SubtitleTrackRule &rule : request.subtitleTracks) {
+    if (rule.sourceTrackIndex >= subTrackCount ||
+        rule.sourceTrackIndex < -1) {
+      return Error::make(ErrorCode::InvalidTrackIdentity,
+                         "subtitle track index " +
+                             std::to_string(rule.sourceTrackIndex) +
+                             " is outside this source (0.." +
+                             std::to_string(subTrackCount - 1) + ").");
+    }
+    switch (rule.policy) {
+      case SubtitleTrackPolicy::Preserve:
+      case SubtitleTrackPolicy::Embed:
+        shape.keepSubtitles = true;
+        break;
+      case SubtitleTrackPolicy::Remove:
+        break;
+      case SubtitleTrackPolicy::BurnIn:
+        shape.burnIn = true;
+        break;
+    }
+  }
+  if (request.subtitleTracks.empty() && source.hasSubtitles()) {
+    shape.keepSubtitles = true;
+  }
+  if (shape.burnIn && !request.subtitleTracks.empty() &&
+      std::none_of(request.subtitleTracks.begin(),
+                   request.subtitleTracks.end(),
+                   [](const SubtitleTrackRule &rule) {
+                     return rule.policy == SubtitleTrackPolicy::BurnIn &&
+                            (rule.externalUri.has_value() ||
+                             rule.sourceTrackIndex >= 0);
+                   })) {
+    return Error::make(ErrorCode::InvalidArgument,
+                       "Burn-in requested but no subtitle track or external "
+                       "subtitle file was provided.");
+  }
+  // Adjustments (mandate §25).
+  shape.rotationDegrees = request.adjustments.rotationDegrees;
+  shape.flipHorizontal = request.adjustments.flipHorizontal;
+  shape.flipVertical = request.adjustments.flipVertical;
+  shape.playbackSpeed = request.adjustments.playbackSpeed;
+  shape.reverse = request.adjustments.reverse;
+  shape.hdrToSdr = request.adjustments.hdrToSdr;
+  fillAudioSettingsShape(request.audioSettings, shape);
+  fillCompressionShape(request.compression, request.metadata, shape);
+  shape.coverArtUri = request.metadata.artworkAction ==
+                              MetadataFieldAction::Set
+                          ? std::optional<std::string>(
+                                request.metadata.artworkUri)
+                          : std::nullopt;
+  (void)sources;
+  return {};
+}
+
+// AudioConvert (mandate §20/§32): audio-only pipeline.
+Error shapeForAudioConvert(const job::AudioConvert &request,
+                           const MediaInfo &source, Shape &shape) {
+  shape.source = request.source;
+  shape.outputContainer =
+      request.output.container.value_or(source.container);
+  shape.wantsVideo = false;
+  shape.wantsAudio = true;
+  shape.gainDb = request.adjustments.gainDb;
+  shape.fadeInMs = request.adjustments.fadeInMs;
+  shape.fadeOutMs = request.adjustments.fadeOutMs;
+  shape.normalize = request.adjustments.normalize;
+  shape.removeSilence = request.adjustments.removeSilence;
+  shape.audioSpeed = request.adjustments.playbackSpeed;
+  fillAudioSettingsShape(request.audio, shape);
+  fillCompressionShape(request.compression, request.metadata, shape);
+  shape.coverArtUri = request.metadata.artworkAction == MetadataFieldAction::Set
+                          ? std::optional<std::string>(
+                                request.metadata.artworkUri)
+                          : std::nullopt;
+  return {};
+}
+
+// Crop (mandate §27 spatial): transcode with crop; no format/codec change
+// by default (source container; source codec when encodable, else H.264).
+Error shapeForCrop(const job::Crop &request, const MediaInfo &source,
+                   const FeatureRegistry &features, Shape &shape) {
+  shape.source = request.source;
+  shape.outputContainer =
+      request.output.container.value_or(source.container);
+  shape.hasCrop = true;
+  shape.crop = request.crop;
+  // Full-frame unchanged crop = pure remux (no pixel work at all).
+  const VideoStream *video =
+      source.hasVideo() ? &source.video.front() : nullptr;
+  const bool fullFrame =
+      video != nullptr && request.crop.x == 0 && request.crop.y == 0 &&
+      request.crop.width >= video->width &&
+      request.crop.height >= video->height;
+  if (!fullFrame) {
+    shape.crop = request.crop;
+  } else {
+    shape.hasCrop = false;
+  }
+  if (!source.hasVideo()) {
+    return Error::make(ErrorCode::InvalidArgument,
+                       "crop needs a video source.");
+  }
+  // Validate the rectangle against the source display dims (post-rotation
+  // display space handled at execution; the planner sees the stored dims).
+  if (request.crop.x < 0 || request.crop.y < 0 ||
+      request.crop.x + request.crop.width > video->width ||
+      request.crop.y + request.crop.height > video->height) {
+    return Error::make(ErrorCode::InvalidCrop,
+                       "crop rectangle does not fit inside the source "
+                       "frame.");
+  }
+  // Source codec when encodable into the target container, else H.264.
+  if (video != nullptr && features.knowsVideoCodec(video->codec) &&
+      features.videoSupport(video->codec).encode &&
+      features.containerAccepts(shape.outputContainer, video->codec)) {
+    shape.videoCodec = video->codec;
+  } else {
+    shape.videoCodec = VideoCodec::H264;
+  }
+  shape.wantsAudio = true;  // audio/subtitles preserved (stream copy)
+  shape.keepSubtitles = source.hasSubtitles();
+  return {};
+}
+
+// Trim (mandate §27.1): the retained window drives the existing trim logic.
+Error shapeForTrim(const job::Trim &request, const MediaInfo &source,
+                   Shape &shape) {
+  shape.source = request.source;
+  shape.outputContainer =
+      request.output.container.value_or(source.container);
+  if (!request.range.valid()) {
+    return Error::make(ErrorCode::InvalidTimeRange,
+                       "Trim window is empty: end must come after start.");
+  }
+  shape.trimRanges.push_back(request.range);
+  // Trim preserves the source representation: the codec resolution below
+  // keeps the source codec (nullopt = preserve).
+  return {};
+}
+
+// ExtractAudio (mandate §23/§28): audio-only extraction with track
+// selection and an optional range.
+Error shapeForExtractAudio(const job::ExtractAudio &request,
+                           const MediaInfo &source, Shape &shape) {
+  shape.source = request.source;
+  shape.outputContainer =
+      request.output.container.value_or(source.container);
+  shape.wantsVideo = false;
+  shape.wantsAudio = true;
+  const std::int32_t trackCount = std::int32_t(source.audio.size());
+  for (std::int32_t index : request.trackIndices) {
+    if (index < 0 || index >= trackCount) {
+      return Error::make(
+          ErrorCode::InvalidTrackIdentity,
+          "audio track index " + std::to_string(index) +
+              " is outside this source (0.." +
+              std::to_string(trackCount - 1) + ").");
+    }
+  }
+  if (request.trackIndices.empty()) {
+    shape.audioTrackIndex = -1; // default track
+  } else if (request.trackIndices.size() == 1) {
+    shape.audioTrackIndex = request.trackIndices.front();
+  } else if (request.trackIndices.size() ==
+             static_cast<std::size_t>(trackCount)) {
+    // Selecting every track = the all-lanes shape.
+    std::vector<std::int32_t> sorted = request.trackIndices;
+    std::sort(sorted.begin(), sorted.end());
+    bool every = true;
+    for (std::int32_t i = 0; i < trackCount; ++i) {
+      if (sorted[std::size_t(i)] != i) {
+        every = false;
+        break;
+      }
+    }
+    if (!every) {
+      return Error::make(ErrorCode::InvalidArgument,
+                         "selecting a subset of audio tracks is not yet "
+                         "implemented in this build.");
+    }
+    shape.allSourceAudioTracks = true;
+    shape.audioTrackIndex = -1;
+  } else {
+    return Error::make(ErrorCode::InvalidArgument,
+                       "selecting a subset of audio tracks is not yet "
+                       "implemented in this build.");
+  }
+  if (request.range.has_value()) {
+    if (!request.range->valid()) {
+      return Error::make(ErrorCode::InvalidTimeRange,
+                         "Extraction range is empty: end must come after "
+                         "start.");
+    }
+    shape.trimRanges.push_back(*request.range);
+  }
+  fillAudioSettingsShape(request.audio, shape);
+  fillCompressionShape(request.compression, request.metadata, shape);
+  shape.coverArtUri = request.metadata.artworkAction == MetadataFieldAction::Set
+                          ? std::optional<std::string>(
+                                request.metadata.artworkUri)
+                          : std::nullopt;
+  return {};
+}
+
 } // namespace
 
 FailedConfigKey failedConfigKeyFor(BackendId backend, const MediaInfo &source,
-                                   const ConversionRequest &request,
+                                   const JobRequest &request,
                                    VideoCodec outVideoCodec) {
   FailedConfigKey key;
   key.backend = backend;
   key.codec = outVideoCodec;
-  if (request.video.profile.has_value()) {
-    key.profile = *request.video.profile;
-  }
-  if (request.video.pixelFormat.has_value()) {
-    key.pixelFormat = pixelFormatName(*request.video.pixelFormat);
-  }
   if (!source.video.empty()) {
     // Output geometry through the executor's transform order
     // (crop -> rotation -> scale); mirrors what validateOutput expects.
     std::int32_t w = source.video.front().width;
     std::int32_t h = source.video.front().height;
-    if (request.video.crop.has_value() && request.video.crop->active()) {
-      w = std::clamp(request.video.crop->width, 2,
-                     std::max(0, w - request.video.crop->x));
-      h = std::clamp(request.video.crop->height, 2,
-                     std::max(0, h - request.video.crop->y));
+    std::optional<CropIntent> crop;
+    std::int32_t rotation = 0;
+    std::optional<std::int32_t> resolutionHeight;
+    if (request.operation == Operation::VideoCrop) {
+      if (const auto *payload = std::get_if<job::Crop>(&request.payload)) {
+        crop = payload->crop;
+      }
+    } else if (const auto *payload =
+                   std::get_if<job::VideoConvert>(&request.payload)) {
+      rotation = payload->adjustments.rotationDegrees;
+      resolutionHeight = payload->video.resolutionHeight.has_value()
+                              ? payload->video.resolutionHeight
+                              : payload->video.customHeight;
     }
-    if (request.video.rotationDegrees == 90 ||
-        request.video.rotationDegrees == 270) {
+    if (crop.has_value() && crop->valid()) {
+      w = std::clamp(crop->width, 2, std::max(0, w - crop->x));
+      h = std::clamp(crop->height, 2, std::max(0, h - crop->y));
+    }
+    if (rotation == 90 || rotation == 270) {
       std::swap(w, h);
     }
-    if (request.video.resolutionHeight.has_value() && h > 0) {
-      const std::int32_t targetH = *request.video.resolutionHeight;
+    if (resolutionHeight.has_value() && h > 0) {
+      const std::int32_t targetH = *resolutionHeight;
       w = std::max<std::int32_t>(
           2, std::int32_t(std::lround(double(w) * double(targetH) / double(h))) & ~1);
       h = targetH;
@@ -107,168 +465,307 @@ Planner::Planner(const FeatureRegistry &features,
                  const CapabilityRegistry &caps, const ITelemetryQuery *telemetry)
     : features_(features), caps_(caps), telemetry_(telemetry) {}
 
-PlanResult Planner::plan(const MediaInfo &source,
-                         const ConversionRequest &request) {
+Result<PlanResult> Planner::plan(const JobRequest &request,
+                                 const std::vector<MediaInfo> &sources) {
   const auto startTime = std::chrono::steady_clock::now();
   PlanResult result;
 
+  if (sources.empty()) {
+    return Result<PlanResult>(Error::make(
+        ErrorCode::InvalidArgument,
+        "planning needs at least one inspected source"));
+  }
+  const MediaInfo &source = sources.front();
+
+  // ----- Normalize the typed payload into the conversion shape ----------
+  Shape shape;
+  bool deferred = false;
+  switch (request.payload.index()) {
+    case 0: { // VideoConvert
+      if (request.operation != Operation::VideoConvert) {
+        return Result<PlanResult>(Error::make(
+            ErrorCode::InvalidArgument,
+            "request operation does not match its payload"));
+      }
+      const Error error = shapeForVideoConvert(
+          std::get<job::VideoConvert>(request.payload), sources, source,
+          shape);
+      if (!error.ok()) {
+        result.feasible = false;
+        result.message = error.message;
+        result.errorCode = error.code;
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    case 1: { // AudioConvert
+      const Error error = shapeForAudioConvert(
+          std::get<job::AudioConvert>(request.payload), source, shape);
+      if (!error.ok()) {
+        result.feasible = false;
+        result.message = error.message;
+        result.errorCode = error.code;
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    case 2: { // Crop
+      const Error error =
+          shapeForCrop(std::get<job::Crop>(request.payload), source,
+                       features_, shape);
+      if (!error.ok()) {
+        result.feasible = false;
+        result.message = error.message;
+        result.errorCode = error.code;
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    case 3: { // Trim
+      const Error error = shapeForTrim(std::get<job::Trim>(request.payload),
+                                       source, shape);
+      if (!error.ok()) {
+        result.feasible = false;
+        result.message = error.message;
+        result.errorCode = error.code;
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    case 4: { // Cut: retained = complement of removed.
+      const auto &cut = std::get<job::Cut>(request.payload);
+      shape.source = cut.source;
+      shape.outputContainer = cut.output.container.value_or(source.container);
+      if (cut.removed.empty()) {
+        // Removing nothing = the whole timeline: a pure remux.
+        break;
+      }
+      // Validate the removal intervals; execution of multi-range cuts
+      // lands with the timeline executor phase.
+      for (const TimeRange &range : cut.removed) {
+        if (!range.valid()) {
+          result.feasible = false;
+          result.message = "Removed interval is empty: end must come after "
+                           "start.";
+          result.errorCode = ErrorCode::InvalidTimeRange;
+          return Result<PlanResult>(std::move(result));
+        }
+      }
+      deferred = true;
+      break;
+    }
+    case 5:   // Split
+    case 6: { // Merge
+      // Planning-level validation only in this phase; execution of the
+      // multi-output (Split) and N-source (Merge) shapes lands with the
+      // timeline executor phase.
+      if (request.payload.index() == 5) {
+        const auto &split = std::get<job::Split>(request.payload);
+        shape.source = split.source;
+        shape.outputContainer =
+            split.output.container.value_or(source.container);
+        // Resolvability check (spec §2): unresolvable boundary strategies
+        // are infeasible with a specific message, before the deferral.
+        if (split.rules.mode == SplitMode::MaxSize &&
+            source.overallBitRate() <= 0.0 && source.sizeBytes <= 0) {
+          result.feasible = false;
+          result.message =
+              "Cannot estimate part sizes: the source bitrate is unknown. "
+              "Choose a different split strategy.";
+          return Result<PlanResult>(std::move(result));
+        }
+      } else {
+        const auto &merge = std::get<job::Merge>(request.payload);
+        shape.source =
+            merge.sources.empty() ? MediaSource{} : merge.sources.front();
+        shape.outputContainer =
+            merge.output.container.value_or(
+                sources.empty() ? Container::Mp4 : sources.front().container);
+        if (merge.sources.size() < 2) {
+          result.feasible = false;
+          result.message = "Merge needs at least two sources.";
+          result.errorCode = ErrorCode::InvalidArgument;
+          return Result<PlanResult>(std::move(result));
+        }
+        if (merge.rules.layout != MergeLayout::Sequential &&
+            merge.sources.size() != 2) {
+          result.feasible = false;
+          result.message = "Spatial merge requires exactly two sources.";
+          result.errorCode = ErrorCode::InvalidArgument;
+          return Result<PlanResult>(std::move(result));
+        }
+        for (const MediaInfo &info : sources) {
+          if (!info.hasVideo() && merge.rules.layout != MergeLayout::Sequential) {
+            result.feasible = false;
+            result.message = "Spatial merge requires decodable video in "
+                             "every source.";
+            result.errorCode = ErrorCode::InvalidArgument;
+            return Result<PlanResult>(std::move(result));
+          }
+        }
+      }
+      deferred = true;
+      break;
+    }
+    case 7: { // ExtractAudio
+      const Error error =
+          shapeForExtractAudio(std::get<job::ExtractAudio>(request.payload),
+                               source, shape);
+      if (!error.ok()) {
+        result.feasible = false;
+        result.message = error.message;
+        result.errorCode = error.code;
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    case 8: { // ExtractFrames: gate on a decoder for the source video codec.
+      const auto &frames = std::get<job::ExtractFrames>(request.payload);
+      shape.source = frames.source;
+      if (!source.hasVideo()) {
+        result.feasible = false;
+        result.message = "Frame extraction needs a video source.";
+        result.errorCode = ErrorCode::InvalidArgument;
+        return Result<PlanResult>(std::move(result));
+      }
+      const VideoCodec codec = source.video.front().codec;
+      if (caps_.backendsFor(codec, CodecOp::Decode).empty()) {
+        result.feasible = false;
+        result.message = "No backend can decode this video for frame "
+                         "extraction.";
+        result.errorCode = ErrorCode::DecoderUnavailable;
+        return Result<PlanResult>(std::move(result));
+      }
+      deferred = true;
+      break;
+    }
+    case 9: { // ExtractSubtitles: standalone sidecar extraction.
+      const auto &extract = std::get<job::ExtractSubtitles>(request.payload);
+      shape.source = extract.source;
+      shape.subtitleExtract = true;
+      shape.wantsVideo = false;
+      shape.wantsAudio = false;
+      if (extract.trackIndices.size() > 1) {
+        result.feasible = false;
+        result.message =
+            "Multi-track subtitle extraction (multiple sidecars) is not "
+            "yet implemented in this build; select one track.";
+        result.errorCode = ErrorCode::UnsupportedOperation;
+        return Result<PlanResult>(std::move(result));
+      }
+      if (!extract.trackIndices.empty() &&
+          (extract.trackIndices.front() < 0 ||
+           extract.trackIndices.front() >=
+               std::int32_t(source.subtitles.size()))) {
+        result.feasible = false;
+        result.message = "Subtitle track index is outside this source.";
+        result.errorCode = ErrorCode::InvalidTrackIdentity;
+        return Result<PlanResult>(std::move(result));
+      }
+      if (!source.hasSubtitles()) {
+        result.feasible = false;
+        result.message = "This source has no subtitle track to extract.";
+        return Result<PlanResult>(std::move(result));
+      }
+      const std::size_t track = extract.trackIndices.empty()
+                                    ? 0
+                                    : std::size_t(extract.trackIndices.front());
+      const SubtitleFormat format = source.subtitles[track].format;
+      const bool textExtractable =
+          format == SubtitleFormat::Srt || format == SubtitleFormat::WebVtt ||
+          format == SubtitleFormat::Ass || format == SubtitleFormat::Ssa ||
+          format == SubtitleFormat::MovText || format == SubtitleFormat::Ttml;
+      if (!textExtractable) {
+        result.feasible = false;
+        result.message =
+            std::string("The subtitle track (") + subtitleFormatName(format) +
+            ") cannot be extracted: bitmap and CEA formats need OCR, which "
+            "is outside V1.";
+        return Result<PlanResult>(std::move(result));
+      }
+      break;
+    }
+    default:
+      return Result<PlanResult>(Error::make(ErrorCode::InvalidArgument,
+                                            "unknown request payload"));
+  }
+
+  // ----- Deferred operations: honest refusal ------------------------------
+  // Split, Merge, multi-range Cut and ExtractFrames are not executable in
+  // this build; the planner says so instead of planning a route that would
+  // fail mid-execution.
+  if (deferred) {
+    result.feasible = false;
+    result.errorCode = ErrorCode::UnsupportedOperation;
+    result.message = "operation not yet implemented in this build";
+    return Result<PlanResult>(std::move(result));
+  }
+
   // ----- Resolve requested output shape -------------------------------------
-  const Container outContainer =
-      request.outputContainer.value_or(source.container);
+  const Container outContainer = shape.outputContainer;
   if (!features_.knowsContainer(outContainer)) {
     result.feasible = false;
     result.message = "Output container is not a supported Velmux format.";
-    return result;
+    return Result<PlanResult>(std::move(result));
   }
 
-  const bool wantsVideo = request.video.enabled && source.hasVideo();
-  const bool wantsAudio = request.audio.enabled && source.hasAudio();
-
-  // Timeline-changing audio DSP (pitch-preserving speed, silence removal)
-  // rewrites the audio timeline. With video present that desynchronizes
-  // the streams (V1 has no video speed control to follow along), so the
-  // request is honestly infeasible rather than producing drift. These
-  // operations are for audio-only outputs (extraction, audio conversion).
-  if (wantsVideo && wantsAudio &&
-      (request.audio.playbackSpeed.has_value() ||
-       request.audio.removeSilence)) {
-    result.feasible = false;
-    result.message =
-        "Playback speed and silence removal apply to audio-only outputs; "
-        "they cannot be combined with video in V1 (the streams would "
-        "desynchronize). Disable video or remove the audio timing change.";
-    return result;
-  }
+  const bool wantsVideo = shape.wantsVideo && source.hasVideo();
+  const bool wantsAudio = shape.wantsAudio && source.hasAudio();
 
   VideoCodec outVideoCodec = VideoCodec::H264;
   if (wantsVideo) {
-    outVideoCodec =
-        request.video.codec.value_or(source.video.front().codec);
+    outVideoCodec = shape.videoCodec.value_or(source.video.front().codec);
     if (!features_.knowsVideoCodec(outVideoCodec)) {
       result.feasible = false;
       result.message = "Video codec is not in the Velmux catalog.";
-      return result;
+      return Result<PlanResult>(std::move(result));
     }
     if (!features_.containerAccepts(outContainer, outVideoCodec)) {
       result.feasible = false;
       result.message =
           std::string("Container ") + containerName(outContainer) +
           " does not accept video codec " + codecName(outVideoCodec) + ".";
-      return result;
+      return Result<PlanResult>(std::move(result));
     }
   }
 
   AudioCodec outAudioCodec = AudioCodec::Aac;
   if (wantsAudio) {
-    outAudioCodec = request.audio.codec.value_or(source.audio.front().codec);
+    outAudioCodec = shape.audioCodec.value_or(source.audio.front().codec);
     if (!features_.knowsAudioCodec(outAudioCodec)) {
       result.feasible = false;
       result.message = "Audio codec is not in the Velmux catalog.";
-      return result;
+      return Result<PlanResult>(std::move(result));
     }
     if (!features_.containerAccepts(outContainer, outAudioCodec)) {
       result.feasible = false;
       result.message =
           std::string("Container ") + containerName(outContainer) +
           " does not accept audio codec " + codecName(outAudioCodec) + ".";
-      return result;
+      return Result<PlanResult>(std::move(result));
     }
   }
 
-  // Subtitle policy constraints (never silently discard: removal must be
-  // explicit).
-  bool extractJob = false;
-  if (request.subtitles.policy == SubtitlePolicy::Extract) {
-    // Extraction produces a text sidecar, not a media container: it is a
-    // subtitle-only job. Mixed "convert + extract" would need two outputs;
-    // v1 asks for two jobs (honest refusal, no silent half-work).
-    extractJob = true;
-    if (request.video.enabled || request.audio.enabled) {
-      result.feasible = false;
-      result.message =
-          "Subtitle extraction is a standalone operation in this build: "
-          "disable video and audio for the extract job.";
-      return result;
-    }
-    if (!source.hasSubtitles()) {
-      result.feasible = false;
-      result.message = "This source has no subtitle track to extract.";
-      return result;
-    }
-    // v1 extracts the first subtitle track. Bitmap formats need OCR
-    // (outside V1, spec §14); CEA captions ride the video elementary
-    // stream and have no demuxed track here.
-    const SubtitleFormat first = source.subtitles.front().format;
-    const bool textExtractable =
-        first == SubtitleFormat::Srt || first == SubtitleFormat::WebVtt ||
-        first == SubtitleFormat::Ass || first == SubtitleFormat::Ssa ||
-        first == SubtitleFormat::MovText || first == SubtitleFormat::Ttml;
-    if (!textExtractable) {
-      result.feasible = false;
-      result.message =
-          std::string("The first subtitle track (") +
-          subtitleFormatName(first) +
-          ") cannot be extracted: bitmap and CEA formats need OCR, which "
-          "is outside V1.";
-      return result;
-    }
-  }
   // Trim window sanity (spec §15/§16). Executors clamp against the real
   // duration; an inverted or empty window is a request error.
-  if (request.trim.endUs >= 0 && request.trim.endUs <= request.trim.startUs) {
-    result.feasible = false;
-    result.message = "Trim window is empty: end must come after start.";
-    return result;
+  for (const TimeRange &range : shape.trimRanges) {
+    if (!range.valid()) {
+      result.feasible = false;
+      result.message = "Trim window is empty: end must come after start.";
+      result.errorCode = ErrorCode::InvalidTimeRange;
+      return Result<PlanResult>(std::move(result));
+    }
+    if (range.startUs < 0) {
+      result.feasible = false;
+      result.message = "Trim start must not be negative.";
+      result.errorCode = ErrorCode::InvalidTimeRange;
+      return Result<PlanResult>(std::move(result));
+    }
   }
-  if (request.trim.startUs < 0) {
-    result.feasible = false;
-    result.message = "Trim start must not be negative.";
-    return result;
-  }
-  // Advanced-control sanity (spec §18): range checks here, capability
-  // routing below. Invalid values are request errors, never silently
-  // clamped into a different encode.
-  if (request.video.gopSize.has_value() && *request.video.gopSize < 1) {
-    result.feasible = false;
-    result.message = "GOP size must be at least 1 frame.";
-    return result;
-  }
-  if (request.video.bFrames.has_value() && *request.video.bFrames < 0) {
-    result.feasible = false;
-    result.message = "B-frame count must not be negative.";
-    return result;
-  }
-  // Track selection sanity: -1 = first track; otherwise a real index.
-  if (request.audio.sourceTrackIndex < -1 ||
-      request.audio.sourceTrackIndex >=
-          static_cast<std::int32_t>(source.audio.size())) {
-    result.feasible = false;
-    result.message =
-        std::string("Audio track index ") +
-        std::to_string(request.audio.sourceTrackIndex) +
-        " is outside this source (0.." +
-        std::to_string(source.audio.empty() ? 0 : source.audio.size() - 1) +
-        ").";
-    return result;
-  }
-  // Replacing audio while processing all source tracks is contradictory.
-  if (request.audio.replaceAudioUri.has_value() && request.audio.allTracks) {
-    result.feasible = false;
-    result.message =
-        "Replacing audio cannot be combined with processing all source "
-        "audio tracks.";
-    return result;
-  }
-  if (request.subtitles.policy == SubtitlePolicy::BurnIn &&
-      !request.subtitles.externalUri.has_value() && !source.hasSubtitles()) {
-    result.feasible = false;
-    result.message =
-        "Burn-in requested but the source has no subtitle track and no "
-        "external subtitle file was provided.";
-    return result;
-  }
-  if (source.hasSubtitles() &&
-      request.subtitles.policy == SubtitlePolicy::Preserve) {
+
+  // Preserved subtitle tracks must survive the container (never silently
+  // dropped: removal must be explicit).
+  if (shape.keepSubtitles && source.hasSubtitles()) {
     for (const auto &sub : source.subtitles) {
       if (!features_.containerAccepts(outContainer, sub.format)) {
         // Preserving this track in this container is impossible; surface it
@@ -278,7 +775,7 @@ PlanResult Planner::plan(const MediaInfo &source,
             std::string("Subtitle track (") + subtitleFormatName(sub.format) +
             ") cannot be preserved in " + containerName(outContainer) +
             ". Choose another container, or remove/extract the track.";
-        return result;
+        return Result<PlanResult>(std::move(result));
       }
     }
   }
@@ -305,8 +802,21 @@ PlanResult Planner::plan(const MediaInfo &source,
   // extracts. The artifact is a text sidecar; the extension comes from the
   // track's format (native text copies as-is, container-internal text
   // decodes to SRT).
-  if (extractJob) {
-    const SubtitleFormat first = source.subtitles.front().format;
+  if (shape.subtitleExtract) {
+    const auto &extractPayload =
+        std::get<job::ExtractSubtitles>(request.payload);
+    const std::size_t trackIndex =
+        extractPayload.trackIndices.empty()
+            ? 0
+            : std::size_t(extractPayload.trackIndices.front());
+    // Per-track target (mandate §30): empty/Original keeps the native
+    // sidecar extension (or the SRT decode fallback for container-internal
+    // text); an explicit Srt/Vtt/Ass target picks its own extension — the
+    // executor writes exactly that representation.
+    const SubtitleTextTarget target =
+        extractPayload.targets.empty() ? SubtitleTextTarget::Original
+                                       : extractPayload.targets.front();
+    const SubtitleFormat first = source.subtitles[trackIndex].format;
     for (BackendId backend : caps_.registeredBackends()) {
       const auto *caps = caps_.capabilitiesOf(backend);
       if (caps == nullptr || !caps->subtitleExtract) {
@@ -319,16 +829,30 @@ PlanResult Planner::plan(const MediaInfo &source,
         continue;
       }
       const char *ext = "srt";
-      switch (first) {
-        case SubtitleFormat::WebVtt:
+      switch (target) {
+        case SubtitleTextTarget::Original: {
+          switch (first) {
+            case SubtitleFormat::WebVtt:
+              ext = "vtt";
+              break;
+            case SubtitleFormat::Ass:
+            case SubtitleFormat::Ssa:
+              ext = "ass";
+              break;
+            default:
+              break; // Srt/MovText/Ttml -> SRT (copy or decode)
+          }
+          break;
+        }
+        case SubtitleTextTarget::Srt:
+          ext = "srt";
+          break;
+        case SubtitleTextTarget::Vtt:
           ext = "vtt";
           break;
-        case SubtitleFormat::Ass:
-        case SubtitleFormat::Ssa:
+        case SubtitleTextTarget::Ass:
           ext = "ass";
           break;
-        default:
-          break; // Srt/MovText/Ttml -> SRT (copy or decode)
       }
       Candidate candidate;
       Pipeline &pipeline = candidate.pipeline;
@@ -347,8 +871,9 @@ PlanResult Planner::plan(const MediaInfo &source,
                          (pipeline.sidecarExtension == "ass" ? "ASS" : "SRT") +
                          ") to a sidecar file";
       if (source.subtitles.size() > 1) {
-        pipeline.summary += " (track 1 of " +
-                            std::to_string(source.subtitles.size()) + ")";
+        pipeline.summary += " (track " + std::to_string(trackIndex + 1) +
+                            " of " + std::to_string(source.subtitles.size()) +
+                            ")";
       }
       candidates.push_back(std::move(candidate));
     }
@@ -356,7 +881,7 @@ PlanResult Planner::plan(const MediaInfo &source,
       result.feasible = false;
       result.message =
           "No registered backend can extract subtitles on this device.";
-      return result;
+      return Result<PlanResult>(std::move(result));
     }
   }
 
@@ -365,51 +890,57 @@ PlanResult Planner::plan(const MediaInfo &source,
       features_.videoSupport(outVideoCodec).streamCopy &&
       // No transformation requested: stream copy is only valid when the
       // output streams are identical to the input.
-      !request.video.resolutionHeight.has_value() &&
-      !request.video.frameRate.has_value() &&
+      !shape.resolutionHeight.has_value() && !shape.frameRate.has_value() &&
       // Geometry transforms rewrite pixels (crop/rotate/flip): never a
       // stream copy, exactly like burn-in.
-      !(request.video.crop.has_value() && request.video.crop->active()) &&
-      request.video.rotationDegrees == 0 && !request.video.flipHorizontal &&
-      !request.video.flipVertical &&
+      !shape.hasCrop && shape.rotationDegrees == 0 && !shape.flipHorizontal &&
+      !shape.flipVertical &&
+      // Timing transforms rewrite the presentation timeline.
+      !shape.playbackSpeed.has_value() && !shape.reverse &&
+      // HDR tone mapping rewrites pixels.
+      !shape.hdrToSdr &&
       // Burn-in rewrites the video pixels: it can never stream-copy.
-      request.subtitles.policy != SubtitlePolicy::BurnIn;
+      !shape.burnIn;
   const bool canStreamCopyAudio =
       wantsAudio &&
       // Replacement audio is a different stream: never a copy of the
       // source's audio.
-      !request.audio.replaceAudioUri.has_value() &&
-      // With allTracks, every track must be copyable into the target
+      !shape.replaceAudioUri.has_value() &&
+      // With every source lane kept, each must be copyable into the target
       // container as-is; a mixed copy/encode result is not "stream copy".
-      (!request.audio.allTracks ||
+      (!shape.allSourceAudioTracks ||
        std::all_of(source.audio.begin(), source.audio.end(), [&](
                        const AudioStream &track) {
          return track.codec == outAudioCodec &&
                 features_.audioSupport(track.codec).streamCopy &&
                 features_.containerAccepts(outContainer, track.codec);
        })) &&
-      (request.audio.allTracks ||
-       (source.audio.front().codec == outAudioCodec &&
+      (shape.allSourceAudioTracks ||
+       shape.audioTrackIndex < 0 ||
+       (source.audio[std::size_t(shape.audioTrackIndex)].codec ==
+            outAudioCodec &&
         features_.audioSupport(outAudioCodec).streamCopy &&
-        features_.containerAccepts(outContainer, source.audio.front().codec))) &&
-      !request.audio.sampleRate.has_value() &&
-      !request.audio.channels.has_value() &&
-      !request.audio.bitRate.has_value() &&
+        features_.containerAccepts(
+            outContainer,
+            source.audio[std::size_t(shape.audioTrackIndex)].codec))) &&
+      !shape.budget.audio.bitRate.has_value() &&
+      !shape.budget.audio.sampleRate.has_value() &&
+      !shape.budget.audio.channels.has_value() &&
       // DSP rewrites audio samples: gain/fades/normalization/speed/silence
       // removal all require re-encoding.
-      !request.audio.gainDb.has_value() &&
-      !request.audio.fadeInMs.has_value() &&
-      !request.audio.fadeOutMs.has_value() &&
-      !request.audio.normalizeLoudness &&
-      !request.audio.playbackSpeed.has_value() &&
-      !request.audio.removeSilence;
+      !shape.gainDb.has_value() && !shape.fadeInMs.has_value() &&
+      !shape.fadeOutMs.has_value() && !shape.normalize &&
+      !shape.audioSpeed.has_value() && !shape.removeSilence;
   // Goal sanity: remuxing cannot shrink anything. Stream copy satisfies a
-  // size goal only when the source already fits under the target.
+  // size objective only when the source already fits under the target.
   const bool sizeGoalAllowsCopy =
-      (request.goal.kind != GoalKind::FitUnderSize &&
-       request.goal.kind != GoalKind::SmallerFile) ||
-      (request.goal.targetSizeBytes > 0 && source.sizeBytes > 0 &&
-       source.sizeBytes <= request.goal.targetSizeBytes);
+      !shape.compression.enabled ||
+      shape.compression.preset == CompressionPreset::HighQuality ||
+      shape.compression.preset == CompressionPreset::Balanced ||
+      shape.compression.preset == CompressionPreset::Custom ||
+      (shape.compression.preset == CompressionPreset::TargetSize &&
+       shape.compression.targetSizeBytes > 0 && source.sizeBytes > 0 &&
+       source.sizeBytes <= shape.compression.targetSizeBytes);
   const bool streamCopyIsValid =
       sizeGoalAllowsCopy && canStreamCopyVideo && canStreamCopyAudio;
   const bool sameContainer = source.container == outContainer;
@@ -462,7 +993,7 @@ PlanResult Planner::plan(const MediaInfo &source,
     // Runtime failure feedback (spec §15): a configuration that already
     // failed execution on this backend is avoided while the record is
     // live (the registry's cooldown re-admits it later). This is narrow —
-    // a different codec/profile/geometry on the same backend still plans.
+    // a different codec/geometry on the same backend still plans.
     if (caps_.hasFailed(
             failedConfigKeyFor(backend, source, request, outVideoCodec))) {
       blockedByFailureRecord = true;
@@ -471,8 +1002,7 @@ PlanResult Planner::plan(const MediaInfo &source,
     // Processing capabilities: geometry / rate / audio-format changes and
     // subtitle work only route to backends that actually implement them
     // (reported via BackendCapabilities; executors double-check).
-    const bool wantsTrim = request.trim.startUs != 0 ||
-                           request.trim.endUs != -1;
+    const bool wantsTrim = !shape.trimRanges.empty();
     if (wantsTrim && !caps->timeTrim) {
       // An executor that cannot trim must never receive a trimmed request:
       // it would silently produce the full-length output.
@@ -482,93 +1012,81 @@ PlanResult Planner::plan(const MediaInfo &source,
     // filters: only backends reporting videoScaling execute them (the
     // capability's documented meaning covers scale/rotate/crop).
     if (wantsVideo &&
-        ((request.video.crop.has_value() && request.video.crop->active()) ||
-         request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
-         request.video.flipVertical) &&
+        (shape.hasCrop || shape.rotationDegrees != 0 || shape.flipHorizontal ||
+         shape.flipVertical) &&
         !caps->videoScaling) {
+      return;
+    }
+    // Timing transforms (playback speed / reverse) rewrite presentation
+    // timing: they need the temporal-processing surface (videoScaling
+    // covers it in this build) and, with audio present, audioDsp (the
+    // audio timeline must follow atempo/areverse).
+    if (wantsVideo &&
+        (shape.playbackSpeed.has_value() || shape.reverse) &&
+        !caps->videoScaling) {
+      return;
+    }
+    if (wantsAudio &&
+        (shape.playbackSpeed.has_value() || shape.reverse) && !caps->audioDsp) {
       return;
     }
     // Audio DSP chain (spec §10): only backends reporting audioDsp.
     if (wantsAudio &&
-        (request.audio.gainDb.has_value() ||
-         request.audio.fadeInMs.has_value() ||
-         request.audio.fadeOutMs.has_value() ||
-         request.audio.normalizeLoudness ||
-         request.audio.playbackSpeed.has_value() ||
-         request.audio.removeSilence) &&
+        (shape.gainDb.has_value() || shape.fadeInMs.has_value() ||
+         shape.fadeOutMs.has_value() || shape.normalize ||
+         shape.audioSpeed.has_value() || shape.removeSilence) &&
         !caps->audioDsp) {
-      return;
-    }
-    // Advanced encoder tuning (spec §18): profile/level/pixel format/
-    // GOP/B-frames only route to backends that implement the controls.
-    const bool wantsEncoderTuning =
-        request.video.profile.has_value() ||
-        request.video.level.has_value() ||
-        request.video.pixelFormat.has_value() ||
-        request.video.gopSize.has_value() || request.video.bFrames.has_value();
-    if (wantsVideo && wantsEncoderTuning && !caps->videoEncoderTuning) {
       return;
     }
     // HDR -> SDR conversion (spec §9) needs a tone-mapping backend; only
     // meaningful when the source is actually HDR.
-    if (wantsVideo && !streamCopy &&
-        request.video.hdrPolicy == HdrPolicy::ToneMapToSdr &&
-        source.hasVideo() && source.video.front().hdr &&
-        !caps->hdrToneMapping) {
+    if (wantsVideo && !streamCopy && shape.hdrToSdr && source.hasVideo() &&
+        source.video.front().hdr && !caps->hdrToneMapping) {
       return;
     }
-    // Any transcode of HDR content on a tone-map-less backend must either
-    // preserve HDR (an explicitly requested 10-bit pixel format carries
-    // PQ/HLG honestly) or refuse — encoding PQ pixels through the default
-    // 8-bit SDR pipeline silently produces washed-out output. Stream copy
-    // keeps the bitstream intact and is never gated here.
+    // Any transcode of HDR content on a tone-map-less backend would encode
+    // PQ/HLG pixels through the default 8-bit SDR pipeline and silently
+    // produce washed-out output. Stream copy keeps the bitstream intact
+    // and is never gated here.
     if (wantsVideo && !streamCopy && source.hasVideo() &&
         source.video.front().hdr && !caps->hdrToneMapping) {
-      const bool explicitTenBit =
-          request.video.pixelFormat.has_value() &&
-          (*request.video.pixelFormat == PixelFormat::Yuv420P10Le ||
-           *request.video.pixelFormat == PixelFormat::Yuv422P10Le ||
-           *request.video.pixelFormat == PixelFormat::Yuv444P10Le);
-      if (!explicitTenBit) {
-        return;
-      }
+      return;
     }
     // Multi-track audio and explicit track selection (spec §9).
     if (wantsAudio &&
-        ((request.audio.allTracks && source.audio.size() > 1) ||
-         request.audio.sourceTrackIndex >= 0) &&
+        ((shape.allSourceAudioTracks && source.audio.size() > 1) ||
+         shape.audioTrackIndex >= 0 || shape.hasExternalAudio) &&
         !caps->multiTrackAudio) {
       return;
     }
     // Audio replacement and cover art (spec §9/§10).
-    if (request.audio.replaceAudioUri.has_value() &&
-        !caps->audioReplacement) {
+    if (shape.replaceAudioUri.has_value() && !caps->audioReplacement) {
       return;
     }
-    if (request.audio.coverArtUri.has_value() && !caps->coverArt) {
+    if (shape.coverArtUri.has_value() && !caps->coverArt) {
       return;
     }
     if (!streamCopy) {
       const bool geometryChange =
-          wantsVideo && request.video.resolutionHeight.has_value() &&
-          *request.video.resolutionHeight !=
+          wantsVideo && shape.resolutionHeight.has_value() &&
+          *shape.resolutionHeight !=
               (source.hasVideo() ? source.video.front().height : 0);
       const bool rateChange =
-          wantsVideo && request.video.frameRate.has_value() &&
-          source.hasVideo() && source.video.front().frameRate > 0.0 &&
-          std::abs(*request.video.frameRate -
+          wantsVideo && shape.frameRate.has_value() && source.hasVideo() &&
+          source.video.front().frameRate > 0.0 &&
+          std::abs(*shape.frameRate -
                    source.video.front().frameRate) > 0.01;
       if ((geometryChange || rateChange) && !caps->videoScaling) {
         return;
       }
       const bool sampleRateChange =
-          wantsAudio && request.audio.sampleRate.has_value() &&
+          wantsAudio && shape.budget.audio.sampleRate.has_value() &&
           source.hasAudio() && source.audio.front().sampleRate > 0 &&
-          *request.audio.sampleRate != source.audio.front().sampleRate;
+          *shape.budget.audio.sampleRate != source.audio.front().sampleRate;
       const bool channelChange =
-          wantsAudio && request.audio.channels.has_value() &&
+          wantsAudio && shape.budget.audio.channels.has_value() &&
           source.hasAudio() && source.audio.front().channels > 0 &&
-          *request.audio.channels != source.audio.front().channels;
+          *shape.budget.audio.channels != source.audio.front().channels;
       if ((sampleRateChange || channelChange) && !caps->audioResampling) {
         return;
       }
@@ -577,10 +1095,9 @@ PlanResult Planner::plan(const MediaInfo &source,
     // subtitleBurnIn. Sources with subtitles under a Preserve policy must
     // not lose them by routing to a backend that silently drops text
     // tracks.
-    const bool burnIn = request.subtitles.policy == SubtitlePolicy::BurnIn;
-    const bool preserveWithSubtitles =
-        request.subtitles.policy == SubtitlePolicy::Preserve &&
-        source.hasSubtitles();
+    const bool burnIn = shape.burnIn;
+    const bool preserveWithSubtitles = shape.keepSubtitles &&
+                                       source.hasSubtitles();
     if (burnIn && !caps->subtitleBurnIn) {
       return;
     }
@@ -601,8 +1118,7 @@ PlanResult Planner::plan(const MediaInfo &source,
     if (wantsAudio) {
       assign(StageId::AudioProcessing);
     }
-    if ((source.hasSubtitles() || request.subtitles.externalUri.has_value()) &&
-        request.subtitles.policy == SubtitlePolicy::BurnIn) {
+    if ((source.hasSubtitles() || shape.burnIn) && shape.burnIn) {
       assign(StageId::SubtitleProcessing);
     }
     if (!streamCopy) {
@@ -619,8 +1135,7 @@ PlanResult Planner::plan(const MediaInfo &source,
             : 0.0;
     pipeline.videoStreamCopy = streamCopy && canStreamCopyVideo;
     pipeline.audioStreamCopy = streamCopy && canStreamCopyAudio;
-    pipeline.subtitleStreamCopy =
-        request.subtitles.policy == SubtitlePolicy::Preserve;
+    pipeline.subtitleStreamCopy = shape.keepSubtitles && !shape.burnIn;
 
     // Cost inputs: prefer telemetry observations over static priors.
     double throughput = 0.0, setupMs = 0.0, transferMs = 0.0;
@@ -655,40 +1170,44 @@ PlanResult Planner::plan(const MediaInfo &source,
     candidate.throughput = streamCopy ? throughput * 20.0 : throughput;
     candidate.setupMs = setupMs;
     candidate.transferMs = transferMs;
-
-    // Processing-mode alignment (user preference, soft factor only — a
-    // valid pipeline always beats an invalid one).
-    switch (request.processingMode) {
-      case ProcessingMode::Auto:
-        candidate.preferenceScore = 0.0;
-        break;
-      case ProcessingMode::PreferNative:
-        candidate.preferenceScore =
-            (backend == BackendId::Android || backend == BackendId::Apple)
-                ? 1.0
-                : 0.0;
-        break;
-      case ProcessingMode::PreferSoftware:
-        candidate.preferenceScore = backend == BackendId::Ffmpeg ? 1.0 : 0.0;
-        break;
-      case ProcessingMode::Balanced:
-        candidate.preferenceScore = hw ? 0.5 : 0.2;
-        break;
-    }
+    candidate.preferenceScore = 0.0; // automatic routing (mode retired)
 
     std::string summary;
     if (pipeline.videoStreamCopy && pipeline.audioStreamCopy &&
         sameContainer) {
       summary = "Fast remux (stream copy, no re-encoding)";
+      if (wantsTrim) {
+        summary += " with keyframe-snapped trim";
+      }
     } else if (pipeline.videoStreamCopy) {
       summary = std::string("Remux to ") + containerName(outContainer) +
                 " (video stream copy)";
+      if (wantsTrim) {
+        summary += " with keyframe-snapped trim";
+      }
     } else {
       summary = std::string("Transcode ") + codecName(outVideoCodec) + " via " +
                 backendName(backend) + (hw ? " (hardware)" : " (software)") +
                 " -> " + containerName(outContainer);
       if (pipeline.audioStreamCopy) {
         summary += " (audio copy)";
+      }
+      if (shape.hasCrop) {
+        summary += " (crop)";
+      }
+      if (shape.rotationDegrees != 0) {
+        summary += " (rotate " + std::to_string(shape.rotationDegrees) + ")";
+      }
+      if (shape.playbackSpeed.has_value()) {
+        summary += " (speed " +
+                   std::to_string(int(*shape.playbackSpeed * 100.0) / 100.0) +
+                   "x)";
+      }
+      if (shape.reverse) {
+        summary += " (reverse)";
+      }
+      if (shape.hdrToSdr) {
+        summary += " (HDR -> SDR)";
       }
     }
     pipeline.summary = std::move(summary);
@@ -698,7 +1217,7 @@ PlanResult Planner::plan(const MediaInfo &source,
   // Stream-copy first (never re-encode unnecessarily), then transcodes.
   // Extraction jobs already have their candidates; generating transcode
   // candidates for a subtitle-only request would be meaningless.
-  if (!extractJob) {
+  if (!shape.subtitleExtract) {
     if (streamCopyIsValid &&
         (sameContainer ||
          features_.containerAccepts(outContainer, outVideoCodec))) {
@@ -725,36 +1244,27 @@ PlanResult Planner::plan(const MediaInfo &source,
   // compose a hybrid route that would silently ignore the window. The same
   // holds for geometry transforms and the audio DSP chain: the v1 stage
   // contracts carry plain Yuv420P frames and stream-copied audio only.
-  const bool wantsAnyTrim =
-      request.trim.startUs != 0 || request.trim.endUs != -1;
+  const bool wantsAnyTrim = !shape.trimRanges.empty();
   const bool wantsTransform =
-      (request.video.crop.has_value() && request.video.crop->active()) ||
-      request.video.rotationDegrees != 0 || request.video.flipHorizontal ||
-      request.video.flipVertical;
+      shape.hasCrop || shape.rotationDegrees != 0 || shape.flipHorizontal ||
+      shape.flipVertical || shape.playbackSpeed.has_value() || shape.reverse ||
+      shape.hdrToSdr;
   const bool wantsAudioDsp =
-      request.audio.gainDb.has_value() ||
-      request.audio.fadeInMs.has_value() ||
-      request.audio.fadeOutMs.has_value() || request.audio.normalizeLoudness ||
-      request.audio.playbackSpeed.has_value() || request.audio.removeSilence;
-  // v1 stage contracts carry no advanced encoder tuning and no multi-track
-  // / replacement / cover-art audio handling: such requests stay on
-  // whole-pipeline backends.
+      shape.gainDb.has_value() || shape.fadeInMs.has_value() ||
+      shape.fadeOutMs.has_value() || shape.normalize ||
+      shape.audioSpeed.has_value() || shape.removeSilence;
+  // v1 stage contracts carry no multi-track / replacement / cover-art
+  // audio handling: such requests stay on whole-pipeline backends.
   const bool wantsAdvancedAudio =
-      (request.audio.allTracks && source.audio.size() > 1) ||
-      request.audio.sourceTrackIndex >= 0 ||
-      request.audio.replaceAudioUri.has_value() ||
-      request.audio.coverArtUri.has_value();
-  const bool wantsEncoderTuning =
-      request.video.profile.has_value() || request.video.level.has_value() ||
-      request.video.pixelFormat.has_value() ||
-      request.video.gopSize.has_value() || request.video.bFrames.has_value();
+      (shape.allSourceAudioTracks && source.audio.size() > 1) ||
+      shape.audioTrackIndex >= 0 || shape.replaceAudioUri.has_value() ||
+      shape.coverArtUri.has_value() || shape.hasExternalAudio;
   // Geometry/rate changes mirror HybridExecutor::canExecute (v1 hybrid
   // carries source geometry and rate): planning a hybrid route the
   // executor must then refuse would surface as a mid-job execution error
   // instead of an honest infeasible plan.
   const bool wantsGeometryChange =
-      request.video.resolutionHeight.has_value() ||
-      request.video.frameRate.has_value();
+      shape.resolutionHeight.has_value() || shape.frameRate.has_value();
   // HDR sources never ride the hybrid interchange: the CPU-frame pipeline
   // re-encodes PQ/HLG pixels through the default 8-bit SDR path — the same
   // washed-out output the single-backend HDR gate refuses. Only a
@@ -776,8 +1286,7 @@ PlanResult Planner::plan(const MediaInfo &source,
       });
   if (wantsVideo && !hasTranscodeCandidate && !wantsAnyTrim &&
       !wantsTransform && !wantsAudioDsp && !wantsAdvancedAudio &&
-      !wantsEncoderTuning && !wantsGeometryChange &&
-      !(hdrSource && !anyStageDecoderToneMaps)) {
+      !wantsGeometryChange && !(hdrSource && !anyStageDecoderToneMaps)) {
     const bool audioCopyable =
         !wantsAudio ||
         (source.hasAudio() &&
@@ -904,7 +1413,7 @@ PlanResult Planner::plan(const MediaInfo &source,
                 "requested output on this device."
               : "No registered backend can produce the requested output.";
     }
-    return result;
+    return Result<PlanResult>(std::move(result));
   }
 
   // ----- Cost model + ranking ----------------------------------------------
@@ -935,6 +1444,17 @@ PlanResult Planner::plan(const MediaInfo &source,
               return scoreCandidate(a) < scoreCandidate(b);
             });
 
+  // The rate policy + budget for size estimation.
+  shape.budget.outputContainer = outContainer;
+  shape.budget.audioEnabled = wantsAudio;
+  shape.budget.videoEnabled = wantsVideo;
+  shape.budget.videoCodec = outVideoCodec;
+  shape.budget.resolutionHeight = shape.resolutionHeight;
+  shape.budget.frameRate = shape.frameRate;
+  shape.budget.playbackSpeed = shape.playbackSpeed;
+  const ResolvedRatePolicy rate =
+      resolveRatePolicy(source, shape.compression, shape.budget);
+
   for (auto &candidate : candidates) {
     PlannedPipeline planned;
     planned.pipeline = std::move(candidate.pipeline);
@@ -942,8 +1462,12 @@ PlanResult Planner::plan(const MediaInfo &source,
     planned.expectedThroughput = candidate.throughput;
     planned.setupLatencyMs = candidate.setupMs;
     planned.transferCostMs = candidate.transferMs;
-    planned.estimatedOutputBytes =
-        estimateOutputBytes(source, planned.pipeline, request);
+    if (shape.subtitleExtract) {
+      planned.estimatedOutputBytes = std::nullopt; // sidecar: unknown, honest
+    } else {
+      planned.estimatedOutputBytes =
+          estimateOutputBytes(source, planned.pipeline, shape.budget, rate);
+    }
     planned.rationale = planned.pipeline.summary;
     result.alternates.push_back(std::move(planned));
   }
@@ -978,15 +1502,16 @@ PlanResult Planner::plan(const MediaInfo &source,
     }
   }
 
-  // Fit-under-size feasibility cross-check with real budget math.
-  if (request.goal.kind == GoalKind::FitUnderSize &&
-      request.goal.targetSizeBytes > 0) {
+  // Target-size feasibility cross-check with real budget math.
+  if (shape.compression.enabled &&
+      shape.compression.preset == CompressionPreset::TargetSize &&
+      shape.compression.targetSizeBytes > 0) {
     const BitrateBudget budget = computeBitrateBudget(
-        source, request, request.goal.targetSizeBytes);
+        source, shape.budget, shape.compression.targetSizeBytes);
     if (!budget.feasible) {
       addNote(budget.message);
     } else if (result.best->estimatedOutputBytes.value_or(0) >
-               std::int64_t(request.goal.targetSizeBytes * 1.10)) {
+               std::int64_t(shape.compression.targetSizeBytes * 1.10)) {
       addNote(
           "Estimated output exceeds the target size; consider a lower "
           "resolution or bitrate for a safer margin.");
@@ -996,7 +1521,7 @@ PlanResult Planner::plan(const MediaInfo &source,
   const auto elapsed = std::chrono::steady_clock::now() - startTime;
   result.planningMs =
       std::chrono::duration<double, std::milli>(elapsed).count();
-  return result;
+  return Result<PlanResult>(std::move(result));
 }
 
 } // namespace velmux::core

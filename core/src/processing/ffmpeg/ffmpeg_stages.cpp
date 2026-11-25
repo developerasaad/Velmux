@@ -112,7 +112,7 @@ FfmpegStageDecoder::~FfmpegStageDecoder() {
 Error FfmpegStageDecoder::open(const std::string &sourcePath,
                                InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "ffmpeg");
   }
   int rc = avformat_open_input(&impl_->in, sourcePath.c_str(), nullptr,
@@ -138,7 +138,7 @@ Error FfmpegStageDecoder::open(const std::string &sourcePath,
   const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
   if (codec == nullptr) {
     return Error::make(
-        ErrorCode::UnsupportedFeature,
+        ErrorCode::UnsupportedOperation,
         std::string("no FFmpeg decoder for input video codec: ") +
             avcodec_get_name(stream->codecpar->codec_id),
         "ffmpeg");
@@ -309,7 +309,7 @@ FfmpegStageEncoder::~FfmpegStageEncoder() {
 Error FfmpegStageEncoder::open(const StageEncoderConfig &config,
                                InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "ffmpeg");
   }
   const char *name = encoderNameFor(config.codec);
@@ -319,7 +319,7 @@ Error FfmpegStageEncoder::open(const StageEncoderConfig &config,
     codec = avcodec_find_encoder(avCodecFor(config.codec));
   }
   if (codec == nullptr) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        std::string("no FFmpeg encoder for codec: ") +
                            velmux::core::codecName(config.codec),
                        "ffmpeg");
