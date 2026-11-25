@@ -175,13 +175,18 @@ verify_launch "cold-launch"
 # is missing — the first XCTest executions (run 45528452313) had test
 # processes die mid-run ("Restarting after unexpected exit, crash, or test
 # timeout") because of exactly that. The Release host is also the exact
-# product artifact the cold-launch phase verified.
+# product artifact the cold-launch phase verified. ARCHS=arm64 matches the
+# app build: Release builds default to ONLY_ACTIVE_ARCH=NO, so without the
+# pin the test bundle links a universal simulator binary and the x86_64
+# slice cannot resolve the FFmpeg symbols (the simulator artifact is
+# single-slice arm64 by design, D-058).
 vlog "running VelmuxEngineTests"
 run_in "$IOS_DIR" xcodebuild test \
   -workspace Velmux.xcworkspace -scheme Velmux \
   -configuration Release \
   -destination "platform=iOS Simulator,id=$UDID" \
   -derivedDataPath build \
+  ARCHS=arm64 \
   CODE_SIGNING_ALLOWED=NO \
   | tee "$DIAG_DIR/xctest.log"
 grep -q "Test Suite 'All tests' passed\|TEST SUCCEEDED" "$DIAG_DIR/xctest.log" \
