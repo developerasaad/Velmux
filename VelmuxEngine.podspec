@@ -91,6 +91,29 @@ Pod::Spec.new do |spec|
     # amalgamation is compiled with these same feature macros.
     'OTHER_CFLAGS' => '-DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_THREADSAFE=1 -DSQLITE_DEFAULT_JOURNAL_MODE_LIMITED=1',
   }
+
+  # The C facade (velmux_bridge.h) is the engine's public ABI, and host
+  # binaries link this pod STATICALLY: the Release link dead-strips any
+  # facade entry point the host app itself never calls — which silently
+  # removes symbols that other images legitimately resolve through the
+  # host binary. First observed with velmux_engine_destroy: the app never
+  # destroys its process-owned engine (D-035), so the Release app binary
+  # dead-stripped it and the VelmuxEngineTests bundle (which resolves
+  # engine symbols through the app binary via -bundle_loader) could not
+  # link (Debug builds do not dead-strip, which is why the Debug test run
+  # linked). Every facade entry point is therefore anchored as a dead-strip
+  # root in consumers (-u makes the symbol undefined-required, so the
+  # linker keeps it alive even when the host never calls it).
+  facade_symbols = %w[
+    velmux_engine_create velmux_engine_destroy velmux_inspect velmux_plan
+    velmux_generate_sample velmux_start_job velmux_list_jobs velmux_get_job
+    velmux_is_job_active velmux_describe_backends velmux_cancel_job
+    velmux_pause_job velmux_resume_job velmux_retry_job velmux_delete_job
+    velmux_update_resources velmux_poll_events velmux_free_string
+  ]
+  spec.user_target_xcconfig = {
+    'OTHER_LDFLAGS' => facade_symbols.map { |symbol| "-Wl,-u,_#{symbol}" }.join(' '),
+  }
   spec.public_header_files = 'bridge/cpp/velmux_bridge.h'
   spec.source_files = source_files
   if ffmpeg_relative
