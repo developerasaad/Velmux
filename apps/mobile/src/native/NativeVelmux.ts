@@ -175,6 +175,11 @@ export interface Spec extends TurboModule {
   isJobActive(jobId: string): Promise<boolean>;
   listJobs(): Promise<JobSnapshot[]>;
   describeBackends(): Promise<string[]>;
+  // Android-only: hand an output file to the system share sheet through a
+  // FileProvider content URI (RN core's Share cannot share files on
+  // Android). Resolves false on iOS, where the core Share API already
+  // handles file:// URLs.
+  shareOutput(outputPath: string, mimeType: string, title: string): Promise<boolean>;
   addListener(eventName: string): Promise<void>;
   removeListeners(count: number): Promise<void>;
 }

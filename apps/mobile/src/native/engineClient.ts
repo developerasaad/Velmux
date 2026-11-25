@@ -139,6 +139,23 @@ export function describeBackends(): Promise<string[]> {
 }
 
 /**
+ * Android: shares an output file through the system sheet (FileProvider
+ * content URI — core Share cannot share files on Android). Resolves false
+ * on iOS or when no activity could handle the share; never throws.
+ */
+export async function shareOutputFile(
+  outputPath: string,
+  mimeType: string,
+  title: string,
+): Promise<boolean> {
+  try {
+    return await requireModule().shareOutput(outputPath, mimeType, title);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Narrows an untyped event-emitter payload to a job event. Unknown shapes
  * are ignored rather than coerced.
  */

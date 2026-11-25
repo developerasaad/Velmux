@@ -180,6 +180,11 @@ dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
 
+    // FileProvider for sharing engine outputs as content URIs (the app
+    // declares no storage permissions; sharing grants per-invocation read
+    // access through this provider).
+    implementation("androidx.core:core:1.13.1")
+
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")
     } else {

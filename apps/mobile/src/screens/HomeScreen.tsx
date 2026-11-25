@@ -24,6 +24,7 @@ import {EmptyState} from '../components/EmptyState';
 import {JobRow} from '../components/JobRow';
 import {Screen} from '../components/Screen';
 import {formatBytes, formatSavedPercent} from '../format/format';
+import {importPickedFiles} from '../native/fileAccess';
 import type {MediaSource} from '../native/NativeVelmux';
 import {
   selectActiveJobs,
@@ -163,28 +164,48 @@ export function HomeScreen() {
         const picked = await pick({
           type: [types.video, types.audio],
           mode: 'open',
-          // Durable, persistable source access: recovery must be able to
-          // reopen the file long after the picker closed (spec: file access).
+          // Persistable source access where the platform offers it
+          // (Android URI permission; iOS scoped access during the copy).
           requestLongTermAccess: true,
           allowMultiSelection: true,
         });
-        if (picked.length === 1) {
+        if (picked.length === 0) {
+          return;
+        }
+        // Durable local sources: the engine's contract is local files
+        // (content:// URIs and scoped in-place URLs are not readable by
+        // the backends), so every pick is copied into app-durable storage
+        // once, here. Failures are reported honestly per file.
+        const {sources, failures} = await importPickedFiles(picked);
+        if (failures.length > 0) {
+          const lines = failures
+            .map(failure => `${failure.name}: ${failure.reason}`)
+            .join('\n');
+          if (sources.length === 0) {
+            Alert.alert(
+              'Could not import',
+              'None of the selected files could be imported.\n\n' + lines,
+            );
+            return;
+          }
+          Alert.alert(
+            'Some files were skipped',
+            'These files could not be imported:\n\n' + lines,
+          );
+        }
+        if (sources.length === 1) {
           // Single-source flow: straight into the workspace, no batch.
-          const [only] = picked;
-          const source: MediaSource = {
-            uri: only.uri,
-            displayName: only.name ?? 'Untitled media',
-          };
+          const [only] = sources;
           clearBatch();
-          navigation.navigate('Convert', {source, intent});
+          navigation.navigate('Convert', {source: only, intent});
           return;
         }
         setSelection({
           intent,
-          files: picked.map(file => ({
-            uri: file.uri,
-            name: file.name ?? 'Untitled media',
-            sizeBytes: file.size,
+          files: sources.map(source => ({
+            uri: source.uri,
+            name: source.displayName,
+            sizeBytes: null,
           })),
         });
       } catch (error) {

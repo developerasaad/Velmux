@@ -1,5 +1,6 @@
 package com.velmux.mobile
 
+import android.content.Intent
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -203,6 +204,45 @@ class VelmuxEngineModule(reactContext: ReactApplicationContext) :
       promise.resolve(result)
     } catch (error: JSONException) {
       promise.reject("E_ENGINE", "malformed engine response", error)
+    }
+  }
+
+  /**
+   * Shares one engine output through the system sheet. The engine's
+   * outputs live in app-private storage (filesDir/velmux/outputs), which
+   * other apps cannot read; the FileProvider exposes exactly that tree as
+   * granted content URIs (see the provider declaration in the manifest —
+   * the only storage-related surface the app has, and it needs no
+   * permissions). No storage permissions are involved.
+   */
+  override fun shareOutput(outputPath: String, mimeType: String, title: String, promise: Promise) {
+    try {
+      val file = java.io.File(outputPath)
+      if (!file.isFile) {
+        promise.resolve(false)
+        return
+      }
+      val authority = "${appContext.packageName}.fileprovider"
+      val uri = androidx.core.content.FileProvider.getUriForFile(appContext, authority, file)
+      val send = Intent(Intent.ACTION_SEND).apply {
+        type = if (mimeType.isBlank()) "application/octet-stream" else mimeType
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_TITLE, title)
+        // Grant the receiving app read access to exactly this file.
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      val chooser = Intent.createChooser(send, title).apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      val activity = currentActivity ?: reactApplicationContext.currentActivity
+      if (activity == null) {
+        promise.resolve(false)
+        return
+      }
+      activity.startActivity(chooser)
+      promise.resolve(true)
+    } catch (error: Exception) {
+      promise.resolve(false)
     }
   }
 

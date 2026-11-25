@@ -555,4 +555,85 @@ class NativeConversionTest {
       VelmuxJni.nativeDestroyEngine(handle)
     }
   }
+
+  /**
+   * The durable-import contract end to end with REAL media: the document
+   * picker returns content:// URIs on Android, which no engine backend can
+   * open (the engine's contract is local files). The app's platform layer
+   * copies the picked file into durable app storage at pick time
+   * (keepLocalCopy's documentDirectory destination). This test reproduces
+   * that exact flow: a REAL generated fixture exposed through a REAL
+   * content URI (the app's FileProvider), imported through the
+   * ContentResolver into filesDir (the keepLocalCopy primitive), then
+   * converted through the engine and validated — plus the storage-lifecycle
+   * guarantee: no transcode segment directories survive a completed job
+   * (the engine removes them after assembly; the app's cleanup contract
+   * must never leave them behind on device).
+   */
+  @Test
+  fun safImportedSourceConvertsAndCleansSegments() {
+    val fixture = generateMp4(2)
+    val handle = engineHandle()
+    val engineDir = File(context.filesDir, "velmux-test-engine")
+    val imported = File(File(context.filesDir, "imports"), "saf-import-${System.nanoTime()}.mp4")
+    imported.parentFile!!.mkdirs()
+    try {
+      // Serve the fixture through a REAL content URI: the provider covers
+      // filesDir/velmux/**, so the fixture is moved into that tree first.
+      val served = File(File(engineDir, "outputs"), "saf-source-${System.nanoTime()}.mp4")
+      served.parentFile!!.mkdirs()
+      File(fixture.path).copyTo(served, overwrite = true)
+      val authority = "${context.packageName}.fileprovider"
+      val uri = androidx.core.content.FileProvider.getUriForFile(context, authority, served)
+
+      // The keepLocalCopy primitive: content URI -> durable local file.
+      context.contentResolver.openInputStream(uri)!!.use { input ->
+        imported.outputStream().use { output -> input.copyTo(output) }
+      }
+      assertTrue("imported copy is empty", imported.length() > 1024)
+      // The engine must be able to open the imported copy directly.
+      VelmuxJni.nativeInspect(handle, imported.absolutePath, "imported.mp4").let { raw ->
+        val info = String(raw, Charsets.UTF_8)
+        assertTrue("engine cannot read the imported copy: $info",
+            info.contains("\"codec\":\"h264\""))
+      }
+
+      val request = """
+        {
+          "source": {"uri": "${imported.absolutePath}", "displayName": "imported.mp4"},
+          "outputContainer": "mp4",
+          "goal": {"kind": "custom"},
+          "video": {"codec": "h264", "enabled": true,
+                    "rateControl": "bitrate", "bitRate": 800000},
+          "audio": {"codec": "aac", "enabled": true, "bitRate": 64000},
+          "subtitles": {"policy": "remove"},
+          "processingMode": "auto"
+        }
+      """.trimIndent()
+      val result = runJob(handle, request)
+      assertEquals("engine error: ${result.error}", "completed", result.state)
+      val out = File(result.outputPath!!)
+      assertTrue("output missing", out.exists() && out.length() > 1024)
+      val probed = probe(out.absolutePath)
+      assertEquals("video/avc", probed.videoMime)
+      assertTrue("duration too short",
+          probed.durationUs > fixture.durationUs * 85 / 100)
+
+      // Storage lifecycle: a COMPLETED job leaves no segment directories.
+      // (Segments live at <engine>/outputs/velmux-seg-<jobId> and are
+      // removed after successful assembly; leftovers would grow storage
+      // without bound across jobs.)
+      val outputs = File(engineDir, "outputs")
+      val leftovers = outputs.listFiles { file ->
+        file.isDirectory && file.name.startsWith("velmux-seg-")
+      } ?: emptyArray()
+      assertTrue(
+          "completed job left segment directories: " +
+              leftovers.joinToString { it.name },
+          leftovers.isEmpty())
+    } finally {
+      imported.delete()
+      VelmuxJni.nativeDestroyEngine(handle)
+    }
+  }
 }

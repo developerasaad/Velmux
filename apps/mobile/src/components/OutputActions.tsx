@@ -1,22 +1,31 @@
 import React, {useCallback, useState} from 'react';
-import {Alert, Platform, Share} from 'react-native';
+import {Alert} from 'react-native';
 
 import {Button} from './Button';
 import type {JobSnapshot} from '../native/NativeVelmux';
 import * as engineClient from '../native/engineClient';
+import {saveOutput, shareOutput} from '../native/fileAccess';
 import {useJobsStore} from '../state/jobsStore';
 
 /**
  * Output-file actions for completed jobs (History).
  *
  * Output location: the engine reports the absolute path of the produced
- * file in every job snapshot — C++ `JobSnapshot::outputPath` ("Absolute
- * path of the produced file once known (for open/share)"), serialized by
- * the bridge as `outputPath` and passed through to JS unchanged (empty
- * string until the engine assigns it at run start). The TS contract
- * declares the field as it lands with the output-location contract wave;
- * `outputLocationOf` reads it defensively so this component compiles and
- * behaves correctly against either shape.
+ * file in every job snapshot (`outputPath`); outputs live in the app's
+ * private storage by design (history, re-export and recovery keep
+ * working off them). Users reach the outside world through the system's
+ * own destinations — no storage permissions exist in this app:
+ *
+ * - Save to…: the platform save UI (Storage Access Framework
+ *   ACTION_CREATE_DOCUMENT on Android, the Files picker on iOS) with the
+ *   app streaming the file to the user-chosen location. The app's copy is
+ *   kept.
+ * - Share: on iOS through core Share (file:// URLs); on Android through
+ *   the engine module's FileProvider content URI (core Share is text-only
+ *   there).
+ * - Delete: the engine's `deleteJob` removes the job's durable record; it
+ *   never deletes the output file (bridge contract: "outputs are not
+ *   touched"). The control is labeled and confirmed accordingly.
  */
 
 /** Snapshot shape including the engine's output-location field. */
@@ -32,47 +41,49 @@ export interface OutputActionsProps {
   job: JobSnapshot;
 }
 
-/**
- * Platform honesty (checked against the engine contract and RN 0.88):
- *
- * - Share: RN core `Share` accepts a `url` only on iOS; the engine returns
- *   a bare absolute path, which iOS shares correctly once prefixed with
- *   `file://`. On Android the core `Share` API can only share text — a
- *   local file needs a `content://` URI from a FileProvider, which is a
- *   native-manifest change outside this JS layer. So Share is offered on
- *   iOS only; no dead button is shipped on Android.
- * - Play/Open: `Linking.openURL` with a `file://` URI is unreliable on iOS
- *   and requires `content://` on Android, and RN core has no document
- *   interaction controller or inline player. On iOS the share sheet
- *   already offers "open in app" targets, so no separate Play/Open button
- *   is shipped rather than one that pretends to work.
- * - Delete: the engine's `deleteJob` removes the job's durable record; it
- *   never deletes the output file (bridge contract: "outputs are not
- *   touched"). The control is labeled and confirmed accordingly.
- */
 export function OutputActions({job}: OutputActionsProps) {
   const deleteJob = useJobsStore(state => state.deleteJob);
   const [removing, setRemoving] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const outputPath = outputLocationOf(job);
+  const outputName = job.outputName ?? job.sourceName;
 
-  const shareOutput = useCallback(async () => {
+  const saveToDestination = useCallback(async () => {
     if (outputPath === null) {
       return;
     }
-    // The engine reports a bare absolute POSIX path, not a file URI.
-    const url = outputPath.startsWith('file://')
-      ? outputPath
-      : `file://${outputPath}`;
+    setSaving(true);
     try {
-      await Share.share({
-        title: job.outputName ?? job.sourceName,
-        url,
-      });
-    } catch {
-      // Sharing was canceled or the system refused the URL; the share
-      // sheet itself is the user-facing feedback, so nothing is faked here.
+      const result = await saveOutput(outputPath, outputName);
+      if (!result.saved && !result.canceled) {
+        Alert.alert(
+          'Could not save',
+          result.error ?? 'The file could not be written to the destination.',
+        );
+      }
+    } finally {
+      setSaving(false);
     }
-  }, [job.outputName, job.sourceName, outputPath]);
+  }, [outputName, outputPath]);
+
+  const share = useCallback(async () => {
+    if (outputPath === null) {
+      return;
+    }
+    setSharing(true);
+    try {
+      const shared = await shareOutput(outputPath, outputName);
+      if (!shared) {
+        Alert.alert(
+          'Could not share',
+          'No app could receive the file. Try "Save to…" instead.',
+        );
+      }
+    } finally {
+      setSharing(false);
+    }
+  }, [outputName, outputPath]);
 
   const removeRecord = useCallback(async () => {
     setRemoving(true);
@@ -108,29 +119,26 @@ export function OutputActions({job}: OutputActionsProps) {
     );
   }, [job.sourceName, removeRecord]);
 
-  if (Platform.OS !== 'ios') {
-    // Android: no honest file-share path exists in this build (see the
-    // platform notes above). Record removal still works everywhere.
-    return (
-      <Button
-        label="Remove"
-        variant="dangerGhost"
-        loading={removing}
-        accessibilityLabel={`Remove ${job.sourceName} from history`}
-        onPress={confirmRemove}
-      />
-    );
-  }
-
   return (
     <>
       <Button
+        label="Save to…"
+        variant="primary"
+        loading={saving}
+        disabled={outputPath === null}
+        accessibilityLabel={`Save ${outputName} to a destination you choose`}
+        onPress={() => {
+          saveToDestination();
+        }}
+      />
+      <Button
         label="Share"
         variant="secondary"
+        loading={sharing}
         disabled={outputPath === null}
-        accessibilityLabel={`Share ${job.outputName ?? job.sourceName}`}
+        accessibilityLabel={`Share ${outputName}`}
         onPress={() => {
-          shareOutput();
+          share();
         }}
       />
       <Button

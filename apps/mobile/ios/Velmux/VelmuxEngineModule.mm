@@ -490,6 +490,21 @@ RCT_EXPORT_MODULE(VelmuxEngine)
   [self complete:[self ownedString:raw] resolve:resolve reject:reject];
 }
 
+// Android-only spec method: on iOS the core Share API already shares
+// file:// URLs, so the JS layer never routes through here; resolve false
+// (never reject) so a stray call stays a no-op.
+- (void)shareOutput:(NSString *)outputPath
+           mimeType:(NSString *)mimeType
+              title:(NSString *)title
+            resolve:(RCTPromiseResolveBlock)resolve
+             reject:(RCTPromiseRejectBlock)reject {
+  (void)outputPath;
+  (void)mimeType;
+  (void)title;
+  (void)reject;
+  resolve(@(NO));
+}
+
 - (void)addListener:(NSString *)eventName
             resolve:(RCTPromiseResolveBlock)resolve
              reject:(RCTPromiseRejectBlock)reject {

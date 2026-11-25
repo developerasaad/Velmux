@@ -1,17 +1,12 @@
 import React, {useCallback} from 'react';
-import {
-  ActivityIndicator,
-  Platform,
-  Share,
-  StyleSheet,
-  View,
-} from 'react-native';
+import {ActivityIndicator, StyleSheet, View} from 'react-native';
 
 import {AppText} from '../../components/AppText';
 import {Button} from '../../components/Button';
 import {ErrorState} from '../../components/ErrorState';
 import {Section} from '../../components/Section';
 import {formatBytes} from '../../format/format';
+import {shareOutput} from '../../native/fileAccess';
 import type {SampleResult} from '../../native/engineClient';
 import {useTheme} from '../../theme';
 
@@ -26,7 +21,6 @@ export type SampleState =
   | {status: 'ready'; sample: SampleResult};
 
 export interface SamplePreviewCardProps {
-  sourceName: string;
   sampleState: SampleState;
   onGenerate: () => void;
 }
@@ -38,13 +32,12 @@ export interface SamplePreviewCardProps {
  * the full conversion.
  *
  * Sample file actions reuse the OutputActions (History) platform story:
- * on iOS the share sheet is the open/play path, and no separate Play
+ * the platform share (iOS share sheet with the file:// URL; Android's
+ * FileProvider path through the engine module), and no separate Play
  * control is shipped because RN core has no honest file-play API on
- * either platform. On Android core `Share` cannot share files, so the
- * result stands on its size and caption alone.
+ * either platform.
  */
 export function SamplePreviewCard({
-  sourceName,
   sampleState,
   onGenerate,
 }: SamplePreviewCardProps) {
@@ -63,20 +56,13 @@ export function SamplePreviewCard({
     if (samplePath === null) {
       return;
     }
-    // The engine reports a bare absolute POSIX path, not a file URI.
-    const url = samplePath.startsWith('file://')
-      ? samplePath
-      : `file://${samplePath}`;
-    try {
-      await Share.share({
-        title: `Sample of ${sourceName}`,
-        url,
-      });
-    } catch {
-      // Sharing was canceled or the system refused the URL; the share
-      // sheet itself is the user-facing feedback, so nothing is faked here.
-    }
-  }, [samplePath, sourceName]);
+    // Platform share (core Share with the file:// URL on iOS; the
+    // FileProvider path through the engine module on Android). The
+    // basename carries the extension, so Android resolves the MIME type
+    // for the share targets.
+    const sampleName = samplePath.slice(samplePath.lastIndexOf('/') + 1);
+    await shareOutput(samplePath, sampleName);
+  }, [samplePath]);
 
   let content: React.ReactNode;
   if (sampleState.status === 'generating') {
@@ -121,18 +107,16 @@ export function SamplePreviewCard({
         <AppText variant="caption" tone="muted">
           {`The densest ${SAMPLE_PREVIEW_SECONDS} seconds of the source at your current settings.`}
         </AppText>
-        {Platform.OS === 'ios' && (
-          <View style={styles.actions}>
-            <Button
-              label="Share sample"
-              variant="secondary"
-              disabled={samplePath === null}
-              onPress={() => {
-                shareSample();
-              }}
-            />
-          </View>
-        )}
+        <View style={styles.actions}>
+          <Button
+            label="Share sample"
+            variant="secondary"
+            disabled={samplePath === null}
+            onPress={() => {
+              shareSample();
+            }}
+          />
+        </View>
       </View>
     );
   } else {

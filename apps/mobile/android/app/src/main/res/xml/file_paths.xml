@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider scope for sharing engine outputs.
+     The engine's durable data directory is filesDir/velmux (EngineHolder);
+     outputs land in filesDir/velmux/outputs and transcode segments in
+     filesDir/velmux/outputs/velmux-seg-<jobId>. Only the velmux tree is
+     exposed — nothing else in filesDir is reachable through the provider,
+     and only as explicitly granted, per-invocation content URIs. -->
+<paths>
+    <files-path
+        name="velmux"
+        path="velmux/" />
+</paths>

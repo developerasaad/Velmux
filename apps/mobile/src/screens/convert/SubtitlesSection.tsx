@@ -7,6 +7,7 @@ import {Button} from '../../components/Button';
 import {OptionChips} from '../../components/OptionChips';
 import {Section} from '../../components/Section';
 import {Stepper} from '../../components/Stepper';
+import {importPickedFile} from '../../native/fileAccess';
 import {useConvertStore} from '../../state/convertStore';
 import type {SubtitlePolicy} from '../../state/convertStore';
 
@@ -37,9 +38,24 @@ export function SubtitlesSection() {
         requestLongTermAccess: true,
         allowMultiSelection: false,
       });
+      if (picked == null) {
+        return;
+      }
+      // Durable local copy: the engine consumes external subtitle files
+      // through its local-file contract, so the pick is imported into
+      // app-durable storage once (content:// URIs and scoped in-place
+      // URLs are not readable by the backends).
+      const {source, failure} = await importPickedFile(picked);
+      if (source == null) {
+        Alert.alert(
+          'Could not import subtitle',
+          failure ? `${failure.name}: ${failure.reason}` : 'the copy failed',
+        );
+        return;
+      }
       setExternalSubtitle({
-        uri: picked.uri,
-        name: picked.name ?? 'Subtitle file',
+        uri: source.uri,
+        name: source.displayName,
       });
     } catch (error) {
       if (

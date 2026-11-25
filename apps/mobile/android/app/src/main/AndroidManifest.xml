@@ -36,5 +36,21 @@
         android:name=".ConversionService"
         android:exported="false"
         android:foregroundServiceType="dataSync" />
+
+      <!-- Exposes the app's OWN engine output tree (filesDir/velmux) to
+           other apps as granted content URIs for share/open — the only
+           storage-related surface in the app. No storage permissions:
+           user-facing import goes through the system document picker and
+           exports through the system save UI (Storage Access Framework),
+           neither of which requires any. -->
+      <provider
+        android:name="androidx.core.content.FileProvider"
+        android:authorities="${applicationId}.fileprovider"
+        android:exported="false"
+        android:grantUriPermissions="true">
+        <meta-data
+          android:name="android.support.FILE_PROVIDER_PATHS"
+          android:resource="@xml/file_paths" />
+      </provider>
     </application>
 </manifest>

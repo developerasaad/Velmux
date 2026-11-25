@@ -318,7 +318,6 @@ export function ConvertScreen({route}: ConvertScreenProps) {
       }} />
       {planState.status === 'ready' && (
         <SamplePreviewCard
-          sourceName={source.displayName}
           sampleState={sampleState}
           onGenerate={runSample}
         />
