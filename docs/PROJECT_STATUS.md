@@ -8,7 +8,7 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
 | # | Milestone | State |
 |---|---|---|
 | 0 | Foundation | Complete |
-| 1 | First real Android conversion | Implemented; instrumented tests now RUN on KVM emulators (API 29 + 34) via android-emulated.yml (first green run pending); physical-device validation pending |
+| 1 | First real Android conversion | Implemented and CI-verified: instrumented engine tests are green on KVM emulators (API 29 + 34, 6/6 tests + cold-launch/relaunch RN-init-marker checks via android-emulated.yml); physical-device validation pending |
 | 2 | Capability system and planner | Complete at the core level (static feature registry, cached capability snapshots, per-request gating incl. trim/transforms/DSP, hybrid planning); host-validated |
 | 3 | FFmpeg toolchain | Complete: artifacts build in CI, both app builds consume them |
 | 4 | Hybrid pipeline proof | Stage contracts + HybridExecutor; F→F proven end-to-end in CI; native stage workers implemented (Android ImageReader/MediaCodec, Apple reader/writer) — hardware execution via emulator CI, physical devices pending |
@@ -51,7 +51,8 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
 - Android: app builds with the engine + FFmpeg linked (FFmpeg is a hard
   requirement of the app build — there is no without-FFmpeg path);
   MediaCodec surface transcode, remux, inspection implemented; instrumented
-  tests now execute on emulators (API 29 + 34) in CI. CORRECTION
+  tests are GREEN on emulators (API 29 + 34) in CI: cold launch with the RN
+  init marker, 6/6 engine tests, reinstall, relaunch. CORRECTION
   (2026-11-24): the produced APK was missing libappmodules.so (the app's
   CMake bypassed React Native's application integration), so the app
   crashed at startup ('PlatformConstants' TurboModule missing). Fixed:
@@ -65,7 +66,14 @@ tracks them. See docs/AUDIT.md for the feature-by-feature audit.
   Intel simulator slice is opt-in (VELMUX_IOS_SIM_X86_64=1). CORRECTION
   (2026-11-24): the previous three-slice lipo-merged model failed CI
   artifact validation after every build; fixed with the single-slice
-  model + exact-cause diagnostics in the artifact gate.
+  model + exact-cause diagnostics in the artifact gate. The simulator
+  cold launch is verified in CI (process alive + RN init marker in the
+  unified log + clean log — the marker chain D-060, green in runs
+  45494973378/45504299140/45512595413); the VelmuxEngineTests XCTest
+  suite reached its first CI executions after three never-compiled
+  defects were fixed (CMSampleBufferCreateReady argument order,
+  XCTAssertNotNil on the C facade handle, the VelmuxEngineTestConfig
+  header search path that had silently stubbed the hybrid tests out).
 - Release engineering: assembleRelease/bundleRelease with R8 + resource
   shrinking + app-specific keeps, CI-secret signing with an explicit
   test-signed fallback, Release iOS builds (simulator + unsigned device),

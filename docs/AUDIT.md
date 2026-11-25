@@ -16,7 +16,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Requirement | Status | Evidence / gap |
 |---|---|---|
 | H.264/HEVC/AV1/VP8/VP9/MPEG-4/MPEG-2/MPEG-1/H.263/VC-1/WMV/ProRes/DNxHD/FFV1/MJPEG decode+encode asymmetry | IMPLEMENTED + VERIFIED (FFmpeg path, host CI) | `core/src/feature_registry.cpp` catalog; real transcode tests `backends/ffmpeg/tests/ffmpeg_backend_tests.cpp`; remux/copy tests; planner rejects unsupported combos (`core/tests/planner_tests.cpp`) |
-| Native (MediaCodec/VideoToolbox) encode/decode where device supports | IMPLEMENTED — HARDWARE VALIDATION PENDING | Android `backends/android/cpp/media_transcoder.cpp` (real surface-path MediaCodec); Apple `backends/apple/objcpp/apple_pipeline.mm` (real VideoToolbox/AVFoundation). Instrumented tests execute on KVM emulators in CI (`android-emulated.yml`, API 29 + 34); physical-device runs remain pending |
+| Native (MediaCodec/VideoToolbox) encode/decode where device supports | IMPLEMENTED — HARDWARE VALIDATION PENDING | Android `backends/android/cpp/media_transcoder.cpp` (real surface-path MediaCodec); Apple `backends/apple/objcpp/apple_pipeline.mm` (real VideoToolbox/AVFoundation). Instrumented tests are GREEN on KVM emulators in CI (`android-emulated.yml`, API 29 + 34: cold launch + RN init marker + 6/6 tests + reinstall + relaunch, verified on commits 97f6799–8768d7f); physical-device runs remain pending |
 | HEVC software encode via FFmpeg | IMPLEMENTED + VERIFIED | libx265 3.6 pinned in the builder (`tools/ffmpeg-builder/versions.json`; CMake-4 compat patch in `lib.sh`); real H.264→HEVC transcode test with engine validation + ffprobe cross-check in the host suite |
 
 ## 2. Audio codecs (matrix §8)
@@ -170,7 +170,7 @@ Evidence cites files/functions. Last full revision: see Git history.
 | Area | Status |
 |---|---|
 | Android build (APK with FFmpeg) | IMPLEMENTED + VERIFIED (CI) |
-| Android instrumented tests executed | IMPLEMENTED (emulator CI; API 29 + 34, first green run pending the ubuntu-24.04 pin) | `android-emulated.yml` boots KVM emulators, installs the app, runs NativeConversionTest/HybridConversionTest with cold-launch/relaunch/recovery checks |
+| Android instrumented tests executed | IMPLEMENTED + VERIFIED (CI, 2026-11-24) | `android-emulated.yml` boots KVM emulators on API 29 + 34 (google_apis x86_64), installs the app, verifies the cold launch (process alive + RN init marker + clean log), runs 6/6 instrumented engine tests (NativeConversionTest/HybridConversionTest with on-device encoder fixtures + independent MediaExtractor validation), reinstalls the app AGP uninstalls and re-verifies the relaunch — green on both API levels (runs 45483513108 / 45494973509 / 45504299023) |
 | iOS simulator build with FFmpeg | IMPLEMENTED + VERIFIED (CI) |
 | iOS simulator tests (engine execution) | IMPLEMENTED (VelmuxEngineTests XCTest target runs via `./scripts/test.sh --ios-sim`; first green run pending the bash-3.2 fix) |
 | Physical-device validation (both platforms) | HARDWARE VALIDATION PENDING (documented; RC notes must state it) |
