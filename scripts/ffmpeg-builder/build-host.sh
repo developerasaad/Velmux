@@ -316,7 +316,13 @@ if [ ! -f "$HOST_PREFIX/lib/libzimg.a" ]; then
   zimg_build="$SRC_DIR/build-host/zimg"
   rm -rf "$zimg_build"
   mkdir -p "$zimg_build"
-  (cd "$zimg_build" && "$zimg_src/configure" --prefix="$HOST_PREFIX" \
+  # STL_LIBS is zimg's supported knob for the static-link closure: the
+  # default "-lstdc++" omits libm, and libzimg.a's libm_wrapper references
+  # log10f — FFmpeg's --pkg-config-flags=--static probe then fails with
+  # "DSO missing from command line" on modern ld. Declaring the full
+  # closure (-lstdc++ -lm) makes zimg.pc correct for every static consumer.
+  (cd "$zimg_build" && STL_LIBS="-lstdc++ -lm" "$zimg_src/configure" \
+     --prefix="$HOST_PREFIX" \
      --disable-shared --enable-static >/dev/null && \
    make -j"$JOBS" >/dev/null && make install >/dev/null)
   log "zimg installed"
@@ -371,7 +377,12 @@ if [ ! -f "$HOST_PREFIX/lib/libavcodec.a" ]; then
   if [ -n "$EXTRA_LIBDIR" ]; then
     EXTRA_LDFLAGS="$EXTRA_LDFLAGS -L$EXTRA_LIBDIR"
   fi
-  (cd "$FFBUILD" && "$ffmpeg_src/configure" \
+  # Diagnose failures loudly: a configure error swallowed by >/dev/null
+  # cost a full CI cycle to identify (the full log + ffbuild/config.log
+  # tail both print on failure, exactly like the Android builder).
+  HOST_CONFIGURE_LOG="$SRC_DIR/build-host/ffmpeg-configure.log"
+  mkdir -p "$(dirname "$HOST_CONFIGURE_LOG")"
+  if ! (cd "$FFBUILD" && "$ffmpeg_src/configure" \
      --prefix="$HOST_PREFIX" \
      --pkg-config-flags=--static \
      --extra-cflags="-I$HOST_PREFIX/include" \
@@ -399,7 +410,14 @@ if [ ! -f "$HOST_PREFIX/lib/libavcodec.a" ]; then
      --enable-zlib \
      --enable-protocol=file \
      --enable-protocol=pipe \
-     >/dev/null)
+     >"$HOST_CONFIGURE_LOG" 2>&1); then
+    cat "$HOST_CONFIGURE_LOG" >&2
+    if [ -f "$FFBUILD/ffbuild/config.log" ]; then
+      echo "--- FFmpeg config.log (tail) ---" >&2
+      tail -n 80 "$FFBUILD/ffbuild/config.log" >&2
+    fi
+    die "FFmpeg configure failed (host; full log above)"
+  fi
   log "building FFmpeg (host) with $JOBS jobs"
   (cd "$FFBUILD" && make -j"$JOBS" >/dev/null && make install >/dev/null)
   log "FFmpeg installed to $HOST_PREFIX"

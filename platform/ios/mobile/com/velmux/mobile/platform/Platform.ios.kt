@@ -15,7 +15,12 @@ import platform.UIKit.UIViewController
 @OptIn(ExperimentalForeignApi::class)
 actual val platformName: String = "iOS"
 
-/** The engine's durable data directory: Application Support/velmux. */
+/**
+ * The engine's durable data directory: Application Support/VelmuxEngine —
+ * the SAME canonical location the ObjC++ host's velmux_ios_shared_engine
+ * uses (and the one the previous app version created, so existing durable
+ * state survives the migration, mandate §39).
+ */
 actual val platformDataDir: String = run {
     val directories = NSSearchPathForDirectoriesInDomains(
         NSApplicationSupportDirectory,
@@ -23,7 +28,7 @@ actual val platformDataDir: String = run {
         true,
     )
     val base = (directories.firstOrNull() as? String) ?: NSTemporaryDirectory()
-    val dir = "$base/velmux"
+    val dir = "$base/VelmuxEngine"
     NSFileManager.defaultManager.createDirectoryAtPath(
         dir,
         withIntermediateDirectories = true,

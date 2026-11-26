@@ -7,8 +7,8 @@ import java.io.File
  * (core/include/velmux/abi.h), reached via JNI (RegisterNatives).
  *
  * All JSON payloads cross as UTF-8 byte arrays for full Unicode fidelity.
- * This object is intentionally dumb: parsing and policy live in
- * [VelmuxEngineModule]; the engine and its decisions live in C++.
+ * This object is intentionally dumb: parsing and policy live in the shared
+ * engine client (:ui:mobile); the engine and its decisions live in C++.
  */
 object VelmuxJni {
   init {

@@ -4,7 +4,7 @@
 // the system document picker and export/share through the Storage Access
 // Framework plus the app's own FileProvider. This suite validates the
 // provider surface that Share/Save-to rely on, with the REAL provider (same
-// authority, same paths XML, same resolver) — no RN runtime involved, the
+// authority, same paths XML, same resolver) — no app runtime involved, the
 // manifest wiring is what is under test.
 package com.velmux.mobile
 
@@ -97,8 +97,8 @@ class FileAccessTest {
   }
 
   /**
-   * The PRODUCTION import path (FileImport.importFileInto — what
-   * VelmuxEngineModule.importFile runs for every pick): a content URI
+   * The PRODUCTION import path (FileImport.importFileInto — what the app's
+   * platform layer runs for every pick): a content URI
    * (what the document picker returns on Android and what the engine's
    * backends cannot open) must land in DURABLE app storage with the exact
    * bytes, and the ORIGINAL must be preserved — a copy, never a move.

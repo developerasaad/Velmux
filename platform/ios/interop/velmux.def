@@ -1,3 +1,13 @@
 package = com.velmux.cinterop
 headers = velmux/abi.h
 includeDirs = ../../core/include
+
+---
+
+# Implemented by the iOS host (platform/ios/interop/VelmuxEngineHost.mm):
+# returns THE process engine, creating it on first use with the given data
+# directory; subsequent calls return the same handle. The shared Kotlin
+# engine client calls this instead of velmux_engine_create so the app has
+# exactly ONE engine instance per process (mandate 10.1) shared with the
+# ObjC++ host services (background tasks, notifications, resource feed).
+VelmuxEngineHandle* velmux_ios_shared_engine(const char* dataDir);

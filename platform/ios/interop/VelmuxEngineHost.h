@@ -1,12 +1,12 @@
 // VelmuxEngineHost: process-level owner of the Velmux engine on iOS
-// (spec §22: the job engine must be independent of React Native).
+// (mandate §36.1: the job engine must be independent of the UI layer).
 //
-// The engine handle survives React bridge teardown (reload, background
-// eviction of the JS context): jobs keep running in the process, the
-// durable store keeps its state, and this host keeps polling the engine's
-// bounded event queue at a coalesced cadence, distributing events to:
+// The engine handle survives UI detachment, scene reconnects and
+// backgrounding: jobs keep running in the process, the durable store keeps
+// its state, and this host keeps polling the engine's bounded event queue
+// at a coalesced cadence, distributing events to:
 //
-//  - the React Native module (UI updates), and
+//  - the shared Kotlin engine client (UI updates), and
 //  - the platform notification surface (UNUserNotificationCenter) when
 //    the app is not active.
 //
@@ -19,9 +19,9 @@
 //    ones — that pause is an explicit decision).
 //
 // This header is compiled into the Swift bridging PCH: it must stay free
-// of the VelmuxEngine pod module. The engine handle is forward-declared
-// as the opaque C struct it is; VelmuxEngineHost.mm imports the real
-// facade header.
+// of the engine C facade. The engine handle is forward-declared as the
+// opaque C struct it is; VelmuxEngineHost.mm imports the real facade
+// header.
 #import <Foundation/Foundation.h>
 
 typedef struct VelmuxEngineHandle VelmuxEngineHandle;
@@ -44,7 +44,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Restarts the event poll timer if it is not running (cheap when it is).
 - (void)wake;
 
-/// Cancels a job through the engine (works without any React surface).
+/// Cancels a job through the engine (works without any UI surface).
 - (void)cancelJob:(NSString *)jobId;
 
 /// True while at least one job is in an execution state.

@@ -12,6 +12,11 @@
 # intentionally no such path: a missing/incomplete prefix is a fatal
 # configuration error, not a warning.
 #
+# This file is the TOP-LEVEL project of AGP's externalNativeBuild configure:
+# it must carry its own cmake_minimum_required (AGP's CMake 3.22 makes a
+# missing one a hard configure error, not the warning it is on the host).
+cmake_minimum_required(VERSION 3.22)
+#
 # interop -> android -> platform -> root
 get_filename_component(VELMUX_REPO_ROOT
   "${CMAKE_CURRENT_SOURCE_DIR}/../../../" ABSOLUTE)

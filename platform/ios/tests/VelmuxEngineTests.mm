@@ -7,9 +7,13 @@
 //   1. testFFtoF_engineTranscode — a whole-pipeline FFmpeg transcode
 //      (H.264+AAC -> H.264+AAC) through the SAME engine construction the
 //      app host uses (the C facade, velmux_engine_create). The request
-//      forces a real re-encode (explicit video+audio bitrates make stream
-//      copy invalid) and preferSoftware biases the planner to FFmpeg; the
-//      assertion on the pipeline summary proves FFmpeg actually ran.
+//      forces a real re-encode (the explicit audio bitrate makes stream
+//      copy invalid; the video bitrate rides the Custom compression
+//      preset) and the planner's automatic routing (the v1
+//      software-preference bias is retired) picks FFmpeg's software route
+//      on the simulator, where VideoToolbox reports software encoders and
+//      FFmpeg's software prior wins the cost model; the assertion on the
+//      pipeline summary proves FFmpeg actually ran.
 //
 //   2. testNtoN_stageComposed — an all-Apple stage pipeline (Demux/Decode/
 //      VideoProcessing/AudioProcessing/Encode/Mux/Bitstream -> Apple)
@@ -52,10 +56,13 @@
 //
 // Every frame still crosses the real CPU-frame interchange between the
 // real FFmpeg and Apple stage workers; the engine, planner, job manager,
-// scheduler, stores and hybrid executor are the production objects. Audio
-// is disabled in the masked tests: with identical in/out codecs and
-// container, stream copy would otherwise be the (correct) cheapest plan,
-// and v1 hybrid stream-copies audio anyway.
+// scheduler, stores and hybrid executor are the production objects. The
+// audio lane stays in the masked tests (v1 disabled it to kill the remux
+// route): v2's hybrid interchange REQUIRES a stream-copiable audio lane,
+// so the EXPLICIT AUDIO BITRATE removes the stream-copy/remux route that
+// identical in/out codecs+container would otherwise make the (correct)
+// cheapest plan — and the mux side stream-copies the AAC (the documented
+// v1-hybrid audio behavior).
 //
 // The "pipelineSummary contains Hybrid" assertions prove the PLANNER chose
 // a hybrid composition — not merely that a conversion succeeded.
@@ -155,7 +162,7 @@ static BOOL vlmxFfmpegBackendPresent(VelmuxEngineHandle *engine) {
   return [described containsString:@"FFmpeg"];
 }
 
-/// One job run through the C facade: start, poll to a terminal state.
+/// One job run through the C facade: submit, poll to a terminal state.
 struct VLMXFacadeJob {
   std::string state;
   std::string outputPath;
@@ -167,7 +174,12 @@ static VLMXFacadeJob vlmxRunFacadeJob(VelmuxEngineHandle *engine,
                                       NSString *requestJson,
                                       NSTimeInterval timeout) {
   VLMXFacadeJob outcome;
-  char *startedRaw = velmux_start_job(engine, requestJson.UTF8String);
+  // ABI v2: velmux_submit_job takes the typed JobRequest JSON envelope and
+  // returns {"jobId":"..."} or the error envelope
+  // {"error":{"code":..,"message":..}} — the nil-jobId branch below
+  // fails with the envelope in the error, exactly like the old error
+  // strings.
+  char *startedRaw = velmux_submit_job(engine, requestJson.UTF8String);
   NSString *started =
       startedRaw != nullptr ? [NSString stringWithUTF8String:startedRaw] : @"";
   if (startedRaw != nullptr) {
@@ -178,7 +190,7 @@ static VLMXFacadeJob vlmxRunFacadeJob(VelmuxEngineHandle *engine,
     outcome.state = "failed";
     outcome.error = started.length > 0
                         ? std::string(started.UTF8String)
-                        : std::string("startJob returned no payload");
+                        : std::string("submitJob returned no payload");
     return outcome;
   }
   const NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + timeout;
@@ -205,9 +217,12 @@ static VLMXFacadeJob vlmxRunFacadeJob(VelmuxEngineHandle *engine,
     if (error.length > 0) {
       outcome.error = error.UTF8String;
     }
+    // Terminal states (the snapshot's "error" field is DATA: null or a
+    // message string, never the submit path's error envelope).
     if ([state isEqualToString:@"completed"] ||
         [state isEqualToString:@"failed"] ||
-        [state isEqualToString:@"canceled"]) {
+        [state isEqualToString:@"canceled"] ||
+        [state isEqualToString:@"target-not-met"]) {
       return outcome;
     }
     if ([NSDate timeIntervalSinceReferenceDate] > deadline) {
@@ -257,14 +272,14 @@ enum class VLMXHybridDirection {
 class VLMXRefusingExecutor final : public velmux::backend::IPipelineExecutor {
 public:
   bool canExecute(const velmux::core::Pipeline &,
-                  const velmux::core::ConversionRequest &) const override {
+                  const velmux::core::JobRequest &) const override {
     return false;
   }
   velmux::backend::ExecuteResult
   execute(const velmux::backend::ExecuteParams &) override {
     velmux::backend::ExecuteResult result;
     result.error = velmux::core::Error::make(
-        velmux::core::ErrorCode::UnsupportedFeature,
+        velmux::core::ErrorCode::UnsupportedOperation,
         "whole-pipeline execution masked for test route selection", "test");
     return result;
   }
@@ -395,22 +410,34 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
       return outcome;
     }
 
-    velmux::core::ConversionRequest request;
-    request.source.uri = std::string(fixturePath.UTF8String);
-    request.source.displayName = "fixture.mp4";
-    request.outputContainer = velmux::core::Container::Mp4;
-    request.goal.kind = velmux::core::GoalKind::Custom;
-    request.video.enabled = true;
-    request.video.codec = outCodec;
-    request.video.rateControl = velmux::core::RateControl::Bitrate;
-    request.video.bitRate = videoBitRate;
-    // Audio disabled: identical in/out codec+container would otherwise
-    // stream-copy (correct behavior, but not the hybrid path under test).
-    request.audio.enabled = false;
-    request.subtitles.policy = velmux::core::SubtitlePolicy::Remove;
-    request.processingMode = velmux::core::ProcessingMode::Auto;
+    // ABI v2 typed request: the JobRequest variant carries the operation
+    // payload (the v1 flat ConversionRequest fields map as: display name
+    // -> source.name, container -> output.container, video rate control
+    // -> Custom compression with videoBitrate, subtitle removal -> one
+    // Remove rule). The audio lane stays — v2's hybrid interchange
+    // requires a stream-copiable audio lane (v1 disabled audio here to
+    // kill the remux route); the EXPLICIT AUDIO BITRATE does that job
+    // now: the planner's stream-copy gate refuses any explicit audio
+    // rate, so the hybrid composition is the only plan, and the mux side
+    // stream-copies the AAC anyway.
+    velmux::core::JobRequest request;
+    request.operation = velmux::core::Operation::VideoConvert;
+    auto &payload =
+        request.payload.emplace<velmux::core::job::VideoConvert>();
+    payload.source.uri = std::string(fixturePath.UTF8String);
+    payload.source.displayName = "fixture.mp4";
+    payload.output.container = velmux::core::Container::Mp4;
+    payload.video.codec = outCodec;
+    payload.compression.enabled = true;
+    payload.compression.preset = velmux::core::CompressionPreset::Custom;
+    payload.compression.videoBitrate = videoBitRate;
+    payload.audioSettings.codec = velmux::core::AudioCodec::Aac;
+    payload.audioSettings.bitRate = 64000;
+    velmux::core::SubtitleTrackRule subs;
+    subs.policy = velmux::core::SubtitleTrackPolicy::Remove;
+    payload.subtitleTracks.push_back(subs);
 
-    const auto jobId = engine->startJob(request);
+    const auto jobId = engine->submitJob(request);
     if (!jobId.ok()) {
       outcome.state = "failed";
       outcome.error = jobId.error().message;
@@ -430,7 +457,10 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
       outcome.error = snapshot->error;
       outcome.pipelineSummary = snapshot->pipelineSummary;
       const std::string state = outcome.state;
-      if (state == "completed" || state == "failed" || state == "canceled") {
+      // Terminal states (v2 adds target-not-met; the Custom preset this
+      // helper submits can never produce it, but polling stops honestly).
+      if (state == "completed" || state == "failed" || state == "canceled" ||
+          state == "target-not-met") {
         outcome.ok = state == "completed";
         return outcome;
       }
@@ -500,18 +530,25 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
               @"transcode path cannot be exercised");
     }
 
-    // The explicit video+audio bitrates make stream copy invalid (a real
-    // re-encode); preferSoftware biases the planner to FFmpeg.
+    // The explicit audio bitrate makes stream copy invalid and the Custom
+    // compression preset carries the video bitrate (a real re-encode —
+    // the v1 rate-control intent). The planner's automatic routing (the
+    // v1 software-preference bias is retired) picks FFmpeg's software
+    // route on the simulator, where VideoToolbox reports software
+    // encoders and FFmpeg's software prior wins the cost model.
     NSString *request = [NSString stringWithFormat:
         @"{"
-         @"\"source\":{\"uri\":\"%@\",\"displayName\":\"fixture.mp4\"},"
-         @"\"outputContainer\":\"mp4\","
-         @"\"goal\":{\"kind\":\"custom\"},"
-         @"\"video\":{\"codec\":\"h264\",\"enabled\":true,"
-         @"\"rateControl\":\"bitrate\",\"bitRate\":800000},"
-         @"\"audio\":{\"codec\":\"aac\",\"enabled\":true,\"bitRate\":64000},"
-         @"\"subtitles\":{\"policy\":\"remove\"},"
-         @"\"processingMode\":\"preferSoftware\""
+         @"\"operation\":\"video-convert\","
+         @"\"video-convert\":{"
+         @"\"source\":{\"uri\":\"%@\",\"name\":\"fixture.mp4\"},"
+         @"\"output\":{\"name\":null,\"container\":\"mp4\"},"
+         @"\"video\":{\"codec\":\"h264\"},"
+         @"\"audioSettings\":{\"codec\":\"aac\",\"bitRate\":64000},"
+         @"\"subtitleTracks\":[{\"index\":-1,\"policy\":\"remove\"}],"
+         @"\"compression\":{\"enabled\":true,\"preset\":\"custom\","
+         @"\"targetSizeBytes\":0,\"quality\":null,"
+         @"\"videoBitrate\":800000,\"audioBitrate\":null}"
+         @"}"
          @"}",
         fixture.path];
     const VLMXFacadeJob job = vlmxRunFacadeJob(engine, request, 300.0);
@@ -604,19 +641,25 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
   pipeline.videoStreamCopy = false;
   pipeline.audioStreamCopy = true; // the Apple mux stage copies the AAC
 
-  velmux::core::ConversionRequest request;
-  request.source.uri = std::string(fixture.path.UTF8String);
-  request.source.displayName = "fixture.mp4";
-  request.outputContainer = velmux::core::Container::Mp4;
-  request.goal.kind = velmux::core::GoalKind::Custom;
-  request.video.enabled = true;
-  request.video.codec = velmux::core::VideoCodec::H264;
-  request.video.rateControl = velmux::core::RateControl::Bitrate;
-  request.video.bitRate = 800000;
-  request.audio.enabled = true;
-  request.audio.codec = velmux::core::AudioCodec::Aac;
-  request.subtitles.policy = velmux::core::SubtitlePolicy::Remove;
-  request.processingMode = velmux::core::ProcessingMode::Auto;
+  // ABI v2 typed request (the HybridExecutor's canExecute consumes the
+  // JobRequest): the v1 flat fields map onto the VideoConvert payload. The
+  // audio lane stays (empty track rules preserve all): the hybrid
+  // interchange stream-copies the AAC through the Apple mux stage — the
+  // exact v1 N->N behavior under test.
+  velmux::core::JobRequest request;
+  request.operation = velmux::core::Operation::VideoConvert;
+  auto &payload = request.payload.emplace<velmux::core::job::VideoConvert>();
+  payload.source.uri = std::string(fixture.path.UTF8String);
+  payload.source.displayName = "fixture.mp4";
+  payload.output.container = velmux::core::Container::Mp4;
+  payload.video.codec = velmux::core::VideoCodec::H264;
+  payload.compression.enabled = true;
+  payload.compression.preset = velmux::core::CompressionPreset::Custom;
+  payload.compression.videoBitrate = 800000;
+  payload.audioSettings.codec = velmux::core::AudioCodec::Aac;
+  velmux::core::SubtitleTrackRule subs;
+  subs.policy = velmux::core::SubtitleTrackPolicy::Remove;
+  payload.subtitleTracks.push_back(subs);
 
   velmux::core::HybridExecutor hybrid({&apple});
   XCTAssertTrue(hybrid.canExecute(pipeline, request),
@@ -705,15 +748,18 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
       XCTSkip(@"the engine was built without the FFmpeg backend; the FFV1 "
               @"intermediate cannot be produced");
     }
+    // ABI v2 typed request: FFV1 into MKV through the natural facade
+    // submit path (the codec change alone rules out any stream copy).
     NSString *ffv1Request = [NSString stringWithFormat:
         @"{"
-         @"\"source\":{\"uri\":\"%@\",\"displayName\":\"fixture.mp4\"},"
-         @"\"outputContainer\":\"mkv\","
-         @"\"goal\":{\"kind\":\"custom\"},"
-         @"\"video\":{\"codec\":\"ffv1\",\"enabled\":true},"
-         @"\"audio\":{\"codec\":\"aac\",\"enabled\":true},"
-         @"\"subtitles\":{\"policy\":\"remove\"},"
-         @"\"processingMode\":\"auto\""
+         @"\"operation\":\"video-convert\","
+         @"\"video-convert\":{"
+         @"\"source\":{\"uri\":\"%@\",\"name\":\"fixture.mp4\"},"
+         @"\"output\":{\"name\":null,\"container\":\"mkv\"},"
+         @"\"video\":{\"codec\":\"ffv1\"},"
+         @"\"audioSettings\":{\"codec\":\"aac\"},"
+         @"\"subtitleTracks\":[{\"index\":-1,\"policy\":\"remove\"}]"
+         @"}"
          @"}",
         fixture.path];
     const VLMXFacadeJob ffv1Job = vlmxRunFacadeJob(engine, ffv1Request, 300.0);
@@ -868,21 +914,29 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
     return;
   }
   @try {
-    // A real transcode (explicit bitrates invalidate stream copy) through
-    // whichever backend this build has.
+    // A real transcode (the explicit bitrates invalidate stream copy —
+    // the v1 rate-control intent) through whichever backend this build has.
     NSString *request = [NSString stringWithFormat:
         @"{"
-         @"\"source\":{\"uri\":\"%@\",\"displayName\":\"fixture.mp4\"},"
-         @"\"outputContainer\":\"mp4\","
-         @"\"goal\":{\"kind\":\"custom\"},"
-         @"\"video\":{\"codec\":\"h264\",\"enabled\":true,"
-         @"\"rateControl\":\"bitrate\",\"bitRate\":800000},"
-         @"\"audio\":{\"codec\":\"aac\",\"enabled\":true,\"bitRate\":64000},"
-         @"\"subtitles\":{\"policy\":\"remove\"},"
-         @"\"processingMode\":\"auto\""
+         @"\"operation\":\"video-convert\","
+         @"\"video-convert\":{"
+         @"\"source\":{\"uri\":\"%@\",\"name\":\"fixture.mp4\"},"
+         @"\"output\":{\"name\":null,\"container\":\"mp4\"},"
+         @"\"video\":{\"codec\":\"h264\"},"
+         @"\"audioSettings\":{\"codec\":\"aac\",\"bitRate\":64000},"
+         @"\"subtitleTracks\":[{\"index\":-1,\"policy\":\"remove\"}],"
+         @"\"compression\":{\"enabled\":true,\"preset\":\"custom\","
+         @"\"targetSizeBytes\":0,\"quality\":null,"
+         @"\"videoBitrate\":800000,\"audioBitrate\":null}"
+         @"}"
          @"}",
         fixture.path];
-    char *startedRaw = velmux_start_job(engine, request.UTF8String);
+    // ABI v2: velmux_submit_job (the v1 start entry point is gone) —
+    // returns {"jobId":"..."} or the error envelope
+    // {"error":{"code":..,"message":..}}; the nil-jobId assertion below
+    // fails with the envelope in the message, exactly like the old error
+    // strings.
+    char *startedRaw = velmux_submit_job(engine, request.UTF8String);
     NSString *started =
         startedRaw != nullptr ? [NSString stringWithUTF8String:startedRaw]
                               : @"";
@@ -890,7 +944,7 @@ static VLMXMaskedJob vlmxRunMaskedHybridJob(NSString *fixturePath,
       velmux_free_string(startedRaw);
     }
     NSString *jobId = vlmxJsonStringField(started, @"jobId");
-    XCTAssertNotNil(jobId, @"startJob returned: %@", started);
+    XCTAssertNotNil(jobId, @"submitJob returned: %@", started);
     if (jobId == nil) {
       return;
     }

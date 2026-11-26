@@ -3,9 +3,20 @@
 //
 // The fixture is REAL media generated on-device by hardware/software
 // MediaCodec encoders (H.264 + AAC into MP4). The conversion then runs
-// through the same JNI facade the React Native app uses, and the output is
-// validated with an independent MediaExtractor probe (never with the code
-// that produced it, spec §50).
+// through the same JNI facade the Compose Multiplatform app uses, and the
+// output is validated with an independent MediaExtractor probe (never with
+// the code that produced it, spec §50).
+//
+// ABI v2: jobs are submitted through nativeSubmitJob with the typed
+// JobRequest JSON envelope ("operation" + the operation-named payload —
+// the same requestFromJson contract core/src/api/serialization.cpp
+// enforces). The flat v1 request fields map onto the v2 payload as:
+//   source display name      -> source.name
+//   the v1 container field   -> output.container
+//   v1 custom goal + rate    -> compression (Custom preset, videoBitrate)
+//   video/audio bit rates    -> compression.videoBitrate / audioSettings.bitRate
+//   subtitles removal policy -> one subtitleTracks removal rule (index -1)
+//   goal / processing mode   -> retired (no v2 equivalent; automatic routing)
 package com.velmux.mobile
 
 import android.content.Context
@@ -440,8 +451,12 @@ class NativeConversionTest {
   private class JobResult(val state: String, val outputPath: String?, val error: String?)
 
   private fun runJob(handle: Long, requestJson: String): JobResult {
-    val started = String(VelmuxJni.nativeStartJob(handle, requestJson), Charsets.UTF_8)
-    assertTrue("startJob returned: $started", started.contains("\"jobId\""))
+    // nativeSubmitJob returns {"jobId":"..."} on success or the error
+    // envelope {"error":{"code":..,"message":..}} (an OBJECT) on failure.
+    // The contains("jobId") guard fails on error envelopes exactly the way
+    // the old code failed on error strings, with the envelope in the message.
+    val started = String(VelmuxJni.nativeSubmitJob(handle, requestJson), Charsets.UTF_8)
+    assertTrue("submitJob returned: $started", started.contains("\"jobId\""))
     val jobId = jsonStringField(started, "jobId")!!
     var lastState = "queued"
     var outputPath: String? = null
@@ -455,7 +470,10 @@ class NativeConversionTest {
         outputPath = pathField
       }
       error = jsonStringField(snapshotJson, "error")?.takeIf { it.isNotEmpty() && it != "null" }
-      if (state == "completed" || state == "failed" || state == "canceled") {
+      // Terminal states (the snapshot's "error" field is DATA: null or a
+      // message string, never the submit path's error envelope).
+      if (state == "completed" || state == "failed" || state == "canceled" ||
+          state == "target-not-met") {
         break
       }
       Thread.sleep(100)
@@ -474,16 +492,24 @@ class NativeConversionTest {
     val fixture = generateMp4(3)
     val handle = engineHandle()
     try {
+      // A real re-encode: the explicit audio bitrate invalidates the audio
+      // stream-copy route (the planner refuses any explicit audio rate) and
+      // the Custom compression preset carries the video bitrate, so the
+      // whole request is a genuine transcode — the v1 rateControl/bitRate
+      // intent under the v2 typed payload.
       val request = """
         {
-          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-          "outputContainer": "mp4",
-          "goal": {"kind": "custom"},
-          "video": {"codec": "h264", "enabled": true,
-                    "rateControl": "bitrate", "bitRate": 800000},
-          "audio": {"codec": "aac", "enabled": true, "bitRate": 64000},
-          "subtitles": {"policy": "remove"},
-          "processingMode": "auto"
+          "operation": "video-convert",
+          "video-convert": {
+            "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+            "output": {"name": null, "container": "mp4"},
+            "video": {"codec": "h264"},
+            "audioSettings": {"codec": "aac", "bitRate": 64000},
+            "subtitleTracks": [{"index": -1, "policy": "remove"}],
+            "compression": {"enabled": true, "preset": "custom",
+                            "targetSizeBytes": 0, "quality": null,
+                            "videoBitrate": 800000, "audioBitrate": null}
+          }
         }
       """.trimIndent()
       val result = runJob(handle, request)
@@ -513,16 +539,19 @@ class NativeConversionTest {
     val handle = engineHandle()
     try {
       // Same codecs, same container, no bitrate/rate changes: the planner
-      // must choose the stream-copy pipeline.
+      // must choose the stream-copy pipeline. (The v1 custom goal without
+      // rate-control values has no v2 equivalent — the disabled
+      // compression default is the closest field.)
       val request = """
         {
-          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-          "outputContainer": "mp4",
-          "goal": {"kind": "custom"},
-          "video": {"codec": "h264", "enabled": true},
-          "audio": {"codec": "aac", "enabled": true},
-          "subtitles": {"policy": "remove"},
-          "processingMode": "auto"
+          "operation": "video-convert",
+          "video-convert": {
+            "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+            "output": {"name": null, "container": "mp4"},
+            "video": {"codec": "h264"},
+            "audioSettings": {"codec": "aac"},
+            "subtitleTracks": [{"index": -1, "policy": "remove"}]
+          }
         }
       """.trimIndent()
       val result = runJob(handle, request)
@@ -590,8 +619,8 @@ class NativeConversionTest {
       val authority = "${context.packageName}.fileprovider"
       val uri = androidx.core.content.FileProvider.getUriForFile(context, authority, served)
 
-      // The PRODUCTION import path (FileImport — what the module's
-      // importFile runs at pick time): content URI -> durable local file.
+      // The PRODUCTION import path (FileImport — the app's pick-time
+      // import): content URI -> durable local file.
       val importedPath = FileImport.importFileInto(context, uri.toString(), "imported.mp4")
       val imported = File(importedPath)
       importedDir = imported.parentFile
@@ -605,14 +634,17 @@ class NativeConversionTest {
 
       val request = """
         {
-          "source": {"uri": "${imported.absolutePath}", "displayName": "imported.mp4"},
-          "outputContainer": "mp4",
-          "goal": {"kind": "custom"},
-          "video": {"codec": "h264", "enabled": true,
-                    "rateControl": "bitrate", "bitRate": 800000},
-          "audio": {"codec": "aac", "enabled": true, "bitRate": 64000},
-          "subtitles": {"policy": "remove"},
-          "processingMode": "auto"
+          "operation": "video-convert",
+          "video-convert": {
+            "source": {"uri": "${imported.absolutePath}", "name": "imported.mp4"},
+            "output": {"name": null, "container": "mp4"},
+            "video": {"codec": "h264"},
+            "audioSettings": {"codec": "aac", "bitRate": 64000},
+            "subtitleTracks": [{"index": -1, "policy": "remove"}],
+            "compression": {"enabled": true, "preset": "custom",
+                            "targetSizeBytes": 0, "quality": null,
+                            "videoBitrate": 800000, "audioBitrate": null}
+          }
         }
       """.trimIndent()
       val result = runJob(handle, request)

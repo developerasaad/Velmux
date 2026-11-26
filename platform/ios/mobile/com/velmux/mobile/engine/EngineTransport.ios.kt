@@ -7,8 +7,6 @@ import com.velmux.cinterop.velmux_close_session
 import com.velmux.cinterop.velmux_create_session
 import com.velmux.cinterop.velmux_delete_job
 import com.velmux.cinterop.velmux_describe_backends
-import com.velmux.cinterop.velmux_engine_create
-import com.velmux.cinterop.velmux_engine_destroy
 import com.velmux.cinterop.velmux_engine_version
 import com.velmux.cinterop.velmux_free_string
 import com.velmux.cinterop.velmux_generate_session_sample
@@ -16,6 +14,7 @@ import com.velmux.cinterop.velmux_get_job
 import com.velmux.cinterop.velmux_get_session_options
 import com.velmux.cinterop.velmux_get_session_snapshot
 import com.velmux.cinterop.velmux_inspect
+import com.velmux.cinterop.velmux_ios_shared_engine
 import com.velmux.cinterop.velmux_is_job_active
 import com.velmux.cinterop.velmux_list_jobs
 import com.velmux.cinterop.velmux_pause_job
@@ -42,10 +41,17 @@ import kotlinx.serialization.encodeToString
 /**
  * iOS actual: the frozen C ABI v2 through kotlinx.cinterop — extern
  * declarations generated from platform/ios/interop/velmux.def, which
- * points at core/include/velmux/abi.h. Every JSON payload crosses as a
- * UTF-8 C string; malloc'd results are released with velmux_free_string
- * (velmux_engine_version returns a static label and is never freed).
- * Calls run on Dispatchers.IO (the C functions are synchronous).
+ * binds core/include/velmux/abi.h plus the host-provided
+ * velmux_ios_shared_engine (VelmuxEngineHost.mm). Every JSON payload
+ * crosses as a UTF-8 C string; malloc'd results are released with
+ * velmux_free_string (velmux_engine_version returns a static label and
+ * is never freed). Calls run on Dispatchers.IO (the C functions are
+ * synchronous).
+ *
+ * ONE process engine (mandate §10.1): velmux_ios_shared_engine returns
+ * the same handle the ObjC++ host services use, created once in the
+ * canonical Application Support/VelmuxEngine directory; [dispose] only
+ * detaches (the engine is process-owned and never destroyed).
  *
  * On Linux this compiles to a klib (the verification this task performs);
  * LINKING the framework is the Xcode product build (scripts/build.sh --ios)
@@ -61,23 +67,23 @@ actual open class EngineTransport actual constructor(
     private var handle: CPointer<VelmuxEngineHandle>? = null
     private var handleValid: Boolean = false
 
-    /** Lazily creates the process engine (velmux_engine_create). */
+    /** Resolves THE process engine (velmux_ios_shared_engine). */
     private suspend fun engine(): CPointer<VelmuxEngineHandle> = engineMutex.withLock {
         val existing = handle
         if (handleValid && existing != null) return existing
-        val created = withContext(Dispatchers.IO) {
-            memScoped { velmux_engine_create(dataDir.cstr.ptr) }
+        val resolved = withContext(Dispatchers.IO) {
+            memScoped { velmux_ios_shared_engine(dataDir.cstr.ptr) }
         }
-        if (created == null) {
+        if (resolved == null) {
             throw EngineException(
                 EngineErrorCode.ENGINE_UNAVAILABLE,
                 "The Velmux engine failed to initialize " +
                     "(unusable data directory or no backend started)",
             )
         }
-        handle = created
+        handle = resolved
         handleValid = true
-        created
+        resolved
     }
 
     /** Reads (and frees) a malloc'd facade string. */
@@ -291,11 +297,10 @@ actual open class EngineTransport actual constructor(
     }
 
     actual open fun dispose() {
-        val current = handle
+        // The engine is process-owned (shared with the ObjC++ host services):
+        // detaching releases only this transport's reference. The C++ engine
+        // and its durable store live until the process exits.
         handle = null
         handleValid = false
-        if (current != null) {
-            velmux_engine_destroy(current)
-        }
     }
 }

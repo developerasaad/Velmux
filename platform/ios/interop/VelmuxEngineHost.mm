@@ -5,7 +5,7 @@
 #import <UserNotifications/UserNotifications.h>
 #import <BackgroundTasks/BackgroundTasks.h>
 
-#import <VelmuxEngine/abi.h>
+#import <velmux/abi.h>
 
 #import <os/proc.h>
 
@@ -41,9 +41,53 @@ static const NSTimeInterval kVelmuxResourcePushInterval = 3.0;
 @property (assign) NSTimeInterval lastResourcePushAt;
 @end
 
-@implementation VelmuxEngineHost {
-  std::once_flag _once;
+// ---------------------------------------------------------------------------
+// The ONE process engine (mandate §10.1).
+//
+// The shared Kotlin engine client (cinterop: velmux_ios_shared_engine in
+// platform/ios/interop/velmux.def) and this host (background tasks,
+// notifications, resource feed) resolve the SAME handle through this
+// function. The first caller's dataDir owns the durable store; both sides
+// pass the canonical Application Support/VelmuxEngine location the
+// previous app version created, so existing durable state survives. The
+// engine is never destroyed: the process owns it.
+// ---------------------------------------------------------------------------
+static VelmuxEngineHandle *gVelmuxSharedEngine = nullptr;
+static std::once_flag gVelmuxSharedEngineOnce;
+
+/// The canonical durable data directory (preserved from the previous app
+/// version; migration §39 keeps existing job stores readable).
+static NSString *VelmuxEngineDataDir() {
+  NSArray *dirs = NSSearchPathForDirectoriesInDomains(
+      NSApplicationSupportDirectory, NSUserDomainMask, YES);
+  NSString *base = dirs.count > 0 ? dirs[0] : NSTemporaryDirectory();
+  return [base stringByAppendingPathComponent:@"VelmuxEngine"];
 }
+
+extern "C" VelmuxEngineHandle *velmux_ios_shared_engine(const char *dataDir) {
+  std::call_once(gVelmuxSharedEngineOnce, [&] {
+    NSString *dir =
+        (dataDir != nullptr && dataDir[0] != '\0')
+            ? [NSString stringWithUTF8String:dataDir]
+            : VelmuxEngineDataDir();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+    gVelmuxSharedEngine = velmux_engine_create(dir.UTF8String);
+    // Launch-verification marker: proves the process reached a WORKING
+    // engine (created + versioning answered), not merely a live UI. The
+    // automated simulator suite greps exactly this line in the unified log.
+    if (gVelmuxSharedEngine != nullptr) {
+      const char *version = velmux_engine_version();
+      NSLog(@"[Velmux] app init: engine ready (abi %d, engine %s)",
+            velmux_abi_version(), version != nullptr ? version : "?");
+    }
+  });
+  return gVelmuxSharedEngine;
+}
+
+@implementation VelmuxEngineHost
 
 + (instancetype)shared {
   static VelmuxEngineHost *host = nil;
@@ -68,19 +112,10 @@ static const NSTimeInterval kVelmuxResourcePushInterval = 3.0;
 #pragma mark - Engine
 
 - (VelmuxEngineHandle *)engine {
-  // The engine is created once per process and never destroyed.
-  std::call_once(_once, ^{
-    NSArray *dirs = NSSearchPathForDirectoriesInDomains(
-        NSApplicationSupportDirectory, NSUserDomainMask, YES);
-    NSString *base =
-        dirs.count > 0 ? dirs[0] : NSTemporaryDirectory();
-    NSString *dir = [base stringByAppendingPathComponent:@"VelmuxEngine"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
-    self->_engine = velmux_engine_create(dir.UTF8String);
-  });
+  // The shared process engine (see velmux_ios_shared_engine above).
+  if (_engine == nullptr) {
+    _engine = velmux_ios_shared_engine(nullptr);
+  }
   return _engine;
 }
 
@@ -314,9 +349,9 @@ static BOOL VelmuxOnBatteryPower(void) {
   [UIDevice currentDevice].batteryMonitoringEnabled = NO;
 }
 
-/// Pushes the current thermal/battery/memory snapshot through the bridge
-/// (same JSON shape the RN module's updateResources produces). Throttled
-/// unless `force` (listener events); identical state never re-sends.
+/// Pushes the current thermal/battery/memory snapshot through the C ABI
+/// (the same JSON shape velmux_update_resources parses on every platform).
+/// Throttled unless `force` (listener events); identical state never re-sends.
 /// Must run on `_queue`.
 - (void)pushResourcesFromQueue:(BOOL)force {
   VelmuxEngineHandle *handle = self.engine;
@@ -411,7 +446,7 @@ static BOOL VelmuxOnBatteryPower(void) {
   }
   if ([UIApplication sharedApplication].applicationState ==
       UIApplicationStateActive) {
-    return; // the RN UI is the active surface
+    return; // the shared UI is the active surface
   }
   UNMutableNotificationContent *content =
       [[UNMutableNotificationContent alloc] init];

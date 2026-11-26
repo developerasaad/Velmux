@@ -291,6 +291,9 @@ object EngineErrorCode {
     const val INVALID_ARGUMENT = "invalid-argument"
     const val UNSUPPORTED_OPERATION = "unsupported-operation"
 
+    /** The engine's code for a missing/unreadable/permission-revoked source. */
+    const val SOURCE_UNAVAILABLE = "source-unavailable"
+
     /** Client-side code for a transport with no engine behind it. */
     const val ENGINE_UNAVAILABLE = "engine-unavailable"
 }

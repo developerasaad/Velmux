@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Physical iOS device test run (final hardware validation — spec §10).
+# Physical iOS device test run (final hardware validation).
 #
 # Contract:
 #   scripts/ios/device-test.sh
@@ -24,12 +24,11 @@ case "$(uname -s)" in
 esac
 
 require_tool xcodebuild
-require_tool pod || vdie "CocoaPods not found (sudo gem install cocoapods)"
-require_tool npm
+require_tool python3
 
 BUNDLE_ID="com.velmux.mobile"
-IOS_DIR="$(repo_dir "$VELMUX_APP_IOS_DIR")"
-DIAG_DIR="$IOS_DIR/device-test-diagnostics"
+HOST_DIR="$VELMUX_ROOT/$VELMUX_PLATFORM_IOS_DIR/host"
+DIAG_DIR="$HOST_DIR/device-test-diagnostics"
 rm -rf "$DIAG_DIR"; mkdir -p "$DIAG_DIR"
 
 # ---------------------------------------------------------------------------
@@ -53,7 +52,6 @@ print(devices[0]["identifier"])
 [ -n "$UDID" ] || vdie "no connected iOS device found (devicectl lists none)"
 vlog "device: $UDID"
 
-SIGN_ARGS=()
 if [ -n "${VELMUX_SIGNING_TEAM:-}" ]; then
   SIGN_ARGS=(DEVELOPMENT_TEAM="$VELMUX_SIGNING_TEAM"
              -allowProvisioningUpdates)
@@ -70,34 +68,28 @@ collect_diagnostics() {
 trap 'collect_diagnostics' ERR
 
 # ---------------------------------------------------------------------------
-# 2. FFmpeg artifacts (identity-checked reuse or build)
+# 2. Engine XCTest suite ON THE HARDWARE. The Xcode project's "Prepare
+#    engine and framework" phase resolves the mandatory FFmpeg artifacts,
+#    the CMake engine archives and the Kotlin Compose framework first —
+#    the same path a developer runs locally. Debug configuration: the
+#    device run is a development diagnostic, and Debug links faster.
 # ---------------------------------------------------------------------------
-bash "$SCRIPTS_DIR/ffmpeg/fetch.sh" ios
-
-# ---------------------------------------------------------------------------
-# 3. Engine XCTest suite ON THE HARDWARE
-# ---------------------------------------------------------------------------
-ensure_js_deps
-if [ ! -d "$IOS_DIR/Pods" ]; then
-  export VELMUX_FFMPEG_ROOT="$VELMUX_ROOT/ffmpeg-ios-packaged"
-  run_in "$IOS_DIR" pod install
-fi
-
 vlog "running VelmuxEngineTests on the device (this builds for arm64)"
-run_in "$IOS_DIR" xcodebuild test \
-  -workspace Velmux.xcworkspace -scheme Velmux \
+run_in "$HOST_DIR" xcodebuild test \
+  -project Velmux.xcodeproj -scheme Velmux \
   -configuration Debug \
   -destination "platform=iOS,id=$UDID" \
   -derivedDataPath build-device \
+  ARCHS="$VELMUX_IOS_DEVICE_ARCH" \
   "${SIGN_ARGS[@]}" \
   | tee "$DIAG_DIR/xctest.log"
 grep -q "Test Suite 'All tests' passed\|TEST SUCCEEDED" "$DIAG_DIR/xctest.log" \
   || vdie "the on-device VelmuxEngineTests suite failed"
 
 # ---------------------------------------------------------------------------
-# 4. Launch + lifecycle smoke (the test run above already installed the app)
+# 3. Launch + lifecycle smoke (the test run above already installed the app)
 # ---------------------------------------------------------------------------
-APP="$IOS_DIR/build-device/Build/Products/Debug-iphoneos/Velmux.app"
+APP="$HOST_DIR/build-device/Build/Products/Debug-iphoneos/Velmux.app"
 [ -d "$APP" ] || vdie "device .app not found at $APP"
 
 vlog "installing and launching"

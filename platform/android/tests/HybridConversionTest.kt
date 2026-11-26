@@ -474,8 +474,12 @@ class HybridConversionTest {
   private class JobResult(val state: String, val outputPath: String?, val error: String?)
 
   private fun runJob(handle: Long, requestJson: String): JobResult {
-    val started = String(VelmuxJni.nativeStartJob(handle, requestJson), Charsets.UTF_8)
-    assertTrue("startJob returned: $started", started.contains("\"jobId\""))
+    // nativeSubmitJob returns {"jobId":"..."} on success or the error
+    // envelope {"error":{"code":..,"message":..}} (an OBJECT) on failure.
+    // The contains("jobId") guard fails on error envelopes exactly the way
+    // the old code failed on error strings, with the envelope in the message.
+    val started = String(VelmuxJni.nativeSubmitJob(handle, requestJson), Charsets.UTF_8)
+    assertTrue("submitJob returned: $started", started.contains("\"jobId\""))
     val jobId = jsonStringField(started, "jobId")!!
     var lastState = "queued"
     var outputPath: String? = null
@@ -489,7 +493,10 @@ class HybridConversionTest {
         outputPath = pathField
       }
       error = jsonStringField(snapshotJson, "error")?.takeIf { it.isNotEmpty() && it != "null" }
-      if (state == "completed" || state == "failed" || state == "canceled") {
+      // Terminal states (the snapshot's "error" field is DATA: null or a
+      // message string, never the submit path's error envelope).
+      if (state == "completed" || state == "failed" || state == "canceled" ||
+          state == "target-not-met") {
         break
       }
       Thread.sleep(100)
@@ -572,16 +579,24 @@ class HybridConversionTest {
   fun testNToN_stageComposed_realWorkers() {
     val fixture = generateMp4(2)
     val out = File(context.cacheDir, "hybrid-nton-${System.nanoTime()}.mp4")
+    // ABI v2 typed request (nativeTestRunAndroidStagePipeline parses it
+    // with the same requestFromJson the app facade uses). The audio lane
+    // stays (empty audioTracks = preserve all): the v2 hybrid interchange
+    // requires a stream-copiable audio lane and the Android mux stage
+    // stream-copies the AAC — exactly the v1 N->N behavior under test.
     val request = """
       {
-        "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-        "outputContainer": "mp4",
-        "goal": {"kind": "custom"},
-        "video": {"codec": "h264", "enabled": true,
-                  "rateControl": "bitrate", "bitRate": 800000},
-        "audio": {"codec": "aac", "enabled": true},
-        "subtitles": {"policy": "remove"},
-        "processingMode": "auto"
+        "operation": "video-convert",
+        "video-convert": {
+          "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+          "output": {"name": null, "container": "mp4"},
+          "video": {"codec": "h264"},
+          "audioSettings": {"codec": "aac"},
+          "subtitleTracks": [{"index": -1, "policy": "remove"}],
+          "compression": {"enabled": true, "preset": "custom",
+                          "targetSizeBytes": 0, "quality": null,
+                          "videoBitrate": 800000, "audioBitrate": null}
+        }
       }
     """.trimIndent()
 
@@ -610,7 +625,7 @@ class HybridConversionTest {
    * (FFmpeg stage decode -> Android MediaCodec stage encode).
    *
    * Step 1 produces the FFV1 intermediate through the NORMAL facade
-   * start-conversion path the app uses (FFmpeg is the only backend that
+   * submit path the app uses (FFmpeg is the only backend that
    * encodes FFV1). Step 2 requests FFV1 -> HEVC through an UNMASKED engine
    * and asserts the planner chose the hybrid route. On emulators without
    * an HEVC encoder the same F->N composition is forced on the original
@@ -629,16 +644,18 @@ class HybridConversionTest {
           "the engine build has no FFmpeg backend (F->N hybrid needs it)",
           ffmpegBackendPresent(handle))
 
-      // Step 1: fixture -> FFV1 in MKV through the normal engine path.
+      // Step 1: fixture -> FFV1 in MKV through the normal engine path
+      // (ABI v2 typed request; the v1 flat fields map onto the payload).
       val ffv1Request = """
         {
-          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-          "outputContainer": "mkv",
-          "goal": {"kind": "custom"},
-          "video": {"codec": "ffv1", "enabled": true},
-          "audio": {"codec": "aac", "enabled": true},
-          "subtitles": {"policy": "remove"},
-          "processingMode": "auto"
+          "operation": "video-convert",
+          "video-convert": {
+            "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+            "output": {"name": null, "container": "mkv"},
+            "video": {"codec": "ffv1"},
+            "audioSettings": {"codec": "aac"},
+            "subtitleTracks": [{"index": -1, "policy": "remove"}]
+          }
         }
       """.trimIndent()
       val ffv1Job = runJob(handle, ffv1Request)
@@ -664,14 +681,17 @@ class HybridConversionTest {
       if (hasEncoderFor("video/hevc")) {
         val hevcRequest = """
           {
-            "source": {"uri": "$ffv1Path", "displayName": "intermediate.mkv"},
-            "outputContainer": "mp4",
-            "goal": {"kind": "custom"},
-            "video": {"codec": "hevc", "enabled": true,
-                      "rateControl": "bitrate", "bitRate": 800000},
-            "audio": {"codec": "aac", "enabled": true},
-            "subtitles": {"policy": "remove"},
-            "processingMode": "auto"
+            "operation": "video-convert",
+            "video-convert": {
+              "source": {"uri": "$ffv1Path", "name": "intermediate.mkv"},
+              "output": {"name": null, "container": "mp4"},
+              "video": {"codec": "hevc"},
+              "audioSettings": {"codec": "aac"},
+              "subtitleTracks": [{"index": -1, "policy": "remove"}],
+              "compression": {"enabled": true, "preset": "custom",
+                              "targetSizeBytes": 0, "quality": null,
+                              "videoBitrate": 800000, "audioBitrate": null}
+            }
           }
         """.trimIndent()
         val natural = runMaskedEngine(hevcRequest, freshWorkDir("fton-natural"), "")
@@ -722,20 +742,29 @@ class HybridConversionTest {
       // route and must compose the hybrid pipeline; the frames still cross
       // the real FFmpeg-decode -> Android-encode CPU-frame boundary.
       //
-      // Audio is disabled: with identical in/out codecs, container and
-      // audio, STREAM COPY would be the cheapest (and correct) plan —
-      // disabling audio removes that route, making the request a genuine
-      // transcode only the hybrid route can serve.
+      // AUDIO (v1 -> v2 adaptation): v1 disabled the audio lane to remove
+      // the stream-copy/remux route (identical in/out codecs+container
+      // would otherwise remux, which is correct behavior but not the
+      // hybrid path under test). v2's hybrid interchange REQUIRES a
+      // stream-copiable audio lane (its canExecute refuses pipelines
+      // without one), so the lane stays and the EXPLICIT AUDIO BITRATE
+      // removes the remux route instead: the planner's stream-copy gate
+      // refuses any explicit audio rate. The request is still a genuine
+      // video transcode only the hybrid route can serve, and the mux side
+      // stream-copies the AAC (the documented v1-hybrid audio behavior).
       val h264Request = """
         {
-          "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-          "outputContainer": "mp4",
-          "goal": {"kind": "custom"},
-          "video": {"codec": "h264", "enabled": true,
-                    "rateControl": "bitrate", "bitRate": 800000},
-          "audio": {"enabled": false},
-          "subtitles": {"policy": "remove"},
-          "processingMode": "auto"
+          "operation": "video-convert",
+          "video-convert": {
+            "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+            "output": {"name": null, "container": "mp4"},
+            "video": {"codec": "h264"},
+            "audioSettings": {"codec": "aac", "bitRate": 64000},
+            "subtitleTracks": [{"index": -1, "policy": "remove"}],
+            "compression": {"enabled": true, "preset": "custom",
+                            "targetSizeBytes": 0, "quality": null,
+                            "videoBitrate": 800000, "audioBitrate": null}
+          }
         }
       """.trimIndent()
       val outcome = runMaskedEngine(h264Request, freshWorkDir("fton-masked"),
@@ -770,19 +799,25 @@ class HybridConversionTest {
   @Test
   fun testNToF_maskedDecodersForceHybrid() {
     val fixture = generateMp4(2)
-    // Audio disabled for the same stream-copy reason as the F->N fallback
-    // (identical in/out codecs+container would otherwise remux, which is
-    // correct behavior but not the hybrid path under test).
+    // AUDIO: v1 disabled the lane to remove the stream-copy route (see the
+    // F->N fallback above for the full rationale). v2's hybrid interchange
+    // requires a stream-copiable audio lane, so the lane stays and the
+    // explicit audio bitrate removes the remux route instead; the mux side
+    // (FFmpeg) stream-copies the AAC while the video crosses the real
+    // Android-decode -> FFmpeg-encode CPU-frame boundary.
     val request = """
       {
-        "source": {"uri": "${fixture.path}", "displayName": "fixture.mp4"},
-        "outputContainer": "mp4",
-        "goal": {"kind": "custom"},
-        "video": {"codec": "h264", "enabled": true,
-                  "rateControl": "bitrate", "bitRate": 800000},
-        "audio": {"enabled": false},
-        "subtitles": {"policy": "remove"},
-        "processingMode": "auto"
+        "operation": "video-convert",
+        "video-convert": {
+          "source": {"uri": "${fixture.path}", "name": "fixture.mp4"},
+          "output": {"name": null, "container": "mp4"},
+          "video": {"codec": "h264"},
+          "audioSettings": {"codec": "aac", "bitRate": 64000},
+          "subtitleTracks": [{"index": -1, "policy": "remove"}],
+          "compression": {"enabled": true, "preset": "custom",
+                          "targetSizeBytes": 0, "quality": null,
+                          "videoBitrate": 800000, "audioBitrate": null}
+        }
       }
     """.trimIndent()
 

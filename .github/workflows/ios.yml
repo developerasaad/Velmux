@@ -1,44 +1,42 @@
 # CI for the iOS application: the repository's test script (simulator run:
-# FFmpeg resolve/rebuild, Release simulator app build with the embedded JS
-# bundle, cold-launch + RN init marker verification, the VelmuxEngineTests
-# XCTest suite, relaunch) followed by the unsigned device Release product
-# build through the repository's build script. CI only provides the
-# toolchain, an identity-keyed FFmpeg cache, and the artifact upload.
+# FFmpeg resolve/rebuild through the Xcode project's "Prepare engine and
+# framework" phase, the Release simulator app build, cold-launch + engine
+# init marker verification, the VelmuxEngineTests XCTest suite, relaunch)
+# followed by the unsigned device Release product build through the
+# repository's build script. CI only provides the toolchain, JDK/Gradle,
+# an identity-keyed FFmpeg cache, and the artifact upload.
 name: iOS build
 
 on:
   push:
     paths:
-      - apps/**
+      - ui/**
       - core/**
-      - backends/**
-      - bridge/**
-      - tools/ffmpeg-builder/**
-      # The scripts this workflow executes: test.sh --ios-sim dispatches
-      # to scripts/ios/simulator-test.sh, which builds through
-      # scripts/ios/build.sh (FFmpeg via scripts/ffmpeg/*); the device
-      # build goes through scripts/build.sh --ios. Both source
-      # scripts/lib/*. (A scripts-only change must still validate the iOS
-      # suite — the 7403b4f simulator-verification fix initially never
-      # got a run because scripts/ was not filtered in.)
-      - scripts/test.sh
-      - scripts/build.sh
-      - scripts/lib/**
-      - scripts/ffmpeg/**
-      - scripts/ios/**
+      - platform/ios/**
+      - scripts/**
+      - third_party/**
+      - CMakeLists.txt
+      - settings.gradle.kts
+      - build.gradle.kts
+      - gradle.properties
+      - gradle/**
+      - gradlew
+      - gradlew.bat
       - .github/workflows/ios.yml
   pull_request:
     paths:
-      - apps/**
+      - ui/**
       - core/**
-      - backends/**
-      - bridge/**
-      - tools/ffmpeg-builder/**
-      - scripts/test.sh
-      - scripts/build.sh
-      - scripts/lib/**
-      - scripts/ffmpeg/**
-      - scripts/ios/**
+      - platform/ios/**
+      - scripts/**
+      - third_party/**
+      - CMakeLists.txt
+      - settings.gradle.kts
+      - build.gradle.kts
+      - gradle.properties
+      - gradle/**
+      - gradlew
+      - gradlew.bat
       - .github/workflows/ios.yml
   workflow_dispatch:
 
@@ -62,13 +60,6 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: apps/mobile/package-lock.json
-
       # The iOS FFmpeg cross-build (run by the scripts when the artifacts
       # are missing or stale) needs these. cmake/ninja/pkg-config are
       # preinstalled on macOS runners.
@@ -84,6 +75,17 @@ jobs:
             brew install nasm
           fi
 
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Gradle dependency and wrapper caching (the Kotlin Compose framework
+      # link task runs through the Gradle wrapper).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Compute FFmpeg artifact identity
         id: ffid
         run: echo "identity=$(bash scripts/ffmpeg/identity.sh ios device)" >> "$GITHUB_OUTPUT"
@@ -96,39 +98,44 @@ jobs:
           # downloaded source tarballs. The key is the exact identity the
           # scripts verify before reuse.
           path: |
-            tools/ffmpeg-builder/out/ios
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/ios
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-ios-device-${{ steps.ffid.outputs.identity }}
 
-      # The repository script owns everything: FFmpeg resolve/rebuild,
-      # xcframework packaging, pod install, the Release simulator app
-      # build, simulator boot, cold-launch + RN init marker verification,
-      # the VelmuxEngineTests XCTest suite, and the relaunch check.
+      # The repository script owns everything: FFmpeg resolve/rebuild (the
+      # Xcode "Prepare engine and framework" phase), the CMake engine
+      # archives, the Kotlin Compose framework, the Release simulator app
+      # build, simulator boot, cold-launch + engine-init marker
+      # verification, the VelmuxEngineTests XCTest suite, and the relaunch
+      # check.
       - name: iOS simulator suite (FFmpeg resolve + app build + XCTest)
         id: ios-sim
+        env:
+          VELMUX_FFMPEG_JOBS: 3
         run: ./scripts/test.sh --ios-sim
 
       # The product-build gate: the unsigned device Release build
       # (CODE_SIGNING_ALLOWED=NO is passed by the script). Products land in
-      # apps/mobile/ios/build-device/Build/Products/Release-iphoneos/.
+      # platform/ios/host/build-device/Build/Products/Release-iphoneos/.
       - name: Build Release for iOS devices (unsigned)
         id: device-build
+        env:
+          VELMUX_FFMPEG_JOBS: 3
         run: ./scripts/build.sh --ios --release
 
       # Diagnostics on failure: the BUILD-IDENTITY files (recorded hash +
       # provenance of every FFmpeg layout/slice) and the simulator test
       # diagnostics. Without these, an identity-gate failure leaves nothing
-      # to diagnose from (the 2026-11-24 mismatch was undiagnosable from
-      # the log alone).
+      # to diagnose from.
       - name: Collect FFmpeg identity diagnostics on failure
         if: failure()
         run: |
           mkdir -p /tmp/ffdiag
           for f in \
-              tools/ffmpeg-builder/out/ios/iphoneos/BUILD-IDENTITY \
-              tools/ffmpeg-builder/out/ios/iphonesimulator/BUILD-IDENTITY \
-              tools/ffmpeg-builder/out/ios/slices/*/BUILD-IDENTITY \
-              tools/ffmpeg-builder/out/ios/manifest.json; do
+              scripts/ffmpeg-builder/out/ios/iphoneos/BUILD-IDENTITY \
+              scripts/ffmpeg-builder/out/ios/iphonesimulator/BUILD-IDENTITY \
+              scripts/ffmpeg-builder/out/ios/slices/*/BUILD-IDENTITY \
+              scripts/ffmpeg-builder/out/ios/manifest.json; do
             if [ -f "$f" ]; then
               cp "$f" "/tmp/ffdiag/$(printf '%s' "$f" | tr '/' '_')"
             fi
@@ -140,7 +147,7 @@ jobs:
           name: velmux-ios-diag
           path: |
             /tmp/ffdiag
-            apps/mobile/ios/sim-test-diagnostics
+            platform/ios/host/sim-test-diagnostics
           if-no-files-found: ignore
           retention-days: 7
 
@@ -154,13 +161,13 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            tools/ffmpeg-builder/out/ios
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/ios
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-ios-device-${{ steps.ffid.outputs.identity }}
 
       - name: Upload device app
         uses: actions/upload-artifact@v4
         with:
           name: velmux-ios-device-app
-          path: apps/mobile/ios/build-device/Build/Products/Release-iphoneos/Velmux.app
+          path: platform/ios/host/build-device/Build/Products/Release-iphoneos/Velmux.app
           if-no-files-found: error
