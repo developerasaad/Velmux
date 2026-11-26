@@ -1,6 +1,5 @@
 package = com.velmux.cinterop
 headers = velmux/abi.h
-includeDirs = ../../core/include
 
 ---
 

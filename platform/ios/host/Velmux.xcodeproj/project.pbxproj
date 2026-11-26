@@ -51,13 +51,13 @@
                 A10000000000000000000F023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = ../tests/Info.plist; sourceTree = "<group>"; };
                 A10000000000000000000F030 /* Velmux.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Velmux.app; sourceTree = BUILT_PRODUCTS_DIR; };
                 A10000000000000000000F031 /* VelmuxEngineTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VelmuxEngineTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-                A10000000000000000000F100 /* Velmux.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = Velmux.framework; sourceTree = "<group>"; };
-                A10000000000000000000F101 /* libvelmux_abi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_abi.a; sourceTree = "<group>"; };
-                A10000000000000000000F102 /* libvelmux_backend_apple.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_backend_apple.a; sourceTree = "<group>"; };
-                A10000000000000000000F103 /* libvelmux_ffmpeg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_ffmpeg.a; sourceTree = "<group>"; };
-                A10000000000000000000F104 /* libvelmux_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_core.a; sourceTree = "<group>"; };
-                A10000000000000000000F105 /* libvelmux_sqlite.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_sqlite.a; sourceTree = "<group>"; };
-                A10000000000000000000F110 /* libffmpeg_deps.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libffmpeg_deps.a; sourceTree = "<group>"; };
+                A10000000000000000000F100 /* Velmux.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/framework/Velmux.framework"; sourceTree = "<group>"; };
+                A10000000000000000000F101 /* libvelmux_abi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_abi.a"; sourceTree = "<group>"; };
+                A10000000000000000000F102 /* libvelmux_backend_apple.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_backend_apple.a"; sourceTree = "<group>"; };
+                A10000000000000000000F103 /* libvelmux_ffmpeg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_ffmpeg.a"; sourceTree = "<group>"; };
+                A10000000000000000000F104 /* libvelmux_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_core.a"; sourceTree = "<group>"; };
+                A10000000000000000000F105 /* libvelmux_sqlite.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_sqlite.a"; sourceTree = "<group>"; };
+                A10000000000000000000F110 /* libffmpeg_deps.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/ffmpeg/libffmpeg_deps.a"; sourceTree = "<group>"; };
                 A10000000000000000000F111 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
                 A10000000000000000000F112 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
                 A10000000000000000000F113 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
@@ -168,27 +168,11 @@
                 A10000000000000000000C51 /* stage */ = {
                         isa = PBXGroup;
                         children = (
-                                A10000000000000000000C52 /* $(PLATFORM_NAME) */,
-                        );
-                        path = build/ios/stage;
-                        sourceTree = "<group>";
-                };
-                A10000000000000000000C52 /* $(PLATFORM_NAME) */ = {
-                        isa = PBXGroup;
-                        children = (
-                                A10000000000000000000C53 /* $(CONFIGURATION) */,
-                        );
-                        path = "$(PLATFORM_NAME)";
-                        sourceTree = "<group>";
-                };
-                A10000000000000000000C53 /* $(CONFIGURATION) */ = {
-                        isa = PBXGroup;
-                        children = (
                                 A10000000000000000000C54 /* engine */,
                                 A10000000000000000000C56 /* framework */,
                                 A10000000000000000000C57 /* ffmpeg */,
                         );
-                        path = "$(CONFIGURATION)";
+                        path = build/ios/stage;
                         sourceTree = "<group>";
                 };
                 A10000000000000000000C54 /* engine */ = {
@@ -200,7 +184,7 @@
                                 A10000000000000000000F104 /* libvelmux_core.a */,
                                 A10000000000000000000F105 /* libvelmux_sqlite.a */,
                         );
-                        path = engine;
+                        name = engine;
                         sourceTree = "<group>";
                 };
                 A10000000000000000000C56 /* framework */ = {
@@ -208,7 +192,7 @@
                         children = (
                                 A10000000000000000000F100 /* Velmux.framework */,
                         );
-                        path = framework;
+                        name = framework;
                         sourceTree = "<group>";
                 };
                 A10000000000000000000C57 /* ffmpeg */ = {
@@ -216,7 +200,7 @@
                         children = (
                                 A10000000000000000000F110 /* libffmpeg_deps.a */,
                         );
-                        path = ffmpeg;
+                        name = ffmpeg;
                         sourceTree = "<group>";
                 };
 /* End PBXGroup section */

@@ -63,6 +63,14 @@ kotlin {
     iosTargets.forEach { target ->
         target.compilations.getByName("main").cinterops.create("velmux") {
             defFile(rootProject.layout.projectDirectory.file("platform/ios/interop/velmux.def"))
+            // The C ABI headers live under the repository root. The def
+            // file carries no includeDirs on purpose: its relative paths
+            // resolve against the Gradle invocation directory (observed:
+            // '../../core/include' from the repo root landed outside the
+            // repository and clang could not find velmux/abi.h). An
+            // absolute path anchored to the project root is unambiguous
+            // on every machine and in every invocation context.
+            includeDirs(rootProject.projectDir.resolve("core/include"))
         }
         // The Xcode host consumes a STATIC Compose framework: the Kotlin
         // object code, the C++ engine archives and the pinned FFmpeg all
