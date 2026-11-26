@@ -147,14 +147,41 @@ PY
   log "sanitized x265.pc implicit-lib entries"
 }
 
+# ensure_build_libtool <prefix> — guarantee a host-usable libtoolize for
+# autogen-based dependencies (zimg). CI images ship libtool; hosts without
+# it get a prefix-local build from the pinned tarball (nasm-style
+# fallback). Exports PATH/ACLOCAL_PATH so autoreconf finds the macros.
+ensure_build_libtool() {
+  local prefix="$1"
+  if command -v libtoolize >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ ! -x "$prefix/bin/libtoolize" ]; then
+    log "no system libtoolize; building libtool into $prefix"
+    local tb src
+    tb="$(fetch_tarball libtool)"
+    src="$(extract_tarball "$tb")"
+    (cd "$src" && ./configure --prefix="$prefix" >/dev/null && \
+     make -j"${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 4)}" >/dev/null && \
+     make install >/dev/null)
+    log "libtool installed to $prefix"
+  fi
+  export PATH="$prefix/bin:$PATH"
+  [ -d "$prefix/share/aclocal" ] && \
+    export ACLOCAL_PATH="${ACLOCAL_PATH:+$ACLOCAL_PATH:}$prefix/share/aclocal"
+}
+
 # ua_for_url <url> — print the User-Agent to use for a host, if any.
-# Some hosts (code.videolan.org) reject plain curl/wget requests and need
-# a browser-like UA; others (gitlab.com) run bot protection that REJECTS
-# fake browser UAs while allowing the honest curl default. Nothing is
-# printed for hosts that prefer the default.
+# Some hosts reject plain curl/wget requests and need a browser-like UA.
+# Verified per host from real networks: code.videolan.org rejects the
+# default curl UA, and gitlab.com (observed 2026-11) answers 403 to the
+# default UA from some networks while serving the identical pinned bytes
+# to a browser UA — so both get the browser UA. Hosts that prefer the
+# default print nothing.
 ua_for_url() {
   case "$1" in
-    https://code.videolan.org/* | http://code.videolan.org/*)
+    https://code.videolan.org/* | http://code.videolan.org/* | \
+    https://gitlab.com/* | http://gitlab.com/*)
       printf '%s' "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
       ;;
   esac

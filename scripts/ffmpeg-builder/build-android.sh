@@ -528,6 +528,50 @@ ZPC
     log "[$abi] libass installed"
   fi
 
+  # --- zimg (autoconf cross, in-tree per ABI; zscale for HDR tone mapping) ------------
+  if [ ! -f "$prefix/lib/libzimg.a" ]; then
+    log "[$abi] building zimg"
+    ensure_build_libtool "$OUT_DIR/tools"
+    zimg_tb="$(fetch_tarball zimg)"
+    zimg_src="$(extract_tarball "$zimg_tb" "$srctag")"
+    # The archive ships no configure: regenerate once per ABI source tree.
+    (cd "$zimg_src" && ./autogen.sh >/dev/null)
+    (cd "$zimg_src" && \
+     CFLAGS="$ABI_CFLAGS -O3 -fPIC -I$prefix/include" \
+     CXXFLAGS="$ABI_CFLAGS -O3 -fPIC -I$prefix/include" \
+     LDFLAGS="-L$prefix/lib" \
+     ./configure \
+       --prefix="$prefix" --disable-shared --enable-static --with-pic \
+       --host="$AUTOCONF_HOST" \
+       >/dev/null && \
+     make -j"$JOBS" >/dev/null && make install >/dev/null)
+    log "[$abi] zimg installed"
+  fi
+
+  # --- libwebp (cmake cross; still WebP output, mandate 29.3) --------------------------
+  if [ ! -f "$prefix/lib/libwebp.a" ]; then
+    log "[$abi] building libwebp"
+    webp_tb="$(fetch_tarball libwebp)"
+    webp_src="$(extract_tarball "$webp_tb" "$srctag")"
+    webp_build="$build_tmp/webp"
+    rm -rf "$webp_build"
+    cmake -G Ninja -S "$webp_src" -B "$webp_build" \
+      -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+      -DANDROID_ABI="$abi" -DANDROID_PLATFORM="android-$API_LEVEL" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DCMAKE_FIND_ROOT_PATH="$prefix" \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF \
+      -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF \
+      -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
+      -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
+      -DWEBP_BUILD_EXTRAS=OFF >/dev/null
+    cmake --build "$webp_build" >/dev/null
+    cmake --install "$webp_build" >/dev/null
+    log "[$abi] libwebp installed"
+  fi
+
   # --- FFmpeg (out of tree) -----------------------------------------------------------------
   ffmpeg_tb="$(fetch_ffmpeg)"
   ffmpeg_src="$(extract_tarball "$ffmpeg_tb")"
@@ -575,6 +619,8 @@ ZPC
        --enable-libharfbuzz \
        --enable-libfribidi \
        --enable-libass \
+       --enable-libzimg \
+       --enable-libwebp \
        --enable-zlib \
        --enable-protocol=file \
        --enable-protocol=pipe \

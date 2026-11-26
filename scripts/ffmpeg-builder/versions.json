@@ -144,6 +144,33 @@
       "url": "https://github.com/libass/libass/releases/download/0.17.3/libass-0.17.3.tar.xz",
       "mirrors": [],
       "sha256": "eae425da50f0015c21f7b3a9c7262a910f0218af469e22e2931462fed3c50959"
+    },
+    "libtool": {
+      "version": "2.5.4",
+      "url": "https://mirror.netcologne.de/gnu/libtool/libtool-2.5.4.tar.gz",
+      "mirrors": [
+        "https://ftp.acc.umu.se/mirror/gnu.org/libtool/libtool-2.5.4.tar.gz",
+        "https://ftp.gnu.org/gnu/libtool/libtool-2.5.4.tar.gz"
+      ],
+      "sha256": "da8ebb2ce4dcf46b90098daf962cffa68f4b4f62ea60f798d0ef12929ede6adf",
+      "file": "libtool-2.5.4.tar.gz",
+      "note": "Build-time dependency for zimg's autogen (libtoolize + m4 macros); built into the prefix only when the host has none. CI images ship libtool, so this is the offline/fallback path."
+    },
+    "zimg": {
+      "version": "3.0.5",
+      "url": "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.5.tar.gz",
+      "mirrors": [],
+      "sha256": "a9a0226bf85e0d83c41a8ebe4e3e690e1348682f6a2a7838f1b8cbff1b799bcf",
+      "file": "zimg-release-3.0.5.tar.gz",
+      "note": "Colors-space conversion + tone mapping (zscale filter) \u2014 required for genuine HDR-to-SDR (mandate 17.2/25). 3.0.6 was skipped: its tarball ships a configure with unexpanded libtool macros."
+    },
+    "libwebp": {
+      "version": "1.5.0",
+      "url": "https://github.com/webmproject/libwebp/archive/refs/tags/v1.5.0.tar.gz",
+      "mirrors": [],
+      "sha256": "668c9aba45565e24c27e17f7aaf7060a399f7f31dba6c97a044e1feacb930f37",
+      "file": "libwebp-1.5.0.tar.gz",
+      "note": "Still WebP image output for frame extraction (mandate 29.3). Encoding only; animated output stays deferred to V2."
     }
   }
 }

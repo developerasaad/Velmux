@@ -33,7 +33,8 @@ host_build_complete() {
   local lib
   for lib in libx264.a libx265.a libmp3lame.a libopus.a libogg.a libvorbis.a \
              libvpx.a libdav1d.a libSvtAv1Enc.a libfreetype.a libpng16.a \
-             libharfbuzz.a libfribidi.a libass.a libavcodec.a libavformat.a \
+             libharfbuzz.a libfribidi.a libass.a libzimg.a libwebp.a \
+             libavcodec.a libavformat.a \
              libavutil.a libavfilter.a libswscale.a libswresample.a; do
     [ -f "$HOST_PREFIX/lib/$lib" ] || return 1
   done
@@ -301,6 +302,47 @@ if [ ! -f "$HOST_PREFIX/lib/libass.a" ]; then
   log "libass installed"
 fi
 
+# --- zimg (color conversion + tone mapping; zscale filter, mandate 17.2/25) -------------
+# The GitHub source archive ships no generated configure: autogen.sh needs
+# libtoolize + the libtool m4 macros (see ensure_build_libtool in lib.sh).
+ensure_build_libtool "$HOST_PREFIX"
+
+zimg_tb="$(fetch_tarball zimg)"
+zimg_src="$(extract_tarball "$zimg_tb")"
+if [ ! -f "$HOST_PREFIX/lib/libzimg.a" ]; then
+  log "building zimg"
+  (cd "$zimg_src" && ./autogen.sh >/dev/null 2>&1) || \
+    (cd "$zimg_src" && autoreconf -i >/dev/null)
+  zimg_build="$SRC_DIR/build-host/zimg"
+  rm -rf "$zimg_build"
+  mkdir -p "$zimg_build"
+  (cd "$zimg_build" && "$zimg_src/configure" --prefix="$HOST_PREFIX" \
+     --disable-shared --enable-static >/dev/null && \
+   make -j"$JOBS" >/dev/null && make install >/dev/null)
+  log "zimg installed"
+fi
+
+# --- libwebp (still WebP image output, mandate 29.3) ------------------------------------
+webp_tb="$(fetch_tarball libwebp)"
+webp_src="$(extract_tarball "$webp_tb")"
+if [ ! -f "$HOST_PREFIX/lib/libwebp.a" ]; then
+  log "building libwebp"
+  webp_build="$SRC_DIR/build-host/webp"
+  rm -rf "$webp_build"
+  mkdir -p "$webp_build"
+  (cd "$webp_build" && cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+     -DCMAKE_INSTALL_PREFIX="$HOST_PREFIX" \
+     -DBUILD_SHARED_LIBS=OFF \
+     -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF \
+     -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF \
+     -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
+     -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
+     -DWEBP_BUILD_EXTRAS=OFF \
+     "$webp_src" >/dev/null && \
+   cmake --build . >/dev/null && cmake --install . >/dev/null)
+  log "libwebp installed"
+fi
+
 # ---------------------------------------------------------------------------
 # FFmpeg itself.
 # NOTE: nasm (built above) enables x86 asm. Conversion is local-file only, so
@@ -352,6 +394,8 @@ if [ ! -f "$HOST_PREFIX/lib/libavcodec.a" ]; then
      --enable-libharfbuzz \
      --enable-libfribidi \
      --enable-libass \
+     --enable-libzimg \
+     --enable-libwebp \
      --enable-zlib \
      --enable-protocol=file \
      --enable-protocol=pipe \

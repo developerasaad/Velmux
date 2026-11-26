@@ -638,6 +638,51 @@ ZPC
     log "[$slice] libass installed"
   fi
 
+  # --- zimg (autoconf cross, in-tree per slice; zscale for HDR tone mapping) -----------------
+  if [ ! -f "$SLICE_PREFIX/lib/libzimg.a" ]; then
+    log "[$slice] building zimg"
+    ensure_build_libtool "$OUT_DIR/tools"
+    zimg_tb="$(fetch_tarball zimg)"
+    zimg_src="$(extract_tarball "$zimg_tb" "$SLICE_TAG")"
+    # The archive ships no configure: regenerate once per slice source tree.
+    (cd "$zimg_src" && ./autogen.sh >/dev/null)
+    (cd "$zimg_src" && \
+     CC="$CC" CXX="$CXX" \
+     CFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -fPIC -I$SLICE_PREFIX/include" \
+     CXXFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -fPIC -I$SLICE_PREFIX/include" \
+     LDFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -L$SLICE_PREFIX/lib" \
+     ./configure \
+       --prefix="$SLICE_PREFIX" --disable-shared --enable-static --with-pic \
+       --host="$SLICE_AUTOCONF_HOST" \
+       >/dev/null && \
+     make -j"$JOBS" >/dev/null && make install >/dev/null)
+    log "[$slice] zimg installed"
+  fi
+
+  # --- libwebp (cmake cross; still WebP output, mandate 29.3) --------------------------------
+  if [ ! -f "$SLICE_PREFIX/lib/libwebp.a" ]; then
+    log "[$slice] building libwebp"
+    webp_tb="$(fetch_tarball libwebp)"
+    webp_src="$(extract_tarball "$webp_tb" "$SLICE_TAG")"
+    local webp_build="$build_tmp/webp"
+    rm -rf "$webp_build"
+    cmake -G Ninja -S "$webp_src" -B "$webp_build" \
+      -DCMAKE_OSX_SYSROOT="$SLICE_SDK" \
+      -DCMAKE_OSX_ARCHITECTURES="$SLICE_ARCH" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SLICE_PREFIX" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF \
+      -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF \
+      -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF \
+      -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
+      -DWEBP_BUILD_EXTRAS=OFF >/dev/null
+    cmake --build "$webp_build" >/dev/null
+    cmake --install "$webp_build" >/dev/null
+    log "[$slice] libwebp installed"
+  fi
+
   # --- FFmpeg (out of tree) -----------------------------------------------------------------------------------------
   ffmpeg_tb="$(fetch_ffmpeg)"
   ffmpeg_src="$(extract_tarball "$ffmpeg_tb")"
@@ -683,6 +728,8 @@ ZPC
        --enable-libharfbuzz \
        --enable-libfribidi \
        --enable-libass \
+       --enable-libzimg \
+       --enable-libwebp \
        --enable-zlib \
        --enable-protocol=file \
        --enable-protocol=pipe \
