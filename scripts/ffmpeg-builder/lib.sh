@@ -182,6 +182,15 @@ PY
 # autogen-based dependencies (zimg). CI images ship libtool; hosts without
 # it get a prefix-local build from the pinned tarball (nasm-style
 # fallback). Exports PATH/ACLOCAL_PATH so autoreconf finds the macros.
+#
+# libtool itself is a HOST tool: its build must not see any caller's cross
+# environment. The iOS builders export the cross CC/CXX/AR wrapper AND put
+# the wrapper dir (with cc/clang/clang++ symlinks) FIRST on PATH; Xcode
+# script phases export SDKROOT/deployment targets. Any of those leaking
+# into this configure compiles the test program for iOS and aborts with
+# "cannot run C compiled programs" — so the build runs with a controlled
+# system PATH, the absolute host compiler when the platform has one, and
+# every cross variable unset.
 ensure_build_libtool() {
   local prefix="$1"
   if command -v libtoolize >/dev/null 2>&1; then
@@ -189,12 +198,23 @@ ensure_build_libtool() {
   fi
   if [ ! -x "$prefix/bin/libtoolize" ]; then
     log "no system libtoolize; building libtool into $prefix"
-    local tb src
+    local tb src host_path host_cc clean_env
     tb="$(fetch_tarball libtool)"
     src="$(extract_tarball "$tb")"
-    (cd "$src" && ./configure --prefix="$prefix" >/dev/null && \
-     make -j"${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 4)}" >/dev/null && \
-     make install >/dev/null)
+    host_path="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+    host_cc=""
+    if [ -x /usr/bin/clang ]; then host_cc=/usr/bin/clang; fi
+    # Options first, then assignments: valid for both GNU and BSD env.
+    clean_env=(env -u CXX -u AR -u RANLIB -u STRIP -u NM -u CFLAGS -u CXXFLAGS \
+       -u LDFLAGS -u SDKROOT -u MACOSX_DEPLOYMENT_TARGET \
+       -u IPHONEOS_DEPLOYMENT_TARGET -u TVOS_DEPLOYMENT_TARGET \
+       -u WATCHOS_DEPLOYMENT_TARGET -u XROS_DEPLOYMENT_TARGET \
+       PATH="$host_path")
+    [ -n "$host_cc" ] && clean_env+=("CC=$host_cc")
+    (cd "$src" && "${clean_env[@]}" ./configure --prefix="$prefix" >/dev/null && \
+     "${clean_env[@]}" \
+       make -j"${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 4)}" >/dev/null && \
+     "${clean_env[@]}" make install >/dev/null)
     log "libtool installed to $prefix"
   fi
   export PATH="$prefix/bin:$PATH"
