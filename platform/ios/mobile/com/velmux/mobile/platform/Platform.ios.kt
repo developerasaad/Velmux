@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+
 package com.velmux.mobile.platform
 
 import kotlinx.cinterop.ExperimentalForeignApi
@@ -12,7 +14,6 @@ import platform.UIKit.UIDocumentInteractionController
 import platform.UIKit.UIApplication
 import platform.UIKit.UIViewController
 
-@OptIn(ExperimentalForeignApi::class)
 actual val platformName: String = "iOS"
 
 /**
@@ -100,6 +101,7 @@ private fun topMost(controller: UIViewController): UIViewController {
 
 private inline fun <T> runCatchingUIKit(block: () -> T): Boolean = try {
     block()
+    true
 } catch (error: Throwable) {
     false
 }

@@ -1,6 +1,6 @@
 package com.velmux.mobile.engine
 
-import com.velmux.cinterop.VelmuxEngineHandle
+import cnames.structs.VelmuxEngineHandle
 import com.velmux.cinterop.velmux_abi_version
 import com.velmux.cinterop.velmux_cancel_job
 import com.velmux.cinterop.velmux_close_session
@@ -30,7 +30,6 @@ import com.velmux.cinterop.velmux_update_session
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.toKString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -42,16 +41,25 @@ import kotlinx.serialization.encodeToString
  * iOS actual: the frozen C ABI v2 through kotlinx.cinterop — extern
  * declarations generated from platform/ios/interop/velmux.def, which
  * binds core/include/velmux/abi.h plus the host-provided
- * velmux_ios_shared_engine (VelmuxEngineHost.mm). Every JSON payload
- * crosses as a UTF-8 C string; malloc'd results are released with
- * velmux_free_string (velmux_engine_version returns a static label and
- * is never freed). Calls run on Dispatchers.Default (Kotlin/Native has no
+ * velmux_ios_shared_engine (VelmuxEngineHost.mm).
+ *
+ * Binding notes (verified against the generated interop):
+ *  - `const char*` parameters map to Kotlin String? — payloads cross as
+ *    plain strings;
+ *  - `char*` returns map to CPointer<ByteVar>? — malloc'd results are
+ *    read with toKString() and released with velmux_free_string
+ *    (velmux_engine_version returns a static label and is never freed);
+ *  - the opaque engine handle maps to cnames.structs.VelmuxEngineHandle
+ *    (the forward-declared struct pattern; the def-package typealias
+ *    does not exist for the self-referential typedef).
+ *
+ * Calls run on Dispatchers.Default (Kotlin/Native has no
  * Dispatchers.IO; Default is the background pool and the C functions are
  * synchronous).
  *
  * ONE process engine (mandate §10.1): velmux_ios_shared_engine returns
  * the same handle the ObjC++ host services use, created once in the
- * canonical Application Support/VelmuxEngine directory; [dispose] only
+ * canonical Application Support/VelmuxEngine directory; dispose only
  * detaches (the engine is process-owned and never destroyed).
  *
  * On Linux this compiles to a klib (the verification this task performs);
@@ -73,7 +81,7 @@ actual open class EngineTransport actual constructor(
         val existing = handle
         if (handleValid && existing != null) return existing
         val resolved = withContext(Dispatchers.Default) {
-            memScoped { velmux_ios_shared_engine(dataDir.cstr.ptr) }
+            velmux_ios_shared_engine(dataDir)
         }
         if (resolved == null) {
             throw EngineException(
@@ -101,12 +109,14 @@ actual open class EngineTransport actual constructor(
     }
 
     /** Reads a facade string and decodes it as the (reified) payload. */
-    private inline fun <reified T> decodeFacade(call: () -> CPointer<ByteVar>?): T =
-        decodeEnginePayload(readFacadeString(call))
+    private inline fun <reified T> decodeFacade(
+        noinline call: () -> CPointer<ByteVar>?,
+    ): T = decodeEnginePayload(readFacadeString(call))
 
     /** Reads a facade string and decodes it as a typed array payload. */
-    private inline fun <reified T> decodeFacadeArray(call: () -> CPointer<ByteVar>?): List<T> =
-        decodeEngineArray(readFacadeString(call))
+    private inline fun <reified T> decodeFacadeArray(
+        noinline call: () -> CPointer<ByteVar>?,
+    ): List<T> = decodeEngineArray(readFacadeString(call))
 
     // ---- ABI version -----------------------------------------------------------
 
@@ -127,24 +137,20 @@ actual open class EngineTransport actual constructor(
     ): String = withContext(Dispatchers.Default) {
         val engine = engine()
         val json = VelmuxJson.json.encodeToString(CreateSessionRequest(operation, sources))
-        val raw = memScoped { readFacadeString { velmux_create_session(engine, json.cstr.ptr) } }
+        val raw = readFacadeString { velmux_create_session(engine, json) }
         VelmuxJson.json.decodeFromString(SessionIdResult.serializer(), raw).sessionId
     }
 
     actual open suspend fun prepareSession(sessionId: String): SessionSnapshot =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped {
-                decodeFacade { velmux_prepare_session(engine, sessionId.cstr.ptr) }
-            }
+            decodeFacade { velmux_prepare_session(engine, sessionId) }
         }
 
     actual open suspend fun getSessionSnapshot(sessionId: String): SessionSnapshot =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped {
-                decodeFacade { velmux_get_session_snapshot(engine, sessionId.cstr.ptr) }
-            }
+            decodeFacade { velmux_get_session_snapshot(engine, sessionId) }
         }
 
     actual open suspend fun getSessionOptions(
@@ -154,11 +160,7 @@ actual open class EngineTransport actual constructor(
     ): FieldOptions = withContext(Dispatchers.Default) {
         val engine = engine()
         val json = VelmuxJson.json.encodeToString(SessionOptionsQuery(field, revision))
-        memScoped {
-            decodeFacade {
-                velmux_get_session_options(engine, sessionId.cstr.ptr, json.cstr.ptr)
-            }
-        }
+        decodeFacade { velmux_get_session_options(engine, sessionId, json) }
     }
 
     actual open suspend fun updateSession(
@@ -167,20 +169,14 @@ actual open class EngineTransport actual constructor(
     ): SessionSnapshot = withContext(Dispatchers.Default) {
         val engine = engine()
         val json = VelmuxJson.json.encodeToString(request)
-        memScoped {
-            decodeFacade { velmux_update_session(engine, sessionId.cstr.ptr, json.cstr.ptr) }
-        }
+        decodeFacade { velmux_update_session(engine, sessionId, json) }
     }
 
     actual open suspend fun generateSample(sessionId: String, revision: Long): SampleResult =
         withContext(Dispatchers.Default) {
             val engine = engine()
             val json = VelmuxJson.json.encodeToString(SampleRequest(revision))
-            memScoped {
-                decodeFacade {
-                    velmux_generate_session_sample(engine, sessionId.cstr.ptr, json.cstr.ptr)
-                }
-            }
+            decodeFacade { velmux_generate_session_sample(engine, sessionId, json) }
         }
 
     actual open suspend fun submitSession(
@@ -192,24 +188,20 @@ actual open class EngineTransport actual constructor(
         val json = VelmuxJson.json.encodeToString(
             SubmitSessionRequest(revision, submissionId)
         )
-        val raw = memScoped {
-            readFacadeString { velmux_submit_session(engine, sessionId.cstr.ptr, json.cstr.ptr) }
-        }
+        val raw = readFacadeString { velmux_submit_session(engine, sessionId, json) }
         VelmuxJson.json.decodeFromString(JobIdResult.serializer(), raw).jobId
     }
 
     actual open suspend fun closeSession(sessionId: String): Boolean =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped { velmux_close_session(engine, sessionId.cstr.ptr) == 0 }
+            velmux_close_session(engine, sessionId) == 0
         }
 
     actual open suspend fun submitJob(requestJson: String): String =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            val raw = memScoped {
-                readFacadeString { velmux_submit_job(engine, requestJson.cstr.ptr) }
-            }
+            val raw = readFacadeString { velmux_submit_job(engine, requestJson) }
             VelmuxJson.json.decodeFromString(JobIdResult.serializer(), raw).jobId
         }
 
@@ -217,53 +209,51 @@ actual open class EngineTransport actual constructor(
 
     actual open suspend fun listJobs(): List<JobSnapshot> = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { decodeFacadeArray { velmux_list_jobs(engine) } }
+        decodeFacadeArray { velmux_list_jobs(engine) }
     }
 
     actual open suspend fun getJob(jobId: String): JobSnapshot? =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            val raw = memScoped { readFacadeString { velmux_get_job(engine, jobId.cstr.ptr) } }
+            val raw = readFacadeString { velmux_get_job(engine, jobId) }
             if (raw == "null") null else decodeEnginePayload(raw)
         }
 
     actual open suspend fun isJobActive(jobId: String): Boolean =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped { velmux_is_job_active(engine, jobId.cstr.ptr) > 0 }
+            velmux_is_job_active(engine, jobId) > 0
         }
 
     actual open suspend fun cancelJob(jobId: String): Boolean = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { velmux_cancel_job(engine, jobId.cstr.ptr) > 0 }
+        velmux_cancel_job(engine, jobId) > 0
     }
 
     actual open suspend fun pauseJob(jobId: String): Boolean = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { velmux_pause_job(engine, jobId.cstr.ptr) > 0 }
+        velmux_pause_job(engine, jobId) > 0
     }
 
     actual open suspend fun resumeJob(jobId: String): Boolean = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { velmux_resume_job(engine, jobId.cstr.ptr) > 0 }
+        velmux_resume_job(engine, jobId) > 0
     }
 
     actual open suspend fun retryJob(jobId: String): Boolean = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { velmux_retry_job(engine, jobId.cstr.ptr) > 0 }
+        velmux_retry_job(engine, jobId) > 0
     }
 
     actual open suspend fun deleteJob(jobId: String): Boolean = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { velmux_delete_job(engine, jobId.cstr.ptr) > 0 }
+        velmux_delete_job(engine, jobId) > 0
     }
 
     actual open suspend fun reuseJobSettings(jobId: String): String =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            val raw = memScoped {
-                readFacadeString { velmux_reuse_job_settings(engine, jobId.cstr.ptr) }
-            }
+            val raw = readFacadeString { velmux_reuse_job_settings(engine, jobId) }
             VelmuxJson.json.decodeFromString(SessionIdResult.serializer(), raw).sessionId
         }
 
@@ -272,29 +262,27 @@ actual open class EngineTransport actual constructor(
     actual open suspend fun inspect(uri: String, displayName: String): MediaInfo =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped {
-                decodeFacade {
-                    velmux_inspect(engine, uri.cstr.ptr, displayName.cstr.ptr)
-                }
+            decodeFacade {
+                velmux_inspect(engine, uri, displayName)
             }
         }
 
     actual open suspend fun describeBackends(): List<String> =
         withContext(Dispatchers.Default) {
             val engine = engine()
-            memScoped { decodeFacadeArray<String> { velmux_describe_backends(engine) } }
+            decodeFacadeArray<String> { velmux_describe_backends(engine) }
         }
 
     actual open suspend fun updateResources(snapshot: ResourceSnapshot): Boolean =
         withContext(Dispatchers.Default) {
             val engine = engine()
             val json = VelmuxJson.json.encodeToString(snapshot)
-            memScoped { velmux_update_resources(engine, json.cstr.ptr) == 0 }
+            velmux_update_resources(engine, json) == 0
         }
 
     actual open suspend fun pollEvents(): List<JobEvent> = withContext(Dispatchers.Default) {
         val engine = engine()
-        memScoped { decodeFacadeArray { velmux_poll_events(engine) } }
+        decodeFacadeArray { velmux_poll_events(engine) }
     }
 
     actual open fun dispose() {

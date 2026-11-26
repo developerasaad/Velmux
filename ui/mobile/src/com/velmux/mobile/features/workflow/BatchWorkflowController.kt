@@ -79,7 +79,7 @@ class BatchWorkflowController(
     fun sharedOptions(field: String): List<String> {
         var intersection: Set<String>? = null
         for (id in sessionIds) {
-            val options = optionsCache[id]?.get(field) ?: continue
+            val options = optionsCache.value[id]?.get(field) ?: continue
             val ids = options.values.map { it.id }.toSet()
             intersection = when (intersection) {
                 null -> ids
