@@ -53,5 +53,12 @@ add_subdirectory("${VELMUX_REPO_ROOT}" velmux-engine)
 
 add_library(velmux_jni SHARED velmux_jni.cpp)
 target_link_libraries(velmux_jni PRIVATE velmux::abi)
+# The JNI adapter bridges the engine's TEST scaffolding and native-stage
+# entry points, which live behind the private internal headers (core/src,
+# platform/android/native) — the same dirs velmux_abi consumes PRIVATELY,
+# replicated here because PRIVATE includes do not propagate.
+target_include_directories(velmux_jni PRIVATE
+  "${VELMUX_REPO_ROOT}/core/src"
+  "${VELMUX_REPO_ROOT}/platform/android/native")
 find_library(log-lib log)
 target_link_libraries(velmux_jni PRIVATE ${log-lib})

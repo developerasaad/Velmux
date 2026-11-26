@@ -19,7 +19,7 @@
                 A100000000000000000000A13 /* libvelmux_ffmpeg.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F103 /* libvelmux_ffmpeg.a */; };
                 A100000000000000000000A14 /* libvelmux_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F104 /* libvelmux_core.a */; };
                 A100000000000000000000A15 /* libvelmux_sqlite.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F105 /* libvelmux_sqlite.a */; };
-                A100000000000000000000A16 /* VelmuxFFmpeg.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F110 /* VelmuxFFmpeg.xcframework */; };
+                A100000000000000000000A16 /* libffmpeg_deps.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F110 /* libffmpeg_deps.a */; };
                 A100000000000000000000A17 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F111 /* AVFoundation.framework */; };
                 A100000000000000000000A18 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F112 /* VideoToolbox.framework */; };
                 A100000000000000000000A19 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F113 /* CoreMedia.framework */; };
@@ -57,7 +57,7 @@
                 A10000000000000000000F103 /* libvelmux_ffmpeg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_ffmpeg.a; sourceTree = "<group>"; };
                 A10000000000000000000F104 /* libvelmux_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_core.a; sourceTree = "<group>"; };
                 A10000000000000000000F105 /* libvelmux_sqlite.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libvelmux_sqlite.a; sourceTree = "<group>"; };
-                A10000000000000000000F110 /* VelmuxFFmpeg.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = VelmuxFFmpeg.xcframework; sourceTree = "<group>"; };
+                A10000000000000000000F110 /* libffmpeg_deps.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libffmpeg_deps.a; sourceTree = "<group>"; };
                 A10000000000000000000F111 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
                 A10000000000000000000F112 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
                 A10000000000000000000F113 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
@@ -77,7 +77,7 @@
                                 A100000000000000000000A13 /* libvelmux_ffmpeg.a in Frameworks */,
                                 A100000000000000000000A14 /* libvelmux_core.a in Frameworks */,
                                 A100000000000000000000A15 /* libvelmux_sqlite.a in Frameworks */,
-                                A100000000000000000000A16 /* VelmuxFFmpeg.xcframework in Frameworks */,
+                                A100000000000000000000A16 /* libffmpeg_deps.a in Frameworks */,
                                 A100000000000000000000A17 /* AVFoundation.framework in Frameworks */,
                                 A100000000000000000000A18 /* VideoToolbox.framework in Frameworks */,
                                 A100000000000000000000A19 /* CoreMedia.framework in Frameworks */,
@@ -160,7 +160,6 @@
                         isa = PBXGroup;
                         children = (
                                 A10000000000000000000C51 /* stage */,
-                                A10000000000000000000C55 /* ffmpeg-ios-packaged */,
                         );
                         name = "Staged inputs";
                         path = ../../../;
@@ -187,6 +186,7 @@
                         children = (
                                 A10000000000000000000C54 /* engine */,
                                 A10000000000000000000C56 /* framework */,
+                                A10000000000000000000C57 /* ffmpeg */,
                         );
                         path = "$(CONFIGURATION)";
                         sourceTree = "<group>";
@@ -211,12 +211,12 @@
                         path = framework;
                         sourceTree = "<group>";
                 };
-                A10000000000000000000C55 /* ffmpeg-ios-packaged */ = {
+                A10000000000000000000C57 /* ffmpeg */ = {
                         isa = PBXGroup;
                         children = (
-                                A10000000000000000000F110 /* VelmuxFFmpeg.xcframework */,
+                                A10000000000000000000F110 /* libffmpeg_deps.a */,
                         );
-                        path = ffmpeg-ios-packaged;
+                        path = ffmpeg;
                         sourceTree = "<group>";
                 };
 /* End PBXGroup section */

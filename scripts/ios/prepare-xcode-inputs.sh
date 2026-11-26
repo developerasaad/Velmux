@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stage the Xcode app's native inputs: the C++ engine archives (CMake,
-# iOS toolchain) and the Kotlin Compose framework (Gradle link task).
+# iOS toolchain), the Kotlin Compose framework (Gradle link task) and the
+# FFmpeg dependency closure for the current platform slice.
 #
 # Contract:
 #   scripts/ios/prepare-xcode-inputs.sh --configuration <Debug|Release>
@@ -12,11 +13,15 @@
 #
 #   build/ios/stage/<platform>/<configuration>/engine/libvelmux_*.a
 #   build/ios/stage/<platform>/<configuration>/framework/Velmux.framework
+#   build/ios/stage/<platform>/<configuration>/ffmpeg/libffmpeg_deps.a
 #   build/ios/stage/test-config/VelmuxEngineTestConfig.h
-#   ffmpeg-ios-packaged/VelmuxFFmpeg.xcframework
 #
 # The stable stage keeps the .xcodeproj free of platform-specific path
-# branching: ONE reference set serves device and simulator builds.
+# branching: ONE reference set serves device and simulator builds. The
+# FFmpeg closure is a single libtool-merged archive per slice (no
+# cross-archive symbol-ordering hazards at the app link); the app links
+# it as a plain static archive — an xcframework would be validated at
+# build-description time, BEFORE this phase could produce it.
 set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,33 +54,25 @@ esac
 require_tool xcodebuild
 require_tool cmake
 require_tool java
+require_tool libtool
 
 JOBS="${VELMUX_FFMPEG_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 
 # ---------------------------------------------------------------------------
-# 1. Mandatory FFmpeg artifacts (identity-checked reuse or build) + the
-#    static xcframework the app links.
+# 1. Mandatory FFmpeg artifacts (identity-checked reuse or build), per
+#    slice, straight from the builder's output tree.
 # ---------------------------------------------------------------------------
 export VELMUX_FFMPEG_JOBS="$JOBS"
 bash "$SCRIPTS_DIR/ffmpeg/fetch.sh" ios
 FFMPEG_IOS_OUT="$VELMUX_ROOT/$VELMUX_FFMPEG_OUT_DIR/ios"
-FFMPEG_PACKAGED="$VELMUX_ROOT/ffmpeg-ios-packaged"
-if [ ! -d "$FFMPEG_PACKAGED/VelmuxFFmpeg.xcframework" ] \
-   || [ "$FFMPEG_IOS_OUT/iphoneos/BUILD-IDENTITY" -nt "$FFMPEG_PACKAGED/.packaged-stamp" ] 2>/dev/null; then
-  vlog "packaging the FFmpeg xcframework"
-  rm -rf "$FFMPEG_PACKAGED"
-  bash "$VELMUX_ROOT/$VELMUX_FFMPEG_BUILDER_DIR/package-ios-xcframework.sh" \
-    "$FFMPEG_IOS_OUT" "$FFMPEG_PACKAGED"
-  touch "$FFMPEG_PACKAGED/.packaged-stamp"
-fi
+FFMPEG_PREFIX="$FFMPEG_IOS_OUT/$FFMPEG_SLICE"
 
 # ---------------------------------------------------------------------------
 # 2. C++ engine archives per platform (CMake with the iOS toolchain; the
 #    per-slice FFmpeg prefix is the same identity-checked artifact the app
-#    links through the xcframework). ONE CMake build dir per platform.
+#    links through the merged closure). ONE CMake build dir per platform.
 # ---------------------------------------------------------------------------
 ENGINE_BUILD="$VELMUX_ROOT/build/ios-engine-$PLATFORM"
-FFMPEG_PREFIX="$FFMPEG_IOS_OUT/$FFMPEG_SLICE"
 if [ ! -f "$ENGINE_BUILD/CMakeCache.txt" ]; then
   vlog "configuring the engine for $PLATFORM (CMake, deployment $VELMUX_IOS_DEPLOYMENT_TARGET)"
   cmake -S "$VELMUX_ROOT" -B "$ENGINE_BUILD" -G Xcode \
@@ -108,7 +105,7 @@ FRAMEWORK_SRC="$VELMUX_ROOT/ui/mobile/build/bin/$(echo "$KOTLIN_TARGET" | sed 's
 STAGE="$VELMUX_ROOT/build/ios/stage/$PLATFORM/$CONFIGURATION"
 vlog "staging into $STAGE"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/engine" "$STAGE/framework"
+mkdir -p "$STAGE/engine" "$STAGE/framework" "$STAGE/ffmpeg"
 
 # The Xcode generator places products under <dir>/<config>-<platform>/ (the
 # SDK-suffixed convention); resolve by SEARCHING so a layout change cannot
@@ -120,6 +117,15 @@ for lib in $ENGINE_LIBS; do
 done
 
 cp -R "$FRAMEWORK_SRC" "$STAGE/framework/Velmux.framework"
+
+# The FFmpeg dependency closure for THIS slice, merged into one archive
+# (the app link then has a single symbol-indexed input; slices may contain
+# different library sets — the simulator slice omits SVT-AV1).
+vlog "merging the FFmpeg closure for $FFMPEG_SLICE"
+FFMPEG_LIBS="$(ls "$FFMPEG_PREFIX/lib/"*.a | sort)"
+[ -n "$FFMPEG_LIBS" ] || vdie "no FFmpeg static libraries under $FFMPEG_PREFIX/lib"
+( cd "$FFMPEG_PREFIX/lib" && libtool -static -o "$STAGE/ffmpeg/libffmpeg_deps.a" \
+    $(printf '%s\n' $FFMPEG_LIBS | xargs -n1 basename | sort) )
 
 # Test configuration header: the XCTest suite compiles its FFmpeg-dependent
 # scaffolding only when the engine actually carries the FFmpeg backend (the
@@ -133,4 +139,4 @@ cat > "$VELMUX_ROOT/build/ios/stage/test-config/VelmuxEngineTestConfig.h" <<EOF
 #define VELMUX_TEST_FFMPEG_BACKEND 1
 EOF
 
-vlog "staged: $(ls "$STAGE/engine" | tr '\n' ' ') + Velmux.framework"
+vlog "staged: $(ls "$STAGE/engine" | tr '\n' ' ') + Velmux.framework + $(basename "$STAGE/ffmpeg")/libffmpeg_deps.a"

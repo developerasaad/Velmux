@@ -2,6 +2,8 @@ package com.velmux.mobile
 
 import android.app.Application
 import android.util.Log
+import com.velmux.mobile.engine.EngineClient
+import com.velmux.mobile.engine.EngineTransport
 import com.velmux.mobile.platform.AppRuntime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
