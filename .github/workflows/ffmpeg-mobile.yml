@@ -1,6 +1,6 @@
 # Heavy FFmpeg cross-compilation for mobile platforms through the
 # repository build script. Produces the native FFmpeg artifacts under
-# tools/ffmpeg-builder/out; consumers restore them from identity-keyed
+# scripts/ffmpeg-builder/out; consumers restore them from identity-keyed
 # actions/cache entries (see android.yml / ios.yml / release.yml), so the
 # run artifacts uploaded here serve inspection and manual debugging.
 #
@@ -60,8 +60,8 @@ jobs:
         with:
           # Upstream source tarballs; the key changes whenever the pinned
           # versions in versions.json change.
-          path: tools/ffmpeg-builder/downloads
-          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          path: scripts/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('scripts/ffmpeg-builder/versions.json') }}
           restore-keys: |
             ffmpeg-downloads-${{ runner.os }}-
 
@@ -82,14 +82,14 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: tools/ffmpeg-builder/downloads
-          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          path: scripts/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('scripts/ffmpeg-builder/versions.json') }}
 
       - name: Upload Android FFmpeg artifacts
         uses: actions/upload-artifact@v4
         with:
           name: velmux-ffmpeg-android
-          path: tools/ffmpeg-builder/out/android/**
+          path: scripts/ffmpeg-builder/out/android/**
           retention-days: 14
 
   ffmpeg-ios:
@@ -119,8 +119,8 @@ jobs:
         with:
           # Upstream source tarballs; the key changes whenever the pinned
           # versions in versions.json change.
-          path: tools/ffmpeg-builder/downloads
-          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          path: scripts/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('scripts/ffmpeg-builder/versions.json') }}
           restore-keys: |
             ffmpeg-downloads-${{ runner.os }}-
 
@@ -139,12 +139,12 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: tools/ffmpeg-builder/downloads
-          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('tools/ffmpeg-builder/versions.json') }}
+          path: scripts/ffmpeg-builder/downloads
+          key: ffmpeg-downloads-${{ runner.os }}-${{ hashFiles('scripts/ffmpeg-builder/versions.json') }}
 
       - name: Upload iOS FFmpeg artifacts
         uses: actions/upload-artifact@v4
         with:
           name: velmux-ffmpeg-ios
-          path: tools/ffmpeg-builder/out/ios/**
+          path: scripts/ffmpeg-builder/out/ios/**
           retention-days: 14
