@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.StateFlow
 import platform.Foundation.NSURL
 import platform.UIKit.UIApplication
 import platform.UIKit.UIDocumentPickerDelegateProtocol
-import platform.UIKit.UIDocumentPickerModeImport
+import platform.UIKit.UIDocumentPickerMode
 import platform.UIKit.UIDocumentPickerViewController
 import platform.UIKit.UIViewController
 import platform.darwin.NSObject
@@ -40,7 +40,7 @@ actual class FilePickerHandle {
         }
         val picker = UIDocumentPickerViewController(
             documentTypes = documentTypes,
-            inMode = UIDocumentPickerModeImport,
+            inMode = UIDocumentPickerMode.UIDocumentPickerModeImport,
         )
         picker.delegate = delegate
         anchor.presentViewController(picker, animated = true, completion = null)

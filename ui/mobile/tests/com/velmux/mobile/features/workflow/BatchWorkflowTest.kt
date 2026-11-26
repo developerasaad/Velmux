@@ -6,6 +6,7 @@ import com.velmux.mobile.engine.FakeTransport
 import com.velmux.mobile.engine.FieldChange
 import com.velmux.mobile.engine.Fields
 import com.velmux.mobile.navigation.Destination
+import com.velmux.mobile.navigation.Navigator
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
