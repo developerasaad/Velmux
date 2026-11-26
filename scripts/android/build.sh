@@ -94,8 +94,10 @@ run_in "$VELMUX_ROOT" ./gradlew "${GRADLE_TASKS[@]}" --no-daemon --stacktrace \
 # Product verification: every produced APK must carry the app's engine
 # library for every requested ABI — libvelmux_jni.so (the JNI bridge with
 # the C++ engine statically linked inside: RegisterNatives registration
-# runs from JNI_OnLoad, so its absence is an instant load failure). A
-# build that silently packages none, or only some ABIs, must fail here
+# runs from JNI_OnLoad, so its absence is an instant load failure) AND
+# libc++_shared.so (the engine's C++ runtime: the FFmpeg dependency
+# closure links it, so a missing runtime is an instant dlopen failure).
+# A build that silently packages none, or only some ABIs, must fail here
 # instead of in the field.
 # ---------------------------------------------------------------------------
 check_apk_native_libs() {
@@ -104,7 +106,7 @@ check_apk_native_libs() {
 import sys, zipfile
 
 apk, abis = sys.argv[1], sys.argv[2:]
-required = {"libvelmux_jni.so"}
+required = {"libvelmux_jni.so", "libc++_shared.so"}
 z = zipfile.ZipFile(apk)
 names = {n.rsplit("/", 1)[-1]: n for n in z.namelist() if n.startswith("lib/")}
 missing = []

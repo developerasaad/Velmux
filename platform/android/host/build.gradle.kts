@@ -74,8 +74,16 @@ android {
                 // Mandatory per-ABI FFmpeg prefix (out/android/<ABI> from
                 // scripts/ffmpeg-builder/build-android.sh, passed by
                 // scripts/android/build.sh as -PvelmuxFFmpegPrefix).
+                // ANDROID_STL=c++_shared: the FFmpeg dependency closure
+                // (zimg, x265, SVT-AV1, harfbuzz C++ objects) links the
+                // NDK's shared C++ runtime, so the app must use it too and
+                // AGP packages libc++_shared.so into the APK — with the
+                // toolchain default (c++_static) the closure still pulls
+                // the shared runtime into DT_NEEDED but nothing packages
+                // it, and the app dies at dlopen.
                 arguments += listOfNotNull(
                     velmuxFFmpegPrefix?.let { "-DVELMUX_FFMPEG_ANDROID_PREFIX=$it" },
+                    "-DANDROID_STL=c++_shared",
                 )
             }
         }

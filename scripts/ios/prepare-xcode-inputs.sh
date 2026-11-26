@@ -56,13 +56,16 @@ require_tool cmake
 require_tool java
 require_tool libtool
 
-# Xcode script phases export the TARGET platform's SDK (SDKROOT=iphone*
-# and friends). Everything this script builds is either a macOS-host tool
-# build or an explicitly cross-configured one; an inherited SDKROOT makes
-# host-side toolchains (meson's native compiler sanity run) target the
-# simulator SDK and die at run time ("DYLD_ROOT_PATH not set for simulator
-# program"). Drop the contamination for the whole preparation tree.
-unset SDKROOT MACOSX_DEPLOYMENT_TARGET
+# Xcode script phases export the TARGET platform's SDK and deployment
+# targets (SDKROOT=iphone*, IPHONEOS_DEPLOYMENT_TARGET=15, ...). Everything
+# this script builds is either a macOS-host tool build or an explicitly
+# cross-configured one; inherited values make host-side toolchains target
+# iOS against the macOS sysroot — the sanity binaries are unrunnable
+# ("DYLD_ROOT_PATH not set for simulator program", then
+# "using sysroot for 'MacOSX' but targeting 'iPhone'" → killed at load).
+# Drop the contamination for the whole preparation tree.
+unset SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET \
+  TVOS_DEPLOYMENT_TARGET WATCHOS_DEPLOYMENT_TARGET XROS_DEPLOYMENT_TARGET
 
 JOBS="${VELMUX_FFMPEG_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 

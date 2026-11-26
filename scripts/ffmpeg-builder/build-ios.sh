@@ -50,12 +50,15 @@ ensure_cmake_ninja
 ensure_meson
 
 # This builder is explicitly cross-configured (per-slice wrapper scripts
-# with their own -isysroot); a caller's SDKROOT only contaminates the
-# HOST-side tool builds (meson's native compiler sanity run targets the
-# caller's SDK and the built tool cannot run on macOS). Observed when the
-# Xcode "Prepare engine and framework" phase invoked this script with
-# SDKROOT=iphonesimulator in its environment.
-unset SDKROOT
+# with their own -isysroot and -miphoneos-version-min); a caller's SDKROOT
+# or deployment-target variables only contaminate the HOST-side tool
+# builds (meson's native compiler sanity run targets the caller's platform
+# against the macOS sysroot and the built tool cannot run — observed when
+# the Xcode "Prepare engine and framework" phase invoked this script with
+# SDKROOT=iphonesimulator / IPHONEOS_DEPLOYMENT_TARGET in its
+# environment).
+unset SDKROOT MACOSX_DEPLOYMENT_TARGET IPHONEOS_DEPLOYMENT_TARGET \
+  TVOS_DEPLOYMENT_TARGET WATCHOS_DEPLOYMENT_TARGET XROS_DEPLOYMENT_TARGET
 
 FFMPEG_VERSION="$(json_field "$BUILDER_ROOT/versions.json" "ffmpeg.version")"
 
