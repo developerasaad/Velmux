@@ -13,7 +13,7 @@
                 A100000000000000000000A04 /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F010 /* Images.xcassets */; };
                 A100000000000000000000A05 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F011 /* LaunchScreen.storyboard */; };
                 A100000000000000000000A06 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F012 /* PrivacyInfo.xcprivacy */; };
-                A100000000000000000000A10 /* Velmux.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F100 /* Velmux.framework */; };
+                A100000000000000000000A10 /* VelmuxShared.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F100 /* VelmuxShared.framework */; };
                 A100000000000000000000A11 /* libvelmux_abi.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F101 /* libvelmux_abi.a */; };
                 A100000000000000000000A12 /* libvelmux_backend_apple.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F102 /* libvelmux_backend_apple.a */; };
                 A100000000000000000000A13 /* libvelmux_ffmpeg.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A10000000000000000000F103 /* libvelmux_ffmpeg.a */; };
@@ -51,7 +51,7 @@
                 A10000000000000000000F023 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = ../tests/Info.plist; sourceTree = "<group>"; };
                 A10000000000000000000F030 /* Velmux.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Velmux.app; sourceTree = BUILT_PRODUCTS_DIR; };
                 A10000000000000000000F031 /* VelmuxEngineTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VelmuxEngineTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-                A10000000000000000000F100 /* Velmux.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/framework/Velmux.framework"; sourceTree = "<group>"; };
+                A10000000000000000000F100 /* VelmuxShared.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/framework/VelmuxShared.framework"; sourceTree = "<group>"; };
                 A10000000000000000000F101 /* libvelmux_abi.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_abi.a"; sourceTree = "<group>"; };
                 A10000000000000000000F102 /* libvelmux_backend_apple.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_backend_apple.a"; sourceTree = "<group>"; };
                 A10000000000000000000F103 /* libvelmux_ffmpeg.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = "$(PLATFORM_NAME)/$(CONFIGURATION)/engine/libvelmux_ffmpeg.a"; sourceTree = "<group>"; };
@@ -71,7 +71,7 @@
                         isa = PBXFrameworksBuildPhase;
                         buildActionMask = 2147483647;
                         files = (
-                                A100000000000000000000A10 /* Velmux.framework in Frameworks */,
+                                A100000000000000000000A10 /* VelmuxShared.framework in Frameworks */,
                                 A100000000000000000000A11 /* libvelmux_abi.a in Frameworks */,
                                 A100000000000000000000A12 /* libvelmux_backend_apple.a in Frameworks */,
                                 A100000000000000000000A13 /* libvelmux_ffmpeg.a in Frameworks */,
@@ -190,7 +190,7 @@
                 A10000000000000000000C56 /* framework */ = {
                         isa = PBXGroup;
                         children = (
-                                A10000000000000000000F100 /* Velmux.framework */,
+                                A10000000000000000000F100 /* VelmuxShared.framework */,
                         );
                         name = framework;
                         sourceTree = "<group>";

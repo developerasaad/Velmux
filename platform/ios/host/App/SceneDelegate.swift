@@ -1,5 +1,5 @@
 import UIKit
-import Velmux
+import VelmuxShared
 
 class SceneDelegate: UIResponder, UIWindowSceneDelegate {
   var window: UIWindow?

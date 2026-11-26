@@ -78,7 +78,10 @@ kotlin {
         // stages the per-SDK build here; the undefined velmux_* symbols
         // resolve at the app link against the staged engine archives).
         target.binaries.framework {
-            baseName = "Velmux"
+            // NOT "Velmux": the app target's product/module is Velmux, and
+            // two Swift modules of the same name collide (the app's own
+            // import shadowed the Kotlin framework's entry points).
+            baseName = "VelmuxShared"
             isStatic = true
         }
     }

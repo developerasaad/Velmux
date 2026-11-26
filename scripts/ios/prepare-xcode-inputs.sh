@@ -12,7 +12,7 @@
 # directly. Everything lands under a STABLE layout the project references:
 #
 #   build/ios/stage/<platform>/<configuration>/engine/libvelmux_*.a
-#   build/ios/stage/<platform>/<configuration>/framework/Velmux.framework
+#   build/ios/stage/<platform>/<configuration>/framework/VelmuxShared.framework
 #   build/ios/stage/<platform>/<configuration>/ffmpeg/libffmpeg_deps.a
 #   build/ios/stage/test-config/VelmuxEngineTestConfig.h
 #
@@ -115,7 +115,7 @@ run_in "$VELMUX_ROOT" ./gradlew --no-daemon \
 # still use bash 3.2 (no ${var,} expansion).
 kotlin_target_dir="$(printf '%s' "${KOTLIN_TARGET:0:1}" | tr '[:upper:]' '[:lower:]')${KOTLIN_TARGET:1}"
 kotlin_config_dir="$(printf '%s' "$CONFIGURATION" | tr '[:upper:]' '[:lower:]')"
-FRAMEWORK_SRC="$VELMUX_ROOT/ui/mobile/build/bin/$kotlin_target_dir/${kotlin_config_dir}Framework/Velmux.framework"
+FRAMEWORK_SRC="$VELMUX_ROOT/ui/mobile/build/bin/$kotlin_target_dir/${kotlin_config_dir}Framework/VelmuxShared.framework"
 [ -d "$FRAMEWORK_SRC" ] || vdie "Kotlin framework not found at $FRAMEWORK_SRC after the link task"
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ for lib in $ENGINE_LIBS; do
   cp "$lib" "$STAGE/engine/"
 done
 
-cp -R "$FRAMEWORK_SRC" "$STAGE/framework/Velmux.framework"
+cp -R "$FRAMEWORK_SRC" "$STAGE/framework/VelmuxShared.framework"
 
 # The FFmpeg dependency closure for THIS slice, merged into one archive
 # (the app link then has a single symbol-indexed input; slices may contain
@@ -158,4 +158,4 @@ cat > "$VELMUX_ROOT/build/ios/stage/test-config/VelmuxEngineTestConfig.h" <<EOF
 #define VELMUX_TEST_FFMPEG_BACKEND 1
 EOF
 
-vlog "staged: $(ls "$STAGE/engine" | tr '\n' ' ') + Velmux.framework + $(basename "$STAGE/ffmpeg")/libffmpeg_deps.a"
+vlog "staged: $(ls "$STAGE/engine" | tr '\n' ' ') + VelmuxShared.framework + $(basename "$STAGE/ffmpeg")/libffmpeg_deps.a"
