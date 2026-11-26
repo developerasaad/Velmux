@@ -119,6 +119,11 @@ private:
 
   SessionSnapshot snapshotOf(const Session &session) const;
 
+  // Derives the accepted-value entries (valueId + payload, round-trip
+  // stable with applyChange) from the session's accepted request.
+  static void deriveAcceptedValues(const Session &session,
+                                   SessionSnapshot &snapshot);
+
   Result<SessionPtr> lockedSession(const std::string &sessionId,
                                    std::unique_lock<std::mutex> &lock);
 

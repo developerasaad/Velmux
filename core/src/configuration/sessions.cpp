@@ -103,11 +103,77 @@ std::int64_t nowMs() {
       .count();
 }
 
-} // namespace
+// ---------------------------------------------------------------------------
+// Accepted-value derivation (snapshotOf helper)
+//
+// Emits (field, valueId, origin, payloadJson) for every field the
+// operation's accepted request carries. The emitted valueIds match the
+// option ids deriveOptions offers and the payloads match what applyChange
+// accepts, so a UI can render the authoritative accepted configuration
+// and re-send any field verbatim (round-trip stable).
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Session storage
-// ---------------------------------------------------------------------------
+std::string payloadString(const std::string &text) {
+  return "\"" + json::escape(text) + "\"";
+}
+
+std::string payloadInt64(std::int64_t value) { return std::to_string(value); }
+
+std::string optPayloadInt32(const std::optional<std::int32_t> &value) {
+  return value.has_value() ? std::to_string(*value) : "null";
+}
+
+std::string optPayloadDouble(const std::optional<double> &value) {
+  if (!value.has_value()) {
+    return "null";
+  }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.17g", *value);
+  return buf;
+}
+
+std::string timeRangePayload(const TimeRange &range) {
+  return "{\"startUs\":" + payloadInt64(range.startUs) +
+         ",\"endUs\":" + payloadInt64(range.endUs) + "}";
+}
+
+std::string metadataPayload(const MetadataIntention &metadata) {
+  const auto entry = [](MetadataFieldAction action, const std::string &value,
+                        const char *key) -> std::string {
+    switch (action) {
+    case MetadataFieldAction::Unchanged:
+      return {};
+    case MetadataFieldAction::Set:
+      return std::string(",\"") + key + "\":" + payloadString(value);
+    case MetadataFieldAction::Clear:
+      return std::string(",\"") + key + "\":null";
+    }
+    return {};
+  };
+  std::string out = "{";
+  out += entry(metadata.titleAction, metadata.title, "title");
+  out += entry(metadata.artistAction, metadata.artist, "artist");
+  out += entry(metadata.albumAction, metadata.album, "album");
+  out += entry(metadata.genreAction, metadata.genre, "genre");
+  out += entry(metadata.dateAction, metadata.date, "date");
+  out += entry(metadata.descriptionAction, metadata.description,
+               "description");
+  out += entry(metadata.locationAction, metadata.location, "location");
+  switch (metadata.artworkAction) {
+  case MetadataFieldAction::Unchanged:
+    break;
+  case MetadataFieldAction::Set:
+    out += ",\"artwork\":" + payloadString(metadata.artworkUri);
+    break;
+  case MetadataFieldAction::Clear:
+    out += ",\"artwork\":null";
+    break;
+  }
+  out += "}";
+  return out;
+}
+
+} // namespace
 
 struct SessionManager::Session {
   std::string id;
@@ -129,6 +195,585 @@ struct SessionManager::Session {
   std::uint64_t sampleRevision = 0;
   std::mutex mutex;
 };
+
+void SessionManager::deriveAcceptedValues(const Session &session,
+                                          SessionSnapshot &snapshot) {
+  const auto originOf = [&](FieldId field) {
+    const auto it = session.origins.find(field);
+    return it == session.origins.end() ? ValueOrigin::Automatic
+                                       : it->second;
+  };
+  const auto append = [&](FieldId field, const std::string &valueId,
+                          const std::string &payloadJson = {}) {
+    AcceptedValue value;
+    value.field = field;
+    value.valueId = valueId;
+    value.origin = originOf(field);
+    value.payloadJson = payloadJson;
+    snapshot.values.push_back(std::move(value));
+  };
+  const auto appendOutputName = [&](const OutputSpec &output) {
+    if (output.name.has_value()) {
+      append(FieldId::OutputName, "custom", payloadString(*output.name));
+    } else {
+      append(FieldId::OutputName, "auto");
+    }
+  };
+  const auto appendAudioSettings =
+      [&](const AudioSettings &settings, bool includeCodec) {
+        if (includeCodec) {
+          append(FieldId::AudioCodec,
+                 settings.codec.has_value()
+                     ? codecName(*settings.codec)
+                     : "auto");
+        }
+        append(FieldId::AudioBitrate,
+               settings.bitRate.has_value()
+                   ? numberId(*settings.bitRate)
+                   : "auto");
+        append(FieldId::AudioSampleRate,
+               settings.sampleRate.has_value()
+                   ? numberId(*settings.sampleRate)
+                   : "original");
+        append(FieldId::AudioChannels,
+               settings.channels.has_value()
+                   ? numberId(*settings.channels)
+                   : "original");
+      };
+  const auto appendCompression = [&](const CompressionIntent &compression) {
+    append(FieldId::CompressionEnabled,
+           compression.enabled ? "true" : "false");
+    append(FieldId::CompressionPreset,
+           compressionPresetName(compression.preset));
+    append(FieldId::CompressionQuality,
+           compression.quality.has_value()
+               ? numberId(*compression.quality)
+               : "auto",
+           compression.quality.has_value()
+               ? payloadInt64(*compression.quality)
+               : "");
+    append(FieldId::CompressionVideoBitrate,
+           compression.videoBitrate.has_value()
+               ? numberId(*compression.videoBitrate)
+               : "auto",
+           compression.videoBitrate.has_value()
+               ? payloadInt64(*compression.videoBitrate)
+               : "");
+    append(FieldId::CompressionAudioBitrate,
+           compression.audioBitrate.has_value()
+               ? numberId(*compression.audioBitrate)
+               : "auto",
+           compression.audioBitrate.has_value()
+               ? payloadInt64(*compression.audioBitrate)
+               : "");
+    append(FieldId::CompressionTargetSize,
+           compression.targetSizeBytes > 0
+               ? numberId(compression.targetSizeBytes)
+               : "auto",
+           compression.targetSizeBytes > 0
+               ? payloadInt64(compression.targetSizeBytes)
+               : "");
+  };
+  const auto appendFormat = [&](const OutputSpec &output) {
+    const std::optional<Container> source =
+        session.infos.empty()
+            ? std::nullopt
+            : std::optional<Container>(session.infos.front().container);
+    const Container accepted =
+        output.container.value_or(source.value_or(Container::Mp4));
+    // "original" when the accepted container IS the source container (the
+    // option list offers "original" for exactly that case).
+    const bool isOriginal =
+        source.has_value() && accepted == *source && output.container.has_value();
+    append(FieldId::Format,
+           isOriginal ? "original" : containerName(accepted));
+  };
+
+  const JobRequest &request = session.accepted;
+  switch (request.payload.index()) {
+  case 0: { // VideoConvert
+    const auto &r = std::get<job::VideoConvert>(request.payload);
+    appendFormat(r.output);
+    append(FieldId::Codec,
+           r.video.codec.has_value() ? codecName(*r.video.codec) : "auto");
+    if (r.video.customWidth.has_value() && r.video.customHeight.has_value()) {
+      append(FieldId::Resolution, "custom",
+             "{\"width\":" + payloadInt64(*r.video.customWidth) +
+                 ",\"height\":" + payloadInt64(*r.video.customHeight) +
+                 "}");
+    } else if (r.video.resolutionHeight.has_value()) {
+      const std::int32_t height = *r.video.resolutionHeight;
+      const char *preset = nullptr;
+      for (const auto &option : kResolutions) {
+        if (option.landscapeHeight == height) {
+          preset = option.id;
+          break;
+        }
+      }
+      append(FieldId::Resolution, preset != nullptr ? preset : "custom");
+    } else {
+      append(FieldId::Resolution, "original");
+    }
+    append(FieldId::FrameRate,
+           r.video.frameRate.has_value()
+               ? rationalId(*r.video.frameRate)
+               : "original");
+    appendCompression(r.compression);
+    appendAudioSettings(r.audioSettings, /*includeCodec=*/true);
+    if (r.audioTracks.empty()) {
+      append(FieldId::AudioTracks, "preserve-all");
+    } else {
+      std::string payload = "[";
+      for (std::size_t i = 0; i < r.audioTracks.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        const AudioTrackRule &rule = r.audioTracks[i];
+        payload += "{\"index\":" + payloadInt64(rule.sourceTrackIndex);
+        payload += ",\"include\":" +
+                   std::string(rule.include ? "true" : "false");
+        if (rule.externalUri.has_value()) {
+          payload += ",\"external\":" + payloadString(*rule.externalUri);
+        }
+        payload += ",\"replace\":" +
+                   std::string(rule.replace ? "true" : "false");
+        payload += "}";
+      }
+      payload += "]";
+      append(FieldId::AudioTracks, "custom", payload);
+    }
+    if (r.subtitleTracks.empty()) {
+      append(FieldId::Subtitles, "preserve-all");
+    } else {
+      std::string payload = "[";
+      for (std::size_t i = 0; i < r.subtitleTracks.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        const SubtitleTrackRule &rule = r.subtitleTracks[i];
+        payload += "{\"index\":" + payloadInt64(rule.sourceTrackIndex);
+        const char *policy = "preserve";
+        switch (rule.policy) {
+        case SubtitleTrackPolicy::Preserve:
+          policy = "preserve";
+          break;
+        case SubtitleTrackPolicy::Remove:
+          policy = "remove";
+          break;
+        case SubtitleTrackPolicy::Embed:
+          policy = "embed";
+          break;
+        case SubtitleTrackPolicy::BurnIn:
+          policy = "burnIn";
+          break;
+        }
+        payload += ",\"policy\":" + payloadString(policy);
+        if (rule.externalUri.has_value()) {
+          payload += ",\"external\":" + payloadString(*rule.externalUri);
+        }
+        if (rule.fontSize.has_value()) {
+          payload += ",\"fontSize\":" + payloadInt64(*rule.fontSize);
+        }
+        if (rule.color.has_value()) {
+          payload += ",\"color\":" + payloadString(*rule.color);
+        }
+        if (rule.position.has_value()) {
+          payload += ",\"position\":" + payloadInt64(*rule.position);
+        }
+        payload += "}";
+      }
+      payload += "]";
+      append(FieldId::Subtitles, "custom", payload);
+    }
+    {
+      const VideoAdjustments &adj = r.adjustments;
+      const bool isDefault = adj.rotationDegrees == 0 && !adj.flipHorizontal &&
+                             !adj.flipVertical && !adj.playbackSpeed.has_value() &&
+                             !adj.reverse && !adj.hdrToSdr;
+      if (isDefault) {
+        append(FieldId::Adjustments, "default");
+      } else {
+        std::string payload = "{\"rotation\":" +
+                               payloadInt64(adj.rotationDegrees);
+        payload += ",\"flipH\":" + std::string(adj.flipHorizontal ? "true" : "false");
+        payload += ",\"flipV\":" + std::string(adj.flipVertical ? "true" : "false");
+        payload += ",\"speed\":" + optPayloadDouble(adj.playbackSpeed);
+        payload += ",\"reverse\":" + std::string(adj.reverse ? "true" : "false");
+        payload += ",\"hdrToSdr\":" + std::string(adj.hdrToSdr ? "true" : "false");
+        payload += "}";
+        append(FieldId::Adjustments, "custom", payload);
+      }
+    }
+    append(FieldId::Metadata,
+           r.metadata.titleAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artistAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.albumAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.genreAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.dateAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.descriptionAction ==
+                       MetadataFieldAction::Unchanged &&
+                   r.metadata.locationAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artworkAction == MetadataFieldAction::Unchanged
+               ? "unchanged"
+               : "custom",
+           metadataPayload(r.metadata));
+    appendOutputName(r.output);
+    break;
+  }
+  case 1: { // AudioConvert
+    const auto &r = std::get<job::AudioConvert>(request.payload);
+    appendFormat(r.output);
+    append(FieldId::Codec,
+           r.audio.codec.has_value() ? codecName(*r.audio.codec) : "auto");
+    appendAudioSettings(r.audio, /*includeCodec=*/false);
+    appendCompression(r.compression);
+    {
+      const AudioAdjustments &adj = r.adjustments;
+      const bool isDefault = !adj.gainDb.has_value() && !adj.normalize &&
+                             !adj.fadeInMs.has_value() &&
+                             !adj.fadeOutMs.has_value() &&
+                             !adj.playbackSpeed.has_value() && adj.preservePitch &&
+                             !adj.reverse && !adj.removeSilence;
+      if (isDefault) {
+        append(FieldId::Adjustments, "default");
+      } else {
+        std::string payload = "{\"volume\":" + optPayloadDouble(adj.gainDb);
+        payload += ",\"normalize\":" + std::string(adj.normalize ? "true" : "false");
+        payload += ",\"fadeIn\":" + optPayloadInt32(adj.fadeInMs);
+        payload += ",\"fadeOut\":" + optPayloadInt32(adj.fadeOutMs);
+        payload += ",\"speed\":" + optPayloadDouble(adj.playbackSpeed);
+        payload += ",\"preservePitch\":" +
+                   std::string(adj.preservePitch ? "true" : "false");
+        payload += ",\"reverse\":" + std::string(adj.reverse ? "true" : "false");
+        payload += ",\"removeSilence\":" +
+                   std::string(adj.removeSilence ? "true" : "false");
+        payload += "}";
+        append(FieldId::Adjustments, "custom", payload);
+      }
+    }
+    append(FieldId::Metadata,
+           r.metadata.titleAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artistAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.albumAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.genreAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.dateAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.descriptionAction ==
+                       MetadataFieldAction::Unchanged &&
+                   r.metadata.locationAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artworkAction == MetadataFieldAction::Unchanged
+               ? "unchanged"
+               : "custom",
+           metadataPayload(r.metadata));
+    appendOutputName(r.output);
+    break;
+  }
+  case 2: { // Crop
+    const auto &r = std::get<job::Crop>(request.payload);
+    append(FieldId::CropRect, "custom",
+           "{\"x\":" + payloadInt64(r.crop.x) + ",\"y\":" +
+               payloadInt64(r.crop.y) + ",\"width\":" +
+               payloadInt64(r.crop.width) + ",\"height\":" +
+               payloadInt64(r.crop.height) + "}");
+    appendOutputName(r.output);
+    break;
+  }
+  case 3: { // Trim
+    const auto &r = std::get<job::Trim>(request.payload);
+    append(FieldId::TimelineMode, "trim");
+    append(FieldId::TimelineRanges, "custom", timeRangePayload(r.range));
+    appendOutputName(r.output);
+    break;
+  }
+  case 4: { // Cut
+    const auto &r = std::get<job::Cut>(request.payload);
+    append(FieldId::TimelineMode, "cut");
+    if (r.removed.empty()) {
+      append(FieldId::TimelineRanges, "none");
+    } else {
+      std::string payload = "{\"removed\":[";
+      for (std::size_t i = 0; i < r.removed.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        payload += "{\"startUs\":" + payloadInt64(r.removed[i].startUs) +
+                   ",\"endUs\":" + payloadInt64(r.removed[i].endUs) + "}";
+      }
+      payload += "]}";
+      append(FieldId::TimelineRanges, "custom", payload);
+    }
+    appendOutputName(r.output);
+    break;
+  }
+  case 5: { // Split
+    const auto &r = std::get<job::Split>(request.payload);
+    append(FieldId::TimelineMode, "split");
+    {
+      const char *mode = "equal-parts";
+      switch (r.rules.mode) {
+      case SplitMode::EqualParts:
+        mode = "equal-parts";
+        break;
+      case SplitMode::Duration:
+        mode = "duration";
+        break;
+      case SplitMode::MaxSize:
+        mode = "max-size";
+        break;
+      case SplitMode::CustomTimestamps:
+        mode = "custom";
+        break;
+      case SplitMode::Chapters:
+        mode = "chapters";
+        break;
+      case SplitMode::Scenes:
+        mode = "scenes";
+        break;
+      }
+      std::string payload = "{\"mode\":" + payloadString(mode);
+      if (r.rules.partCount != 2) {
+        payload += ",\"partCount\":" + payloadInt64(r.rules.partCount);
+      }
+      if (r.rules.partDurationUs > 0) {
+        payload += ",\"partDurationUs\":" + payloadInt64(r.rules.partDurationUs);
+      }
+      if (r.rules.maxSizeBytes > 0) {
+        payload += ",\"maxSizeBytes\":" + payloadInt64(r.rules.maxSizeBytes);
+      }
+      if (!r.rules.boundaryUs.empty()) {
+        payload += ",\"boundaries\":[";
+        for (std::size_t i = 0; i < r.rules.boundaryUs.size(); ++i) {
+          if (i > 0) {
+            payload += ",";
+          }
+          payload += payloadInt64(r.rules.boundaryUs[i]);
+        }
+        payload += "]";
+      }
+      payload += "}";
+      append(FieldId::SplitRules, mode, payload);
+    }
+    appendOutputName(r.output);
+    break;
+  }
+  case 6: { // Merge
+    const auto &r = std::get<job::Merge>(request.payload);
+    append(FieldId::TimelineMode, "merge");
+    const char *layout = "sequential";
+    switch (r.rules.layout) {
+    case MergeLayout::Sequential:
+      layout = "sequential";
+      break;
+    case MergeLayout::SideBySide:
+      layout = "side-by-side";
+      break;
+    case MergeLayout::TopBottom:
+      layout = "top-bottom";
+      break;
+    }
+    append(FieldId::MergeLayout, layout);
+    const char *audio = "first";
+    switch (r.rules.audio) {
+    case MergeAudioSelection::First:
+      audio = "first";
+      break;
+    case MergeAudioSelection::Second:
+      audio = "second";
+      break;
+    case MergeAudioSelection::Both:
+      audio = "both";
+      break;
+    case MergeAudioSelection::None:
+      audio = "none";
+      break;
+    }
+    append(FieldId::MergeAudio, audio,
+           "{\"longerDuration\":" +
+               std::string(r.rules.longerDuration ? "true" : "false") + "}");
+    appendOutputName(r.output);
+    break;
+  }
+  case 7: { // ExtractAudio
+    const auto &r = std::get<job::ExtractAudio>(request.payload);
+    appendFormat(r.output);
+    appendAudioSettings(r.audio, /*includeCodec=*/true);
+    appendCompression(r.compression);
+    if (r.trackIndices.empty()) {
+      append(FieldId::ExtractAudioTracks, "default");
+    } else {
+      std::string payload = "[";
+      for (std::size_t i = 0; i < r.trackIndices.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        payload += payloadInt64(r.trackIndices[i]);
+      }
+      payload += "]";
+      append(FieldId::ExtractAudioTracks, "custom", payload);
+    }
+    if (r.range.has_value()) {
+      append(FieldId::ExtractAudioRange, "custom",
+             timeRangePayload(*r.range));
+    } else {
+      append(FieldId::ExtractAudioRange, "full");
+    }
+    append(FieldId::Metadata,
+           r.metadata.titleAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artistAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.albumAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.genreAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.dateAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.descriptionAction ==
+                       MetadataFieldAction::Unchanged &&
+                   r.metadata.locationAction == MetadataFieldAction::Unchanged &&
+                   r.metadata.artworkAction == MetadataFieldAction::Unchanged
+               ? "unchanged"
+               : "custom",
+           metadataPayload(r.metadata));
+    appendOutputName(r.output);
+    break;
+  }
+  case 8: { // ExtractFrames
+    const auto &r = std::get<job::ExtractFrames>(request.payload);
+    {
+      const char *mode = "all";
+      switch (r.selection.mode) {
+      case FrameSelectionMode::Current:
+        mode = "current";
+        break;
+      case FrameSelectionMode::Selected:
+        mode = "selected";
+        break;
+      case FrameSelectionMode::Interval:
+        mode = "interval";
+        break;
+      case FrameSelectionMode::FrameRate:
+        mode = "frame-rate";
+        break;
+      case FrameSelectionMode::Count:
+        mode = "count";
+        break;
+      case FrameSelectionMode::AllInRange:
+        mode = "all";
+        break;
+      case FrameSelectionMode::Keyframes:
+        mode = "keyframes";
+        break;
+      case FrameSelectionMode::SceneChanges:
+        mode = "scenes";
+        break;
+      }
+      std::string payload = "{\"mode\":" + payloadString(mode);
+      if (r.selection.intervalUs > 0) {
+        payload += ",\"intervalUs\":" + payloadInt64(r.selection.intervalUs);
+      }
+      if (r.selection.frameRate.valid()) {
+        payload += ",\"frameRate\":" + payloadString(
+                                         rationalId(r.selection.frameRate));
+      }
+      if (r.selection.count > 0) {
+        payload += ",\"count\":" + payloadInt64(r.selection.count);
+      }
+      if (!r.selection.timestampsUs.empty()) {
+        payload += ",\"timestampsUs\":[";
+        for (std::size_t i = 0; i < r.selection.timestampsUs.size(); ++i) {
+          if (i > 0) {
+            payload += ",";
+          }
+          payload += payloadInt64(r.selection.timestampsUs[i]);
+        }
+        payload += "]";
+      }
+      payload += ",\"range\":" + timeRangePayload(r.selection.range);
+      payload += "}";
+      append(FieldId::FrameSelection, mode, payload);
+    }
+    {
+      const char *format = "jpeg";
+      switch (r.image.format) {
+      case ImageOutputRules::Format::Jpeg:
+        format = "jpeg";
+        break;
+      case ImageOutputRules::Format::Png:
+        format = "png";
+        break;
+      case ImageOutputRules::Format::WebP:
+        format = "webp";
+        break;
+      }
+      append(FieldId::ImageFormat, format);
+      append(FieldId::ImageQuality,
+             r.image.quality.has_value() ? numberId(*r.image.quality)
+                                         : "default",
+             r.image.quality.has_value()
+                 ? payloadInt64(*r.image.quality)
+                 : "");
+      if (r.image.maxWidth.has_value() || r.image.maxHeight.has_value()) {
+        append(FieldId::ImageDimensions, "custom",
+               "{\"maxWidth\":" + optPayloadInt32(r.image.maxWidth) +
+                   ",\"maxHeight\":" + optPayloadInt32(r.image.maxHeight) +
+                   "}");
+      } else {
+        append(FieldId::ImageDimensions, "original");
+      }
+    }
+    appendOutputName(r.output);
+    break;
+  }
+  case 9: { // ExtractSubtitles
+    const auto &r = std::get<job::ExtractSubtitles>(request.payload);
+    if (r.trackIndices.empty()) {
+      append(FieldId::SubtitleTracks, "all");
+    } else {
+      std::string payload = "[";
+      for (std::size_t i = 0; i < r.trackIndices.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        payload += payloadInt64(r.trackIndices[i]);
+      }
+      payload += "]";
+      append(FieldId::SubtitleTracks, "custom", payload);
+    }
+    if (r.targets.empty()) {
+      append(FieldId::SubtitleTarget, "original");
+    } else {
+      std::string payload = "[";
+      for (std::size_t i = 0; i < r.targets.size(); ++i) {
+        if (i > 0) {
+          payload += ",";
+        }
+        const char *target = "original";
+        switch (r.targets[i]) {
+        case SubtitleTextTarget::Original:
+          target = "original";
+          break;
+        case SubtitleTextTarget::Srt:
+          target = "srt";
+          break;
+        case SubtitleTextTarget::Vtt:
+          target = "vtt";
+          break;
+        case SubtitleTextTarget::Ass:
+          target = "ass";
+          break;
+        }
+        payload += payloadString(target);
+      }
+      payload += "]";
+      append(FieldId::SubtitleTarget, "custom", payload);
+    }
+    appendOutputName(r.output);
+    break;
+  }
+  }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Session storage
+// ---------------------------------------------------------------------------
+
 
 SessionManager::SessionManager(const FeatureRegistry &features,
                                const CapabilityRegistry &capabilities,
@@ -278,13 +923,9 @@ SessionSnapshot SessionManager::snapshotOf(const Session &session) const {
   snapshot.estimate = session.estimate;
   snapshot.relatedChange = session.relatedChange;
   snapshot.samplePath = session.samplePath;
-  // Accepted values keyed by field id.
-  for (const auto &[field, origin] : session.origins) {
-    AcceptedValue value;
-    value.field = field;
-    value.origin = origin;
-    snapshot.values.push_back(std::move(value));
-  }
+  // Accepted values with the valueId + payload the UI renders and can
+  // re-send verbatim (round-trip stable with applyChange's inputs).
+  deriveAcceptedValues(session, snapshot);
   return snapshot;
 }
 
