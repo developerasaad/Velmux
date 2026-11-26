@@ -156,7 +156,9 @@ if (androidSdkAvailable) {
         namespace = "com.velmux.mobile.shared"
         compileSdk = 35
         defaultConfig {
-            minSdk = 26
+            // Mandate §47: API 29 product floor (kept in sync with the app
+            // module and the FFmpeg artifact platform level).
+            minSdk = 29
         }
         compileOptions {
             sourceCompatibility = JavaVersion.VERSION_17

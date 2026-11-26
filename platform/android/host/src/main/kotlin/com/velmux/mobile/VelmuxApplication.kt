@@ -32,6 +32,12 @@ class VelmuxApplication : Application() {
         client = EngineClient(
             transport = EngineTransport(com.velmux.mobile.platform.platformDataDir),
         )
+        // The platform surfaces (foreground service, notifications, cancel
+        // intents) ride the SAME single engine and event pump (mandate
+        // §10.1): EngineHolder fans the client's event batches out to them.
+        // Bound BEFORE start so the collector sees every event the pump
+        // drains from its very first tick.
+        EngineHolder.bind(client, this)
         client.start(CoroutineScope(SupervisorJob() + Dispatchers.Default))
         logEngineInitMarker()
     }

@@ -2,30 +2,34 @@ package com.velmux.mobile
 
 import android.content.Context
 import android.content.Intent
-import java.io.File
+import com.velmux.mobile.engine.EngineClient
+import com.velmux.mobile.engine.JobEvent
+import com.velmux.mobile.engine.JobStates
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import org.json.JSONArray
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
- * Process-level owner of the Velmux engine (spec §22: the job engine must
- * be independent of React Native).
+ * Process-level platform-surface hub (mandate §10.1: ONE engine, ONE event
+ * pump per process).
  *
- * The engine is a C++ library inside this process; the durable job state
- * lives in its SQLite store. This holder keeps the engine alive across
- * React instance teardowns (background → activity recreation → reload),
- * pumps the engine's bounded event queue at a coalesced cadence, and
- * distributes events to registered listeners:
+ * The engine handle is owned by the shared [EngineClient]'s transport
+ * (a process-wide singleton) and the client's poll loop is the ONE event
+ * pump. This holder binds to that client (VelmuxApplication binds it at
+ * process start) and:
  *
- *  - the React Native module (UI updates), and
- *  - the foreground ConversionService (notifications).
+ *  - fans the client's coalesced event batches out to registered platform
+ *    listeners (the foreground ConversionService renders notifications);
+ *  - starts the ConversionService when work becomes active and lets it
+ *    stop itself when the engine idles;
+ *  - routes job control (cancel intents) back through the client.
  *
- * Pump lifetime is state-driven: it runs while listeners are attached OR
- * the engine has active work, and exits after a bounded idle period — no
- * manual request/release pairing to leak. [wake] restarts it on demand.
+ * It owns no engine handle and never polls the engine itself — a second
+ * pump would race the client's for the engine's bounded event queue.
  */
 object EngineHolder {
 
@@ -34,148 +38,120 @@ object EngineHolder {
     fun onJobEvent(event: JSONObject)
   }
 
-  private val engineLock = Any()
-  private var engineHandle = 0L
-
-  private val pumpExecutor =
-    Executors.newSingleThreadExecutor { runnable ->
-      Thread(runnable, "velmux-events").apply { isDaemon = true }
-    }
-
+  private val listenerLock = Any()
   private val listeners: MutableSet<EventListener> =
     Collections.newSetFromMap(ConcurrentHashMap<EventListener, Boolean>())
-  private val pumping = AtomicBoolean(false)
 
-  // Latest state per job, updated from engine events. Read by the service
-  // to decide foreground lifetime; the engine remains the source of truth.
+  // Latest state per job, updated from the client's event batches. Read by
+  // the service to decide foreground lifetime; the engine remains the
+  // source of truth.
   private val jobStates = ConcurrentHashMap<String, JSONObject>()
 
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+  @Volatile private var boundClient: EngineClient? = null
   private lateinit var appContext: Context
 
   /** Tracks whether the foreground service was requested; avoids duplicate
    * start calls when many events arrive. */
   @Volatile var serviceRunning = false
 
-  fun initialize(context: Context) {
-    if (::appContext.isInitialized) {
-      return
+  /**
+   * Binds the process client once (VelmuxApplication.onCreate). Collects
+   * the client's event batches and job states for as long as the process
+   * lives; idempotent.
+   */
+  fun bind(client: EngineClient, context: Context) {
+    if (boundClient != null) return
+    synchronized(this) {
+      if (boundClient != null) return
+      boundClient = client
+      appContext = context.applicationContext
     }
-    appContext = context.applicationContext
-  }
-
-  // -- engine lifecycle --------------------------------------------------------
-
-  /** The engine handle, created lazily in durable (non-cache) storage. */
-  fun engine(): Long {
-    synchronized(engineLock) {
-      if (engineHandle == 0L) {
-        val dataDir = File(appContext.filesDir, "velmux").apply { mkdirs() }
-        engineHandle = VelmuxJni.nativeCreateEngine(dataDir.absolutePath)
-        require(engineHandle != 0L) {
-          "Velmux engine failed to initialize (no backend could start)"
+    scope.launch {
+      client.eventBatches.collect { batch ->
+        for (event in batch) {
+          dispatch(event)
         }
       }
-      return engineHandle
     }
   }
 
-  /** The engine is process-owned and never destroyed; null when absent. */
-  fun engineHandleOrNull(): Long? = engineHandle.takeIf { it != 0L }
+  /** The bound process client (null before VelmuxApplication.onCreate). */
+  fun clientOrNull(): EngineClient? = boundClient
 
   // -- events --------------------------------------------------------------------
 
   fun addListener(listener: EventListener) {
-    listeners.add(listener)
-    wake()
+    synchronized(listenerLock) {
+      listeners.add(listener)
+    }
+    replayStatesFor(listener)
   }
 
   fun removeListener(listener: EventListener) {
-    listeners.remove(listener)
-  }
-
-  /** Restarts the event pump if it is not running (cheap when it is). */
-  fun wake() {
-    if (listeners.isNotEmpty() && pumping.compareAndSet(false, true)) {
-      pumpExecutor.execute(::pumpLoop)
+    synchronized(listenerLock) {
+      listeners.remove(listener)
     }
   }
 
-  private fun pumpLoop() {
-    var idleRounds = 0
-    while (true) {
-      var sawEvent = false
-      try {
-        val handle = engine()
-        val bytes = VelmuxJni.nativePollEvents(handle)
-        val events = JSONArray(String(bytes, Charsets.UTF_8))
-        for (i in 0 until events.length()) {
-          sawEvent = true
-          dispatch(events.getJSONObject(i))
-        }
-      } catch (error: IllegalStateException) {
-        break // Engine unavailable (process teardown); stop quietly.
-      } catch (error: Exception) {
-        // A malformed poll response must not kill the loop.
-      }
-      // Keep pumping while anyone listens or work is active; exit after a
-      // bounded idle period so nothing runs forever unnoticed. A terminal
-      // event has already been dispatched by the time hasActiveWork()
-      // turns false, so no transitions are lost by exiting.
-      if (sawEvent || listeners.isNotEmpty() || hasActiveWork()) {
-        idleRounds = 0
-      } else {
-        idleRounds++
-        if (idleRounds >= IDLE_ROUNDS_BEFORE_EXIT) {
-          break
-        }
-      }
-      // Coalesced cadence: fast enough for progress, quiet enough for
-      // the event pipe and notifications (superseded progress events may
-      // be dropped by the engine under pressure; transitions never are).
-      try {
-        Thread.sleep(POLL_INTERVAL_MS)
-      } catch (interrupted: InterruptedException) {
-        Thread.currentThread().interrupt()
-        break
-      }
+  /**
+   * A newly attached listener first sees the LAST known state of every
+   * active job, so a service restarted mid-work renders correctly without
+   * waiting for the next event.
+   */
+  private fun replayStatesFor(listener: EventListener) {
+    for (event in jobStates.values) {
+      deliverTo(listener, event)
     }
-    pumping.set(false)
-    // Re-check in case a listener registered while we were exiting.
-    wake()
   }
 
-  private fun dispatch(event: JSONObject) {
-    val jobId = event.optString("jobId")
-    if (jobId.isNotEmpty()) {
-      jobStates[jobId] = event
+  private fun dispatch(event: JobEvent) {
+    val payload = JSONObject().apply {
+      put("jobId", event.jobId)
+      put("state", event.state)
+      put("progress", event.progress)
+      put("outputSizeBytes", event.outputSizeBytes)
+      event.error?.let { put("error", it) }
+      event.errorCode?.let { put("errorCode", it) }
     }
-    for (listener in listeners) {
-      try {
-        listener.onJobEvent(event)
-      } catch (error: Exception) {
-        // A broken listener must not break the pump.
+    if (event.jobId.isNotEmpty()) {
+      jobStates[event.jobId] = payload
+    }
+    synchronized(listenerLock) {
+      for (listener in listeners) {
+        deliverTo(listener, payload)
       }
     }
     maybeStartService()
   }
 
-  // -- job control (used by the service and the RN module) ------------------------
+  private fun deliverTo(listener: EventListener, event: JSONObject) {
+    try {
+      listener.onJobEvent(event)
+    } catch (error: Exception) {
+      // A broken listener must not break the fan-out.
+    }
+  }
 
-  fun cancel(jobId: String): Boolean {
-    val handle = engineHandleOrNull() ?: return false
-    return VelmuxJni.nativeCancelJob(handle, jobId)
+  // -- job control (used by the service and cancel intents) ----------------------
+
+  fun cancel(jobId: String) {
+    scope.launch {
+      boundClient?.cancelJob(jobId)
+    }
   }
 
   /**
    * True while at least one durable job is in an execution state that
-   * justifies a foreground service. Paused/interrupted jobs do not: the
-   * engine idles, and resume re-starts the service.
+   * justifies a foreground service (JobStates.ACTIVE minus QUEUED — merely
+   * queued work does not yet hold a worker). Paused/interrupted jobs do
+   * not: the engine idles, and resume re-starts the service.
    */
   fun hasActiveWork(): Boolean {
     for (event in jobStates.values) {
-      when (event.optString("state")) {
-        "preparing", "running", "checkpointing", "recovering" -> return true
-      }
+      val state = event.optString("state")
+      if (state in FOREGROUND_STATES) return true
     }
     return false
   }
@@ -200,7 +176,7 @@ object EngineHolder {
     }
   }
 
-  private const val POLL_INTERVAL_MS = 250L
-  // ~12s of fully idle polling before the pump thread exits.
-  private const val IDLE_ROUNDS_BEFORE_EXIT = 48
+  /** States that justify holding the foreground service. */
+  private val FOREGROUND_STATES: Set<String> =
+    JobStates.ACTIVE.filter { it != JobStates.QUEUED }.toSet()
 }

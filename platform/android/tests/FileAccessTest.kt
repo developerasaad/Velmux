@@ -36,9 +36,9 @@ class FileAccessTest {
    */
   @Test
   fun fileProviderServesEngineOutputs() {
-    // The REAL engine tree (EngineHolder uses filesDir/velmux; outputs land
-    // in filesDir/velmux/outputs — the provider's paths XML covers exactly
-    // that subtree).
+    // The REAL engine tree (the process engine uses filesDir/velmux; outputs
+    // land in filesDir/velmux/outputs — the provider's paths XML covers
+    // exactly that subtree).
     val outputs = File(File(context.filesDir, "velmux"), "outputs")
     outputs.mkdirs()
     val output = File(outputs, "file-access-test-${System.nanoTime()}.mp4")

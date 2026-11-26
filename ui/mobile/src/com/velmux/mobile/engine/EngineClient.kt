@@ -139,6 +139,18 @@ class EngineClient(
     private val _jobSubmitted = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val jobSubmitted: SharedFlow<String> = _jobSubmitted
 
+    /**
+     * Every coalesced event batch the poll loop drained, for the platform
+     * notification/foreground surfaces (mandate §10.1: ONE engine and ONE
+     * event pump per process — platform services subscribe here instead of
+     * polling the engine a second time). Terminal states ride the same
+     * batches; the buffer is deep enough that a momentarily slow platform
+     * collector cannot lose them (the emitting side back-pressures).
+     */
+    private val _eventBatches =
+        MutableSharedFlow<List<JobEvent>>(replay = 0, extraBufferCapacity = 64)
+    val eventBatches: SharedFlow<List<JobEvent>> = _eventBatches
+
     // ---- internals -----------------------------------------------------------
 
     private val listenerCount = MutableStateFlow(0)
@@ -285,6 +297,7 @@ class EngineClient(
         if (events.isEmpty()) return
         val coalesced = coalesce(events)
         _lastEvents.value = coalesced
+        _eventBatches.emit(coalesced)
         val sawTerminal = coalesced.any { it.state in JobStates.TERMINAL }
         if (sawTerminal) {
             // Terminal event: force a FULL jobs refresh.

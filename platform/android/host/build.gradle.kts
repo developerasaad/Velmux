@@ -50,7 +50,10 @@ android {
 
     defaultConfig {
         applicationId = "com.velmux.mobile"
-        minSdk = 26
+        // Mandate §47: Android 10/API 29 is the fixed product floor; the
+        // FFmpeg artifacts are built for the same level (config.sh
+        // VELMUX_ANDROID_MIN_API=29), so the app must not accept less.
+        minSdk = 29
         targetSdk = 35
         versionCode = velmuxVersionCode.toInt()
         versionName = velmuxVersionName

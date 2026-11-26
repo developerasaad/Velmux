@@ -12,31 +12,35 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.BatteryManager
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
-import org.json.JSONObject
+import com.velmux.mobile.engine.ResourceSnapshot
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import org.json.JSONObject
 
 /**
- * Foreground host for active conversions (spec §22, M8).
+ * Foreground host for active conversions (mandate §37.5/§38).
  *
  * Android keeps the process alive while this service is foreground, which
  * keeps the C++ engine's worker threads running when the UI is gone. The
- * service renders normalized engine events as platform notifications:
+ * service renders the engine events fanned out by [EngineHolder] (the one
+ * process pump) as platform notifications:
  *
  *  - one live progress notification per running job (coalesced cadence);
  *  - terminal notifications on completion/failure/cancel;
  *  - a Cancel action that goes straight to the engine — it works without
- *    the React Native UI being initialized (spec §23).
+ *    the UI being initialized.
  *
- * The service is also the platform resource host (spec §21): while it
- * lives, it feeds the core scheduler thermal/battery/memory state through
- * the same bridge plumbing the RN module uses (VelmuxJni
- * .nativeUpdateResources), so concurrency follows real device conditions.
+ * The service is also the platform resource host: while it lives, it feeds
+ * the core scheduler thermal/battery/memory state through the shared
+ * engine client, so concurrency follows real device conditions.
  *
  * The service starts from EngineHolder when work becomes active and stops
  * itself when the engine idles. It owns no media policy.
@@ -44,6 +48,9 @@ import java.util.concurrent.ConcurrentHashMap
 class ConversionService : Service(), EngineHolder.EventListener {
 
   private lateinit var notifications: NotificationManager
+
+  /** Scope for the suspending resource pushes (the client calls are async). */
+  private val resourceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
   // JobId -> last progress fraction (0..1, or -1). The live notification
   // per job reuses the same id for seamless updates.
@@ -98,19 +105,17 @@ class ConversionService : Service(), EngineHolder.EventListener {
         .setContentIntent(contentIntent())
         .setProgress(0, 0, true)
         .build()
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      startForeground(
-        FOREGROUND_ID,
-        notification,
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-      )
-    } else {
-      startForeground(FOREGROUND_ID, notification)
-    }
+    // API 29 floor: the typed startForeground is always available.
+    startForeground(
+      FOREGROUND_ID,
+      notification,
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+    )
   }
 
   override fun onDestroy() {
     stopResourceMonitoring()
+    resourceScope.cancel()
     EngineHolder.removeListener(this)
     EngineHolder.serviceRunning = false
     super.onDestroy()
@@ -118,13 +123,13 @@ class ConversionService : Service(), EngineHolder.EventListener {
 
   override fun onBind(intent: Intent?): IBinder? = null
 
-  // -- Platform resource feed (spec §21) -----------------------------------------
+  // -- Platform resource feed (mandate §18/§37.5) ---------------------------------
   //
   // The core scheduler consumes thermal/battery/memory state to steer
   // concurrency. This service is the Android-side host of that feed: while
   // it exists (work is active), thermal-status and battery listeners plus
-  // a slow periodic refresh push updates through the bridge, in EXACTLY
-  // the JSON shape velmux_update_resources parses. Pushes are debounced:
+  // a slow periodic refresh push updates through the shared engine client,
+  // in the typed shape velmux_update_resources parses. Pushes are debounced:
   // only real state changes leave the process, at most every few seconds.
   // Every listener is unregistered in onDestroy.
 
@@ -166,30 +171,34 @@ class ConversionService : Service(), EngineHolder.EventListener {
   }
 
   /**
-   * Pushes the current snapshot through the bridge. Debounced: identical
-   * state never re-sends, and no two sends are closer than the throttle
-   * window unless [force] (memory-pressure events must land immediately).
+   * Pushes the current snapshot through the shared engine client (the one
+   * process engine). Debounced: identical state never re-sends, and no two
+   * sends are closer than the throttle window unless [force] (memory-pressure
+   * events must land immediately).
    */
   private fun pushResources(force: Boolean = false) {
-    val handle = EngineHolder.engineHandleOrNull() ?: return
+    val client = EngineHolder.clientOrNull() ?: return
     val now = SystemClock.elapsedRealtime()
     if (!force && now - lastResourcePushMs < RESOURCE_MIN_INTERVAL_MS) {
       return
     }
     val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-    val payload = JSONObject().apply {
-      put("cpuCores", Runtime.getRuntime().availableProcessors())
-      put("memoryAvailableMb", availableMemoryMb())
-      put("thermalPressure", thermalPressureOf(powerManager.currentThermalStatus))
-      put("onBattery", onBatteryPower())
-    }
-    if (payload.toString() == lastResourcePayload) {
+    val snapshot = ResourceSnapshot(
+        cpuCores = Runtime.getRuntime().availableProcessors(),
+        memoryAvailableMb = availableMemoryMb().toInt(),
+        thermalPressure = thermalPressureOf(powerManager.currentThermalStatus),
+        onBattery = onBatteryPower(),
+    )
+    val payloadKey = snapshot.toString()
+    if (payloadKey == lastResourcePayload) {
       lastResourcePushMs = now
       return
     }
-    if (VelmuxJni.nativeUpdateResources(handle, payload.toString())) {
-      lastResourcePayload = payload.toString()
-      lastResourcePushMs = now
+    lastResourcePushMs = now
+    resourceScope.launch {
+      if (client.updateResources(snapshot)) {
+        lastResourcePayload = payloadKey
+      }
     }
   }
 

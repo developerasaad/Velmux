@@ -18,7 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
  * SourcePorter import copies them into app storage before the engine
  * reads them.
  */
-actual class FilePickerHandle actual constructor() {
+actual class FilePickerHandle {
 
     private val _picks = MutableStateFlow<List<PickedFile>>(emptyList())
     actual val picks: StateFlow<List<PickedFile>> = _picks

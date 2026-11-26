@@ -1,8 +1,6 @@
 package com.velmux.mobile.engine
 
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -11,6 +9,11 @@ import java.io.File
  * surface (VelmuxJni, RegisterNatives; JSON crosses as UTF-8 bytes; the
  * handle travels as jlong). Calls run on Dispatchers.IO — JNI is
  * synchronous under the hood.
+ *
+ * ONE process engine (mandate §10.1): the handle is a process-wide
+ * singleton created on first use and never destroyed — UI detachment,
+ * activity recreation and service start/stop all share it. The engine
+ * outlives every transport; [dispose] only detaches.
  *
  * Coverage: the FULL frozen ABI v2 (core/include/velmux/abi.h) —
  * abi/engine version, the configuration-session lifecycle (create/
@@ -23,25 +26,8 @@ actual open class EngineTransport actual constructor(
     private val dataDir: String,
 ) {
 
-    private val engineMutex = Mutex()
-
-    @Volatile
-    private var engineHandle: Long = 0L
-
-    private suspend fun engine(): Long = engineMutex.withLock {
-        if (engineHandle != 0L) return engineHandle
-        withContext(Dispatchers.IO) {
-            val handle = com.velmux.mobile.VelmuxJni.createEngine(File(dataDir))
-            if (handle == 0L) {
-                throw EngineException(
-                    EngineErrorCode.ENGINE_UNAVAILABLE,
-                    "The Velmux engine failed to initialize " +
-                        "(unusable data directory or no backend started)",
-                )
-            }
-            engineHandle = handle
-            handle
-        }
+    private suspend fun engine(): Long = withContext(Dispatchers.IO) {
+        processEngine(dataDir)
     }
 
     private fun bytes(payload: ByteArray): String = payload.decodeToString()
@@ -270,11 +256,9 @@ actual open class EngineTransport actual constructor(
     }
 
     actual open fun dispose() {
-        val handle = engineHandle
-        engineHandle = 0L
-        if (handle != 0L) {
-            com.velmux.mobile.VelmuxJni.nativeDestroyEngine(handle)
-        }
+        // The engine is process-owned (see class docs): detaching the client
+        // releases nothing but this transport's reference. The C++ engine
+        // and its durable store live until the process exits.
     }
 
     private fun encodeResources(snapshot: ResourceSnapshot): String {
@@ -286,5 +270,38 @@ actual open class EngineTransport actual constructor(
             snapshot.hardwareCodecAvailable?.let { add("\"hardwareCodecAvailable\":$it") }
         }
         return "{" + fields.joinToString(",") + "}"
+    }
+
+    companion object {
+        private val processEngineLock = Any()
+
+        /** The one process engine handle (0 until first creation). */
+        @Volatile
+        private var processEngineHandle: Long = 0L
+
+        /**
+         * Returns THE process engine, creating it on first use in [dataDir].
+         * Every later call — from this transport, a recreated activity, or
+         * a platform service — receives the same handle regardless of the
+         * dataDir it passes (the first caller's directory owns the durable
+         * store; the app always passes the same canonical path anyway).
+         */
+        internal fun processEngine(dataDir: String): Long {
+            synchronized(processEngineLock) {
+                if (processEngineHandle != 0L) {
+                    return processEngineHandle
+                }
+                val handle = com.velmux.mobile.VelmuxJni.createEngine(File(dataDir))
+                if (handle == 0L) {
+                    throw EngineException(
+                        EngineErrorCode.ENGINE_UNAVAILABLE,
+                        "The Velmux engine failed to initialize " +
+                            "(unusable data directory or no backend started)",
+                    )
+                }
+                processEngineHandle = handle
+                return handle
+            }
+        }
     }
 }
