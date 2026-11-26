@@ -2,8 +2,9 @@
 //
 // The inspection result is the single source of truth about a media file,
 // produced by any backend's inspector and consumed by the planner, job
-// manager, recovery and validation subsystems. It intentionally mirrors the
-// React Native bridge contract (see apps/mobile/src/native/NativeVelmux.ts).
+// manager, recovery and validation subsystems. It is the model the C ABI
+// serializes for the Kotlin engine clients (the shared UI's source of
+// media facts).
 #pragma once
 
 #include <velmux/types.h>

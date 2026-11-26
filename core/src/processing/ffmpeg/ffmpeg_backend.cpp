@@ -14,6 +14,7 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <system_error>
+#include <unistd.h>
 #include <unordered_map>
 
 extern "C" {

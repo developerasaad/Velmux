@@ -156,12 +156,36 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Check FFmpeg artifact completeness
+        # Whether the FFmpeg artifacts are complete and identity-recorded,
+        # independent of the downstream app/test outcome. The identity gate
+        # on restore re-verifies content, but a PARTIAL tree saved under
+        # this key would claim it permanently (later complete builds could
+        # never save) — so the key is only claimed by a complete tree.
+        id: ffcheck
+        if: always() && steps.ios-sim.outcome != 'cancelled'
+        run: |
+          complete=yes
+          for slice in iphoneos iphonesimulator; do
+            for f in \
+                "scripts/ffmpeg-builder/out/ios/$slice/lib/pkgconfig/libavcodec.pc" \
+                "scripts/ffmpeg-builder/out/ios/$slice/BUILD-IDENTITY" \
+                "scripts/ffmpeg-builder/out/ios/$slice/share/velmux/ffmpeg-capabilities.json"; do
+              if [ ! -f "$f" ]; then
+                complete=no
+                echo "missing: $f" >&2
+              fi
+            done
+          done
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+
       - name: Save FFmpeg artifacts
-        # Save only after the builds succeeded and only when this run
-        # actually built something (no exact cache hit), so a partial
-        # output can never poison the cache. A lost cross-run cache race
-        # only costs a later rebuild, hence continue-on-error.
-        if: steps.device-build.outcome == 'success' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        # Saves the complete artifacts even when a downstream app/test step
+        # failed (an 18-minute cold build should not be discarded because
+        # the app compile failed); partial trees never claim the key.
+        # A lost cross-run cache race only costs a later rebuild, hence
+        # continue-on-error.
+        if: always() && steps.ffmpeg-cache.outputs.cache-hit != 'true' && steps.ffcheck.outputs.complete == 'yes'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:

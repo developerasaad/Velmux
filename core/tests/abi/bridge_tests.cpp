@@ -1,5 +1,6 @@
 // Bridge integration tests: the stable C facade exercised exactly like a
-// React Native TurboModule host would (JSON in, JSON out), against the REAL
+// platform host would (JSON in, JSON out; the JNI/cinterop transports do
+// the same), against the REAL
 // engine + FFmpeg backend. Output validity is cross-checked with ffprobe,
 // never only with the code that produced the output.
 //

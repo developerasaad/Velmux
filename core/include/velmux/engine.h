@@ -1,7 +1,7 @@
 // Velmux core — engine facade.
 //
-// VelmuxEngine is the single entry point every frontend uses (React Native
-// bridge, future Kotlin/Swift/Flutter/CLI hosts). It owns the registries,
+// VelmuxEngine is the single entry point every host uses (the C ABI facade
+// for the Kotlin engine clients; host engine tests). It owns the registries,
 // the job manager, the scheduler and the event bus, and wires the crash
 // recovery sequence at startup.
 #pragma once
