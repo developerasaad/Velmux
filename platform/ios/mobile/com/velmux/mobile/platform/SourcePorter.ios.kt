@@ -18,7 +18,7 @@ import platform.Foundation.NSUUID
 actual object SourcePorter {
 
     actual suspend fun resolve(pick: PickedFile): ResolvedSource =
-        withContext(Dispatchers.IO) {
+        withContext(Dispatchers.Default) {
             ResolvedSource(
                 uri = pick.uri,
                 displayName = pick.displayName,
@@ -27,7 +27,7 @@ actual object SourcePorter {
         }
 
     actual suspend fun import(source: ResolvedSource): ImportedSource =
-        withContext(Dispatchers.IO) {
+        withContext(Dispatchers.Default) {
             val url = NSURL.URLWithString(source.uri)
                 ?: NSURL.fileURLWithPath(source.uri)
             val scoped = url.startAccessingSecurityScopedResource()

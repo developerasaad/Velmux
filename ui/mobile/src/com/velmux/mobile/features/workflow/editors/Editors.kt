@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.workflow.editors
 
+import com.velmux.mobile.fmt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,9 +38,9 @@ import com.velmux.mobile.features.workflow.parseSecondsUs
 internal fun formatBytesLabel(bytes: Long): String = when {
     bytes < 0 -> Strings.NO_VALUE
     bytes < 1_000 -> "$bytes B"
-    bytes < 1_000_000 -> "%.1f KB".format(bytes / 1_000.0)
-    bytes < 1_000_000_000 -> "%.1f MB".format(bytes / 1_000_000.0)
-    else -> "%.2f GB".format(bytes / 1_000_000_000.0)
+    bytes < 1_000_000 -> "%.1f KB".fmt(bytes / 1_000.0)
+    bytes < 1_000_000_000 -> "%.1f MB".fmt(bytes / 1_000_000.0)
+    else -> "%.2f GB".fmt(bytes / 1_000_000_000.0)
 }
 
 /**

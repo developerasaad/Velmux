@@ -84,7 +84,9 @@ data class SelectionOption(
 
 /**
  * Material3 bottom sheet with radio options — the ONE selection mechanism
- * for configuration values (format/codec/preset...).
+ * for configuration values (format/codec/preset...). [emptyMessage] shows an
+ * honest explanation when no option is applicable (e.g. a batch's per-file
+ * option lists have no common value).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -94,6 +96,7 @@ fun SelectionSheet(
     selectedId: String?,
     onDismiss: () -> Unit,
     onSelect: (SelectionOption) -> Unit,
+    emptyMessage: String? = null,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -106,6 +109,14 @@ fun SelectionSheet(
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
             )
+            if (options.isEmpty() && emptyMessage != null) {
+                Text(
+                    text = emptyMessage,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp),
+                )
+            }
             options.forEach { option ->
                 Row(
                     modifier = Modifier

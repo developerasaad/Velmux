@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.video.converter
 
+import com.velmux.mobile.fmt
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -201,7 +202,7 @@ private fun AudioTrackRulesEditor(
     }
     media.audio.forEachIndexed { index, track ->
         CheckRow(
-            label = Strings.TRACK_FORMAT.format(index + 1) +
+            label = Strings.TRACK_FORMAT.fmt(index + 1) +
                 (track.language?.takeIf { it.isNotBlank() && it != "und" }
                     ?.let { " · $it" } ?: ""),
             detail = "${track.codec}" +
@@ -272,7 +273,7 @@ private fun SubtitleRulesEditor(
     media.subtitles.forEachIndexed { index, track ->
         val current = policies[index] ?: "preserve"
         androidx.compose.material3.Text(
-            text = Strings.TRACK_FORMAT.format(index + 1) +
+            text = Strings.TRACK_FORMAT.fmt(index + 1) +
                 (track.language?.takeIf { it.isNotBlank() && it != "und" }
                     ?.let { " · $it" } ?: "") + " · ${track.format}",
             style = androidx.compose.material3.MaterialTheme.typography.bodyLarge,

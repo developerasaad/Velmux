@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.settings
 
+import com.velmux.mobile.fmt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -70,7 +71,7 @@ class SettingsController(
 
     init {
         scope.launch {
-            val loaded = withContext(Dispatchers.IO) { store.load() }
+            val loaded = withContext(Dispatchers.Default) { store.load() }
             if (loaded != null) {
                 _settings.value = loaded
             }
@@ -92,7 +93,7 @@ class SettingsController(
     private fun update(block: (AppSettings) -> AppSettings) {
         _settings.value = block(_settings.value)
         scope.launch {
-            withContext(Dispatchers.IO) { store.save(_settings.value) }
+            withContext(Dispatchers.Default) { store.save(_settings.value) }
         }
     }
 }
@@ -158,7 +159,7 @@ fun SettingsScreen(
                 )
             } else {
                 Text(
-                    text = Strings.SETTINGS_MANAGED_OUTPUTS_COUNT.format(managed.size),
+                    text = Strings.SETTINGS_MANAGED_OUTPUTS_COUNT.fmt(managed.size),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

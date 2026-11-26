@@ -168,6 +168,17 @@ object Strings {
     const val CONVERT_ACTION = "Convert"
     const val COMPRESSION_SECTION_TITLE = "Reduce file size"
 
+    // -- batch (mandate §40) ---------------------------------------------------------
+    const val BATCH_FILES_SECTION = "Files"
+    const val BATCH_SHARED_SECTION = "Shared settings"
+    const val BATCH_VALUE_VARIES = "Varies"
+    const val BATCH_NO_COMMON_OPTIONS = "No common value — adjust files individually"
+    const val BATCH_ADJUST = "Adjust"
+    const val BATCH_SUBMIT_ALL = "Convert all"
+    const val BATCH_FILE_READY = "Ready"
+    const val BATCH_FILE_INVALID = "Needs attention"
+    const val BATCH_READY_COUNT = "%d of %d ready"
+
     // -- compression (mandate §20) ---------------------------------------------------
     const val COMPRESSION_TITLE = "Reduce file size"
     const val COMPRESSION_OFF_HINT =
@@ -311,20 +322,20 @@ object Strings {
     fun formatBytes(bytes: Long): String = when {
         bytes < 0 -> SIZE_UNKNOWN
         bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
-        bytes < 1024L * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
-        else -> "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
+        bytes < 1024 * 1024 -> "%.1f KB".fmt(bytes / 1024.0)
+        bytes < 1024L * 1024 * 1024 -> "%.1f MB".fmt(bytes / (1024.0 * 1024))
+        else -> "%.2f GB".fmt(bytes / (1024.0 * 1024 * 1024))
     }
 
     /** Formats seconds as m:ss / h:mm:ss (unknown when negative). */
     fun formatDuration(seconds: Double): String = when {
         seconds < 0 -> DURATION_UNKNOWN
-        seconds < 60 -> "0:%02d".format(seconds.toInt())
-        seconds < 3600 -> "%d:%02d".format(
+        seconds < 60 -> "0:%02d".fmt(seconds.toInt())
+        seconds < 3600 -> "%d:%02d".fmt(
             (seconds / 60).toInt(),
             (seconds % 60).toInt(),
         )
-        else -> "%d:%02d:%02d".format(
+        else -> "%d:%02d:%02d".fmt(
             (seconds / 3600).toInt(),
             ((seconds % 3600) / 60).toInt(),
             (seconds % 60).toInt(),

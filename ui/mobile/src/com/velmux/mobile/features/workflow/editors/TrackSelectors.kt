@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.workflow.editors
 
+import com.velmux.mobile.fmt
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -165,7 +166,7 @@ fun CheckRow(
 
 /** "Track 2 · English · aac 2ch 48kHz". */
 private fun trackLabel(index: Int, language: String?, detail: String): Pair<String, String> {
-    val title = Strings.TRACK_FORMAT.format(index + 1) +
+    val title = Strings.TRACK_FORMAT.fmt(index + 1) +
         (language?.takeIf { it.isNotBlank() && it != "und" }
             ?.let { " · ${languageLabel(it)}" } ?: "")
     return title to detail

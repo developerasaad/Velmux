@@ -37,7 +37,7 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
         hint = Strings.WORKFLOW_VIDEO_CONVERT_HINT,
         icon = VelmuxIcons.VideoConvert,
         mimeTypes = listOf("video/*"),
-        multiple = false,
+        multiple = true,
     ),
     WorkflowDef(
         operation = "video-crop",
@@ -61,7 +61,7 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
         hint = Strings.WORKFLOW_EXTRACT_AUDIO_HINT,
         icon = VelmuxIcons.Audio,
         mimeTypes = listOf("video/*"),
-        multiple = false,
+        multiple = true,
     ),
     WorkflowDef(
         operation = "extract-frames",
@@ -69,7 +69,7 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
         hint = Strings.WORKFLOW_EXTRACT_FRAMES_HINT,
         icon = VelmuxIcons.Frames,
         mimeTypes = listOf("video/*"),
-        multiple = false,
+        multiple = true,
     ),
     WorkflowDef(
         operation = "extract-subtitles",
@@ -77,7 +77,7 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
         hint = Strings.WORKFLOW_EXTRACT_SUBTITLES_HINT,
         icon = VelmuxIcons.Subtitles,
         mimeTypes = listOf("video/*"),
-        multiple = false,
+        multiple = true,
     ),
 )
 
@@ -88,7 +88,7 @@ val AudioWorkflows: List<WorkflowDef> = listOf(
         hint = Strings.WORKFLOW_AUDIO_CONVERT_HINT,
         icon = VelmuxIcons.Audio,
         mimeTypes = listOf("audio/*"),
-        multiple = false,
+        multiple = true,
     ),
     WorkflowDef(
         operation = "audio-cutmerge",
@@ -134,10 +134,26 @@ class HomeViewModel(
         }
         _pendingWorkflow.value = workflow
         scope.launch {
-            val sessionId = client.beginWorkflow(workflow.operation, picks)
-            _pendingWorkflow.value = null
-            if (sessionId != null) {
-                navigator.open(Destination.Workflow(workflow.operation, sessionId))
+            if (picks.size > 1 && workflow.operation in BATCHABLE_OPERATIONS) {
+                // A multi-file pick on a single-source operation starts a
+                // batch (mandate §40): one independently resolved session
+                // per file sharing one user intent.
+                val started = client.beginBatch(workflow.operation, picks)
+                _pendingWorkflow.value = null
+                val entries = started.mapNotNull { result ->
+                    result.sessionId?.let { id ->
+                        Destination.BatchEntry(name = result.pick.displayName, sessionId = id)
+                    }
+                }
+                if (entries.isNotEmpty()) {
+                    navigator.open(Destination.WorkflowBatch(workflow.operation, entries))
+                }
+            } else {
+                val sessionId = client.beginWorkflow(workflow.operation, picks)
+                _pendingWorkflow.value = null
+                if (sessionId != null) {
+                    navigator.open(Destination.Workflow(workflow.operation, sessionId))
+                }
             }
         }
     }
@@ -157,6 +173,19 @@ class HomeViewModel(
     }
 
     private companion object {
+        /**
+         * Operations whose multi-file picks form a batch (mandate §40:
+         * batch conversion, compression and extraction). Merge workflows
+         * consume multiple sources in ONE session; Crop keeps a single
+         * photo-style surface.
+         */
+        val BATCHABLE_OPERATIONS = setOf(
+            "video-convert",
+            "audio-convert",
+            "extract-audio",
+            "extract-frames",
+            "extract-subtitles",
+        )
         const val ACTIVE_JOBS_MAX = 6
         const val RECENT_RESULTS_MAX = 5
     }

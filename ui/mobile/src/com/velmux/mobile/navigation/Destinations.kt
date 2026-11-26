@@ -21,6 +21,28 @@ sealed interface Destination {
         val sessionId: String? = null,
     ) : Destination
 
+    /**
+     * One batch entry: the file's display name and the session the engine
+     * prepared for it (mandate §40: every source is an independently
+     * resolved operation; the name rides the route because session
+     * snapshots do not echo source display names).
+     */
+    data class BatchEntry(
+        val name: String,
+        val sessionId: String,
+    )
+
+    /**
+     * The batch configuration surface for [operation] (mandate §40):
+     * shared user intent broadcast to every session, per-file states and
+     * estimates, individual overrides through the single-file workflow
+     * screen pushed on top of this route.
+     */
+    data class WorkflowBatch(
+        val operation: String,
+        val entries: List<BatchEntry>,
+    ) : Destination
+
     companion object {
         val topLevel: List<Destination> = listOf(Home, Jobs, Settings)
     }

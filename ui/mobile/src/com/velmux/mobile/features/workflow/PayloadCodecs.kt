@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.workflow
 
+import com.velmux.mobile.fmt
 import com.velmux.mobile.engine.Fields
 import com.velmux.mobile.engine.SessionSnapshot
 import kotlinx.serialization.json.JsonArray
@@ -447,9 +448,9 @@ fun formatUs(us: Long): String {
     val minutes = ((totalSeconds % 3600) / 60).toInt()
     val seconds = totalSeconds % 60
     return if (hours > 0) {
-        "%d:%02d:%06.3f".format(hours, minutes, seconds)
+        "%d:%02d:%06.3f".fmt(hours, minutes, seconds)
     } else {
-        "%d:%06.3f".format(minutes, seconds)
+        "%d:%06.3f".fmt(minutes, seconds)
     }
 }
 

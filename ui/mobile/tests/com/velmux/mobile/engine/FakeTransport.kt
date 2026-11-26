@@ -90,6 +90,12 @@ class FakeTransport : EngineTransport("fake-data-dir") {
     /** (sessionId, revision, submissionId) per submit call. */
     val submissions = mutableListOf<Triple<String, Long, String>>()
 
+    /** (sessionId, request) per update call. */
+    val receivedUpdates = mutableListOf<Pair<String, SessionUpdateRequest>>()
+
+    /** Session ids closed through closeSession (batch failure isolation). */
+    val closedSessions = mutableListOf<String>()
+
     // ---- ABI surface ---------------------------------------------------------------
 
     override suspend fun abiVersion(): Int = abiVersionResult
@@ -125,6 +131,7 @@ class FakeTransport : EngineTransport("fake-data-dir") {
         request: SessionUpdateRequest,
     ): SessionSnapshot {
         updateSessionCalls++
+        receivedUpdates.add(sessionId to request)
         val result = updateHandler(sessionId, request)
         sessions[sessionId] = result
         return result
@@ -145,6 +152,7 @@ class FakeTransport : EngineTransport("fake-data-dir") {
 
     override suspend fun closeSession(sessionId: String): Boolean {
         closeSessionCalls++
+        closedSessions.add(sessionId)
         sessions.remove(sessionId)
         return true
     }

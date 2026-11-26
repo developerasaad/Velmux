@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.workflow
 
+import com.velmux.mobile.fmt
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import com.velmux.mobile.engine.EngineClient
@@ -85,6 +86,6 @@ fun WorkflowScreen(
 private fun UnknownWorkflowScreen(operation: String) {
     com.velmux.mobile.components.EmptyState(
         title = com.velmux.mobile.Strings.WORKFLOW_UNKNOWN_TITLE,
-        message = com.velmux.mobile.Strings.WORKFLOW_UNKNOWN_BODY.format(operation),
+        message = com.velmux.mobile.Strings.WORKFLOW_UNKNOWN_BODY.fmt(operation),
     )
 }

@@ -421,6 +421,87 @@ class EngineClient(
     }
 
     /**
+     * One batch entry: the picked file and the session the engine
+     * prepared for it — null when THIS file failed (its reason rides the
+     * entry; a failed file never invalidates the others, mandate §40).
+     */
+    data class BatchStart(
+        val pick: PickedFile,
+        val sessionId: String?,
+        val failure: EngineError? = null,
+    )
+
+    /**
+     * Starts a batch (mandate §40): one independently prepared session
+     * PER picked file for a single-source operation. Every file goes
+     * through the same resolve/import/create/prepare path; a file that
+     * fails is reported per entry and never aborts the rest. The shared
+     * preparation surface shows aggregate progress.
+     *
+     * @return one entry per pick, in pick order.
+     */
+    suspend fun beginBatch(operation: String, picks: List<PickedFile>): List<BatchStart> {
+        if (picks.isEmpty()) return emptyList()
+        sessionMutex.withLock {
+            cancelRequested = false
+            _preparation.value = PreparationState.Resolving(operation, picks)
+
+            val resolved: List<ResolvedSource> = picks.map { SourcePorter.resolve(it) }
+            if (cancelRequested) {
+                _preparation.value = PreparationState.Canceled
+                cancelRequested = false
+                return picks.map { BatchStart(it, null) }
+            }
+
+            if (resolved.any { it.requiresImport }) {
+                _preparation.value = PreparationState.Importing(operation, picks)
+            }
+            val sources: List<ImportedSource> = resolved.map { source ->
+                if (source.requiresImport) SourcePorter.import(source) else {
+                    ImportedSource(source.uri, source.displayName)
+                }
+            }
+
+            val results = mutableListOf<BatchStart>()
+            for ((index, source) in sources.withIndex()) {
+                if (cancelRequested) break
+                var sessionId: String? = null
+                var failure: EngineError? = null
+                try {
+                    sessionId = transport.createSession(
+                        operation,
+                        listOf(MediaSourceRequest(source.uri, source.displayName)),
+                    )
+                    // Honest aggregate state: this file's session is being
+                    // inspected right now (the card shows the phase + cancel).
+                    _preparation.value = PreparationState.Inspecting(operation, sessionId)
+                    val snapshot = transport.prepareSession(sessionId)
+                    _sessions.value = _sessions.value + (sessionId to snapshot)
+                } catch (error: EngineException) {
+                    // A failed source must not invalidate unrelated items:
+                    // close the half-created session (when any) and continue.
+                    sessionId?.let { closeSessionQuietly(it) }
+                    sessionId = null
+                    failure = error.error
+                }
+                results.add(BatchStart(picks[index], sessionId, failure))
+            }
+
+            if (cancelRequested) {
+                results.forEach { it.sessionId?.let { id -> closeSessionQuietly(id) } }
+                _preparation.value = PreparationState.Canceled
+                cancelRequested = false
+                return picks.map { BatchStart(it, null) }
+            }
+
+            // The batch surface is its own route; the single-flow
+            // preparation states end here.
+            _preparation.value = PreparationState.Idle
+            return results
+        }
+    }
+
+    /**
      * Cancels the in-flight preparation (checked at phase boundaries) and
      * closes any session already created.
      */
@@ -693,7 +774,7 @@ class EngineClient(
         }
         var allRemoved = paths.isNotEmpty()
         for (path in paths) {
-            val removed = withContext(Dispatchers.IO) { deleteFile(path) }
+            val removed = withContext(Dispatchers.Default) { deleteFile(path) }
             if (!removed) allRemoved = false
         }
         if (!allRemoved) {

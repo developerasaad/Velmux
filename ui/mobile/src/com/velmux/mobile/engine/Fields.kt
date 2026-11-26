@@ -1,5 +1,8 @@
 package com.velmux.mobile.engine
 
+import com.velmux.mobile.fmt
+import kotlin.math.floor
+
 /**
  * Canonical session-field identifiers (fieldIdName in core/src/catalog/
  * types.cpp) and the user-facing labels for their value ids. The UI maps
@@ -148,10 +151,10 @@ object ValueLabels {
             return valueId
         }
         val value = num / den
-        return if (value == Math.floor(value) && !value.isInfinite()) {
+        return if (value == floor(value) && !value.isInfinite()) {
             "${value.toInt()}"
         } else {
-            "%.3f".format(value).trimEnd('0').trimEnd('.')
+            "%.3f".fmt(value).trimEnd('0').trimEnd('.')
         }
     }
 }

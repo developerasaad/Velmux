@@ -1,5 +1,6 @@
 package com.velmux.mobile.features.workflow.editors
 
+import com.velmux.mobile.fmt
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -145,7 +146,7 @@ fun CropRectEditor(
     }
     Spacer(Modifier.height(4.dp))
     Text(
-        text = Strings.CROP_RESULT_FORMAT.format(
+        text = Strings.CROP_RESULT_FORMAT.fmt(
             crop.width.coerceAtLeast(0),
             crop.height.coerceAtLeast(0),
         ),
