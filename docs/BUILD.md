@@ -63,7 +63,7 @@ Platform details:
   locally — which resolves FFmpeg, builds the CMake engine archives for
   the target platform, links the Kotlin Compose framework, and stages
   everything under `build/ios/stage/<platform>/<configuration>/`:
-  `engine/libvelmux_*.a`, `framework/Velmux.framework` and the merged
+  `engine/libvelmux_*.a`, `framework/VelmuxShared.framework` and the merged
   `ffmpeg/libffmpeg_deps.a` (the app links one symbol-indexed archive per
   slice; an xcframework would be validated at build-description time,
   before the phase could produce it). The phase environment is sanitized
