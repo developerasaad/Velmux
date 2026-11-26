@@ -17,14 +17,35 @@ object VelmuxJni {
 
   external fun nativeCreateEngine(dataDir: String): Long
   external fun nativeDestroyEngine(handle: Long)
+  external fun nativeAbiVersion(): Int
+  external fun nativeEngineVersion(): ByteArray
   external fun nativeInspect(handle: Long, uri: String, displayName: String): ByteArray
-  external fun nativePlan(handle: Long, requestJson: String): ByteArray
-  external fun nativeGenerateSample(
+  external fun nativeCreateSession(handle: Long, operationJson: String): ByteArray
+  external fun nativePrepareSession(handle: Long, sessionId: String): ByteArray
+  external fun nativeGetSessionSnapshot(handle: Long, sessionId: String): ByteArray
+  external fun nativeGetSessionOptions(
     handle: Long,
-    requestJson: String,
-    sampleSeconds: Int
+    sessionId: String,
+    fieldJson: String
   ): ByteArray
-  external fun nativeStartJob(handle: Long, requestJson: String): ByteArray
+  external fun nativeUpdateSession(
+    handle: Long,
+    sessionId: String,
+    updateJson: String
+  ): ByteArray
+  external fun nativeGenerateSessionSample(
+    handle: Long,
+    sessionId: String,
+    sampleJson: String
+  ): ByteArray
+  external fun nativeSubmitSession(
+    handle: Long,
+    sessionId: String,
+    submitJson: String
+  ): ByteArray
+  external fun nativeCloseSession(handle: Long, sessionId: String): Boolean
+  external fun nativeSubmitJob(handle: Long, requestJson: String): ByteArray
+  external fun nativeReuseJobSettings(handle: Long, jobId: String): ByteArray
   external fun nativeGetJob(handle: Long, jobId: String): ByteArray
   external fun nativeIsJobActive(handle: Long, jobId: String): Boolean
   external fun nativeListJobs(handle: Long): ByteArray

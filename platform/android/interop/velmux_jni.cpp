@@ -27,6 +27,8 @@
 #include "android_backend.h"
 #include "processing/contracts/contracts.h"
 #include <velmux/engine.h>
+#include "api/serialization.h"
+#include "serialization/json.h"
 #include "processing/hybrid_executor.h"
 
 #if __has_include("processing/ffmpeg/ffmpeg_backend.h")
@@ -34,6 +36,7 @@
 #define VELMUX_JNI_WITH_FFMPEG_BACKEND 1
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -136,25 +139,101 @@ jbyteArray nativeInspect(JNIEnv *env, jclass, jlong handle, jstring uri,
                                     nameText.c_str()));
 }
 
-jbyteArray nativePlan(JNIEnv *env, jclass, jlong handle, jstring requestJson) {
-  const std::string request = utf16ToUtf8(env, requestJson);
-  return toJsonBytes(env,
-                     velmux_plan(asEngine(handle), request.c_str()));
+jint nativeAbiVersion(JNIEnv *, jclass) {
+  return velmux_abi_version();
 }
 
-jbyteArray nativeGenerateSample(JNIEnv *env, jclass, jlong handle,
-                                  jstring requestJson, jint sampleSeconds) {
-  const std::string request = utf16ToUtf8(env, requestJson);
-  return toJsonBytes(env, velmux_generate_sample(asEngine(handle),
-                                                 request.c_str(),
-                                                 int(sampleSeconds)));
+jbyteArray nativeEngineVersion(JNIEnv *env, jclass) {
+  const jsize length = static_cast<jsize>(
+      std::strlen(velmux_engine_version()));
+  jbyteArray array = env->NewByteArray(length);
+  if (array != nullptr && length > 0) {
+    env->SetByteArrayRegion(
+        array, 0, length,
+        reinterpret_cast<const jbyte *>(velmux_engine_version()));
+  }
+  return array;
 }
 
-jbyteArray nativeStartJob(JNIEnv *env, jclass, jlong handle,
-                          jstring requestJson) {
+jbyteArray nativeCreateSession(JNIEnv *env, jclass, jlong handle,
+                               jstring operationJson) {
+  const std::string payload = utf16ToUtf8(env, operationJson);
+  return toJsonBytes(
+      env, velmux_create_session(asEngine(handle), payload.c_str()));
+}
+
+jbyteArray nativePrepareSession(JNIEnv *env, jclass, jlong handle,
+                                jstring sessionId) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  return toJsonBytes(env, velmux_prepare_session(asEngine(handle),
+                                                 id.c_str()));
+}
+
+jbyteArray nativeGetSessionSnapshot(JNIEnv *env, jclass, jlong handle,
+                                    jstring sessionId) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  return toJsonBytes(env, velmux_get_session_snapshot(asEngine(handle),
+                                                      id.c_str()));
+}
+
+jbyteArray nativeGetSessionOptions(JNIEnv *env, jclass, jlong handle,
+                                   jstring sessionId, jstring fieldJson) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  const std::string field = utf16ToUtf8(env, fieldJson);
+  return toJsonBytes(env, velmux_get_session_options(asEngine(handle),
+                                                     id.c_str(),
+                                                     field.c_str()));
+}
+
+jbyteArray nativeUpdateSession(JNIEnv *env, jclass, jlong handle,
+                               jstring sessionId, jstring updateJson) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  const std::string update = utf16ToUtf8(env, updateJson);
+  return toJsonBytes(env, velmux_update_session(asEngine(handle),
+                                                id.c_str(),
+                                                update.c_str()));
+}
+
+jbyteArray nativeGenerateSessionSample(JNIEnv *env, jclass, jlong handle,
+                                       jstring sessionId,
+                                       jstring sampleJson) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  const std::string sample = utf16ToUtf8(env, sampleJson);
+  return toJsonBytes(env, velmux_generate_session_sample(asEngine(handle),
+                                                         id.c_str(),
+                                                         sample.c_str()));
+}
+
+jbyteArray nativeSubmitSession(JNIEnv *env, jclass, jlong handle,
+                               jstring sessionId, jstring submitJson) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  const std::string submit = utf16ToUtf8(env, submitJson);
+  return toJsonBytes(env, velmux_submit_session(asEngine(handle),
+                                                id.c_str(),
+                                                submit.c_str()));
+}
+
+jboolean nativeCloseSession(JNIEnv *env, jclass, jlong handle,
+                            jstring sessionId) {
+  const std::string id = utf16ToUtf8(env, sessionId);
+  // 0 = closed, -1 = error (abi.h convention; unlike the job controls,
+  // close has no "recorded but not completed" middle state).
+  return velmux_close_session(asEngine(handle), id.c_str()) == 0 ? JNI_TRUE
+                                                                : JNI_FALSE;
+}
+
+jbyteArray nativeSubmitJob(JNIEnv *env, jclass, jlong handle,
+                           jstring requestJson) {
   const std::string request = utf16ToUtf8(env, requestJson);
   return toJsonBytes(env,
-                     velmux_start_job(asEngine(handle), request.c_str()));
+                     velmux_submit_job(asEngine(handle), request.c_str()));
+}
+
+jbyteArray nativeReuseJobSettings(JNIEnv *env, jclass, jlong handle,
+                                  jstring jobId) {
+  const std::string id = utf16ToUtf8(env, jobId);
+  return toJsonBytes(env,
+                     velmux_reuse_job_settings(asEngine(handle), id.c_str()));
 }
 
 jbyteArray nativeGetJob(JNIEnv *env, jclass, jlong handle, jstring jobId) {
@@ -255,7 +334,7 @@ jbyteArray jbyteArrayFromString(JNIEnv *env, const std::string &text) {
 }
 
 std::string testQuoted(const std::string &s) {
-  return "\"" + velmux::bridge::jsonEscape(s) + "\"";
+  return "\"" + velmux::core::json::escape(s) + "\"";
 }
 
 std::string testErrorJson(const std::string &message) {
@@ -358,7 +437,7 @@ public:
       : real_(real) {}
 
   bool canExecute(const velmux::core::Pipeline &,
-                  const velmux::core::ConversionRequest &) const override {
+                  const velmux::core::JobRequest &) const override {
     return false;
   }
 
@@ -446,10 +525,17 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
         env, testErrorJson("requestJson and outputPath must be non-empty"));
   }
   std::string parseError;
-  const auto request =
-      velmux::bridge::requestFromJson(requestText, parseError);
-  if (!request.has_value()) {
+  const auto decoded =
+      velmux::core::requestFromJson(requestText, parseError);
+  if (!decoded.has_value()) {
     return jbyteArrayFromString(env, testErrorJson(parseError));
+  }
+  const velmux::core::JobRequest &request = decoded->request;
+  const auto *convert = std::get_if<velmux::core::job::VideoConvert>(
+      &request.payload);
+  if (convert == nullptr) {
+    return jbyteArrayFromString(
+        env, testErrorJson("the hybrid test needs a video-convert request"));
   }
 
   velmux::android::AndroidBackend backend;
@@ -465,7 +551,7 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
   // Source facts through the REAL inspector (never fabricated).
   velmux::core::MediaInfo info;
   const velmux::core::Error inspectError =
-      backend.inspector()->inspect(request->source, info);
+      backend.inspector()->inspect(convert->source, info);
   if (!inspectError.ok()) {
     return jbyteArrayFromString(env, testErrorJson(inspectError.message));
   }
@@ -474,7 +560,15 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
         env, testErrorJson("the source has no video track"));
   }
 
-  const bool wantsAudio = request->audio.enabled && info.hasAudio();
+  // Audio stays when the request keeps it: empty rules preserve every
+  // track (the core's preserve-all default), any include=true rule keeps
+  // at least one.
+  const bool requestKeepsAudio = convert->audioTracks.empty() ||
+      std::any_of(convert->audioTracks.begin(), convert->audioTracks.end(),
+                  [](const velmux::core::AudioTrackRule &rule) {
+                    return rule.include;
+                  });
+  const bool wantsAudio = requestKeepsAudio && info.hasAudio();
   velmux::core::Pipeline pipeline;
   const velmux::core::BackendId android = velmux::core::BackendId::Android;
   pipeline.stages.push_back({velmux::core::StageId::Demux, android});
@@ -489,11 +583,12 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
   pipeline.stages.push_back({velmux::core::StageId::Mux, android});
   pipeline.stages.push_back({velmux::core::StageId::Bitstream, android});
   pipeline.videoCodec =
-      request->video.codec.value_or(info.video.front().codec);
+      convert->video.codec.value_or(info.video.front().codec);
   pipeline.audioCodec =
-      wantsAudio ? request->audio.codec.value_or(info.audio.front().codec)
-                 : velmux::core::AudioCodec::Aac;
-  pipeline.container = request->outputContainer.value_or(info.container);
+      wantsAudio
+          ? convert->audioSettings.codec.value_or(info.audio.front().codec)
+          : velmux::core::AudioCodec::Aac;
+  pipeline.container = convert->output.container.value_or(info.container);
   pipeline.sourceFrameRate = info.video.front().frameRate;
   pipeline.videoStreamCopy = false;
   pipeline.audioStreamCopy = wantsAudio;
@@ -503,7 +598,7 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
                      velmux::core::containerName(pipeline.container);
 
   velmux::core::HybridExecutor hybrid({&backend});
-  if (!hybrid.canExecute(pipeline, *request)) {
+  if (!hybrid.canExecute(pipeline, request)) {
     return jbyteArrayFromString(
         env,
         testErrorJson("the hybrid executor cannot serve this pipeline shape "
@@ -513,7 +608,7 @@ jbyteArray nativeTestRunAndroidStagePipeline(JNIEnv *env, jclass,
   }
   velmux::backend::ExecuteParams params;
   params.pipeline = pipeline;
-  params.request = *request;
+  params.request = request;
   params.outputPath = outPath;
   params.jobId = "android-stage-pipeline-test";
   params.cancel = std::make_shared<velmux::backend::CancelToken>();
@@ -558,11 +653,12 @@ jbyteArray nativeTestStartJobMaskedEngine(JNIEnv *env, jclass,
   return jbyteArrayFromString(env, testErrorJson("ffmpeg-absent"));
 #else
   std::string parseError;
-  const auto request =
-      velmux::bridge::requestFromJson(requestText, parseError);
-  if (!request.has_value()) {
+  const auto decoded =
+      velmux::core::requestFromJson(requestText, parseError);
+  if (!decoded.has_value()) {
     return jbyteArrayFromString(env, testErrorJson(parseError));
   }
+  const velmux::core::JobRequest request = decoded->request;
 
   // Engine stack exactly like the app facade (bridge velmux_engine_create):
   // FFmpeg first, Android second, VelmuxEngine::create wires the registries,
@@ -585,7 +681,7 @@ jbyteArray nativeTestStartJobMaskedEngine(JNIEnv *env, jclass,
                            "directory writable?)"));
   }
 
-  const auto jobId = engine->startJob(*request);
+  const auto jobId = engine->submitJob(request);
   if (!jobId.ok()) {
     return jbyteArrayFromString(env, testErrorJson(jobId.error().message));
   }
@@ -645,12 +741,29 @@ const JNINativeMethod kVelmuxJniMethods[] = {
      reinterpret_cast<void *>(nativeDestroyEngine)},
     {"nativeInspect", "(JLjava/lang/String;Ljava/lang/String;)[B",
      reinterpret_cast<void *>(nativeInspect)},
-    {"nativePlan", "(JLjava/lang/String;)[B",
-     reinterpret_cast<void *>(nativePlan)},
-    {"nativeGenerateSample", "(JLjava/lang/String;I)[B",
-     reinterpret_cast<void *>(nativeGenerateSample)},
-    {"nativeStartJob", "(JLjava/lang/String;)[B",
-     reinterpret_cast<void *>(nativeStartJob)},
+    {"nativeAbiVersion", "()I", reinterpret_cast<void *>(nativeAbiVersion)},
+    {"nativeEngineVersion", "()[B",
+     reinterpret_cast<void *>(nativeEngineVersion)},
+    {"nativeCreateSession", "(JLjava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeCreateSession)},
+    {"nativePrepareSession", "(JLjava/lang/String;)[B",
+     reinterpret_cast<void *>(nativePrepareSession)},
+    {"nativeGetSessionSnapshot", "(JLjava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeGetSessionSnapshot)},
+    {"nativeGetSessionOptions", "(JLjava/lang/String;Ljava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeGetSessionOptions)},
+    {"nativeUpdateSession", "(JLjava/lang/String;Ljava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeUpdateSession)},
+    {"nativeGenerateSessionSample", "(JLjava/lang/String;Ljava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeGenerateSessionSample)},
+    {"nativeSubmitSession", "(JLjava/lang/String;Ljava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeSubmitSession)},
+    {"nativeCloseSession", "(JLjava/lang/String;)Z",
+     reinterpret_cast<void *>(nativeCloseSession)},
+    {"nativeSubmitJob", "(JLjava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeSubmitJob)},
+    {"nativeReuseJobSettings", "(JLjava/lang/String;)[B",
+     reinterpret_cast<void *>(nativeReuseJobSettings)},
     {"nativeGetJob", "(JLjava/lang/String;)[B",
      reinterpret_cast<void *>(nativeGetJob)},
     {"nativeIsJobActive", "(JLjava/lang/String;)Z",

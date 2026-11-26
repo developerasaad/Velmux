@@ -13,16 +13,8 @@
 //
 // Legacy Android sources are compiled from their physical homes:
 //   platform/android/interop  (VelmuxJni Kotlin surface + velmux_jni.cpp
-//                              through externalNativeBuild/CMake)
+//                              through externalNativeBuild/CMake; ABI v2)
 //   platform/android/services (ConversionService, EngineHolder, FileImport)
-//
-// NOTE (reported by UI-1, C++ side is out of scope to fix here): the
-// committed JNI adapter (platform/android/interop/velmux_jni.cpp) still
-// references the pre-v2 ABI symbols velmux_plan / velmux_generate_sample /
-// velmux_start_job, which no longer exist in core/include/velmux/abi.h,
-// and its Kotlin surface carries no ABI v2 session functions. The native
-// product build requires regenerating that adapter for ABI v2 (follow-up
-// task); this build file keeps the wiring ready for it.
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
