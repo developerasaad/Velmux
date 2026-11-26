@@ -656,7 +656,13 @@ ZPC
     zimg_tb="$(fetch_tarball zimg)"
     zimg_src="$(extract_tarball "$zimg_tb" "$SLICE_TAG")"
     # The archive ships no configure: regenerate once per slice source tree.
-    (cd "$zimg_src" && ./autogen.sh >/dev/null)
+    # autogen output is captured — a swallowed failure here would only
+    # surface as a confusing configure error later.
+    local zimg_autogen_log="$build_tmp/zimg-autogen-$SLICE_TAG.log"
+    if ! (cd "$zimg_src" && ./autogen.sh >"$zimg_autogen_log" 2>&1); then
+      cat "$zimg_autogen_log" >&2
+      die "[$slice] zimg autogen failed (log above)"
+    fi
     (cd "$zimg_src" && \
      CC="$CC" CXX="$CXX" \
      CFLAGS="-arch $SLICE_ARCH $SLICE_MIN_FLAG -O3 -fPIC -I$SLICE_PREFIX/include" \

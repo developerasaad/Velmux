@@ -215,6 +215,12 @@ ensure_build_libtool() {
      "${clean_env[@]}" \
        make -j"${VELMUX_FFMPEG_JOBS:-$(nproc 2>/dev/null || echo 4)}" >/dev/null && \
      "${clean_env[@]}" make install >/dev/null)
+    # GNU autoreconf on Darwin probes glibtoolize (Homebrew's name, chosen
+    # because Apple ships an unrelated /usr/bin/libtool); the from-source
+    # install only provides libtoolize. Provide both names.
+    if [ -x "$prefix/bin/libtoolize" ] && [ ! -e "$prefix/bin/glibtoolize" ]; then
+      ln -s libtoolize "$prefix/bin/glibtoolize"
+    fi
     log "libtool installed to $prefix"
   fi
   export PATH="$prefix/bin:$PATH"

@@ -18,7 +18,7 @@
 
 namespace velmux::core {
 
-class JobRequest;
+struct JobRequest;
 
 namespace job {
 using VideoConvert = VideoConvertRequest;
