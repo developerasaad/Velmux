@@ -107,7 +107,15 @@ vlog "linking the Kotlin framework ($KOTLIN_TARGET, $CONFIGURATION)"
 run_in "$VELMUX_ROOT" ./gradlew --no-daemon \
   ":ui:mobile:link${CONFIGURATION}Framework${KOTLIN_TARGET}"
 
-FRAMEWORK_SRC="$VELMUX_ROOT/ui/mobile/build/bin/$(echo "$KOTLIN_TARGET" | sed 's/^./\L&/')/$(echo "$CONFIGURATION" | tr '[:upper:]' '[:lower:]')Framework/Velmux.framework"
+# The framework lands in build/bin/<target>/<config>Framework where
+# <target> is the Gradle target name with a lowercase first letter
+# (iosSimulatorArm64) and <config> is fully lowercase (release). Neither
+# part may use GNU-sed extensions: macOS ships BSD sed where \L is not
+# supported (it emitted a literal 'L' and broke the path) and the runners
+# still use bash 3.2 (no ${var,} expansion).
+kotlin_target_dir="$(printf '%s' "${KOTLIN_TARGET:0:1}" | tr '[:upper:]' '[:lower:]')${KOTLIN_TARGET:1}"
+kotlin_config_dir="$(printf '%s' "$CONFIGURATION" | tr '[:upper:]' '[:lower:]')"
+FRAMEWORK_SRC="$VELMUX_ROOT/ui/mobile/build/bin/$kotlin_target_dir/${kotlin_config_dir}Framework/Velmux.framework"
 [ -d "$FRAMEWORK_SRC" ] || vdie "Kotlin framework not found at $FRAMEWORK_SRC after the link task"
 
 # ---------------------------------------------------------------------------
