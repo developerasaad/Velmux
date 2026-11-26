@@ -1,4 +1,10 @@
-# Velmux — Decisions
+# Velmux — Decision Log
+
+Historical engineering decision record (D-001 …). Entries up to the
+repository restructure describe the pre-Kotlin React Native
+architecture; their reasoning about pins, platforms and media behavior
+remains the context for the decisions that still apply. Current
+architecture: docs/ARCHITECTURE.md.
 
 Append-only decision log. Escalate conflicts; never silently change settled
 decisions without evidence.

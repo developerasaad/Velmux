@@ -153,3 +153,58 @@ jobs:
             build/host/CMakeFiles/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  sanitize:
+    name: Host suite under ASan + UBSan
+    # Same tree, separate job: the sanitizer build recompiles every suite
+    # with -fsanitize=address,undefined and runs ctest instrumented. It
+    # shares the identity-keyed FFmpeg cache with the regular host job
+    # (the artifacts are the same; only the instrumented rebuild differs).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsqlite3-dev meson pkg-config libtool
+
+      - name: Verify CMake toolchain
+        run: |
+          if ! command -v cmake >/dev/null 2>&1; then
+            python3 -m pip install cmake ninja
+          fi
+          cmake --version
+
+      - name: Compute FFmpeg artifact identity
+        id: ffid
+        run: echo "identity=$(bash scripts/ffmpeg/identity.sh host)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore host FFmpeg cache
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            scripts/ffmpeg-builder/out/host
+            scripts/ffmpeg-builder/downloads
+          key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
+
+      # The repository script owns everything: same FFmpeg resolution, then
+      # the sanitized configure/build/ctest cycle.
+      - name: Sanitized host suite (ASan + UBSan, ctest)
+        env:
+          VELMUX_FFMPEG_JOBS: 4
+        run: ./scripts/test.sh --sanitize
+
+      - name: Upload sanitized build and test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-sanitize-logs
+          path: |
+            build/host-sanitize/**/Testing/
+            build/host-sanitize/CMakeFiles/*.log
+          if-no-files-found: ignore
+          retention-days: 7

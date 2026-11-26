@@ -54,5 +54,7 @@ compress").
 
 ## Implementation notes
 
-`apps/mobile/src/theme` owns tokens (colors, radii, spacing, type). Components in
-`apps/mobile/src/components` implement the system once; screens compose them.
+The shared Compose design system owns tokens (colors, radii, spacing,
+type) under `ui/mobile/src/com/velmux/mobile/design`; shared components
+under `ui/mobile/src/com/velmux/mobile/components` implement the system
+once; screens compose them.

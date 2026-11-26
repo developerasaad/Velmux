@@ -54,7 +54,7 @@ missing timeline regions; no broken A/V sync; correct final duration; valid outp
 
 Tests force interruption during demux, decode, video/audio processing, encode, mux,
 checkpoint write, DB commit, file promotion, final assembly; then restart and verify
-reconciliation invariants (see `docs/PROJECT_STATUS.md` for current coverage).
+reconciliation invariants (see `docs/TESTING.md` for the verified coverage).
 
 ## Real-world handling
 

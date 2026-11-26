@@ -3,7 +3,8 @@
 # local developers run exactly this script.
 #
 #   ./scripts/test.sh                    host suite (default, Linux/macOS)
-#   ./scripts/test.sh --ts               TypeScript suite
+#   ./scripts/test.sh --sanitize         host suite under ASan + UBSan
+#   ./scripts/test.sh --ui               shared Kotlin/Compose suite
 #   ./scripts/test.sh --android-emulator --api 29
 #   ./scripts/test.sh --ios-sim
 #   ./scripts/test.sh --android-device
@@ -34,9 +35,16 @@ done < <(parse_test_args "$@")
 SUITE="${ARGS[0]}"
 API="${ARGS[1]#api:}"
 ABI="${ARGS[2]#abi:}"
+SANITIZE="${ARGS[3]#sanitize:}"
 
 case "$SUITE" in
-  host) bash "$SCRIPTS_DIR/lib/host-suite.sh" ;;
+  host)
+    if [ -n "$SANITIZE" ]; then
+      bash "$SCRIPTS_DIR/lib/host-suite.sh" --sanitize
+    else
+      bash "$SCRIPTS_DIR/lib/host-suite.sh"
+    fi
+    ;;
   ui) bash "$SCRIPTS_DIR/lib/ui-suite.sh" ;;
   android-emulator)
     bash "$SCRIPTS_DIR/android/emulator-test.sh" --api "$API" --abi "$ABI"

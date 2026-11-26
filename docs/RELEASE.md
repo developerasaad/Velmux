@@ -9,8 +9,8 @@ add for store distribution.
   GitHub pre-releases.
 - Android: `versionName` = tag without the leading `v`; `versionCode` starts
   at 1 for v0.1.0 and must be bumped for every store upload. Both are
-  injectable: `-PvelmuxVersionName=… -PvelmuxVersionCode=…` (defaults live
-  in `apps/mobile/android/app/build.gradle`).
+  injectable: `VELMUX_VERSION_NAME` / `VELMUX_VERSION_CODE` (defaults live in
+  `scripts/lib/config.sh`; the build scripts pass them to Gradle).
 - iOS: `MARKETING_VERSION` = the numeric part of the tag; `CURRENT_PROJECT_VERSION`
   = the release workflow run number. Overridden at the `xcodebuild` command
   line, never hand-edited.
@@ -22,15 +22,16 @@ add for store distribution.
 1. `host-tests` — the full host suite runs inside the workflow (pinned
    FFmpeg build + every engine/backend/bridge test through ctest). A release
    is never published from a failing build.
-2. `android-release` — requires the pinned FFmpeg Android artifacts from the
-   latest successful `ffmpeg-mobile` run (missing artifacts are a hard
-   failure, unlike per-push CI which warns and degrades). Produces:
+2. `android-release` — resolves the pinned FFmpeg Android artifacts through
+   the repository scripts (identity-checked reuse or rebuild; there is no
+   degraded path). Produces:
    - release APK and AAB (R8 minified + resource shrinking),
    - `r8-mapping.txt`,
    - native symbol archives (unstripped + stripped .so trees).
-3. `ios-release` — same FFmpeg requirement via the packaged xcframework.
-   Produces the Release-configuration simulator `.app` and an **unsigned**
-   device `.app` (archive-capable).
+3. `ios-release` — resolves the FFmpeg iOS slices and builds through the
+   Xcode project's prepare phase (engine archives, Kotlin Compose
+   framework, merged FFmpeg closure). Produces the Release-configuration
+   simulator `.app` and an **unsigned** device `.app` (archive-capable).
 4. `github-release` — generates `SHA256SUMS.txt` and `manifest.json`
    (version, commit, signing status, FFmpeg identity, artifact hashes),
    then creates the GitHub Release with all artifacts and notes from

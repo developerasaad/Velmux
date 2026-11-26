@@ -1,67 +1,63 @@
 # Velmux — Product
 
-Velmux is a premium cross-platform video/audio/subtitle conversion and compression
-application for ordinary users, with full technical control retained for power users.
+Velmux is a fully offline, cross-platform video and audio converter,
+compressor and focused media-processing application for ordinary users.
 
 ## Mission
 
-Ordinary users convert and compress media without understanding codecs, containers,
-bitrate control, GOP structures, profiles, pixel formats, subtitle codecs, or platform
-media APIs. Power users keep access to the real technical controls.
+Ordinary users convert, compress, cut, merge, crop and extract media
+without understanding codecs, containers, bitrate control, profiles,
+pixel formats, subtitle representations, or platform media APIs. The
+application stays simple on the surface while implementing
+comprehensive, correct media processing internally.
 
-The user specifies the desired result. The engine decides how to execute it.
+The user specifies the desired result. The core determines which
+configurations are supported and how the accepted operation executes.
+There are no manual processing/implementation/backend selectors, no raw
+FFmpeg arguments, no technical encoder tuning exposed anywhere — the
+approved compression presets (High Quality / Balanced / Smaller File /
+Target File Size / Custom) are the full control surface.
+
+## Scope (fixed)
+
+Two media domains on the Home screen, eight primary workflows:
+
+**Video** — Video Converter, Crop Video, Cut & Merge (Trim / Cut /
+Split / Merge), Extract Audio, Extract Frames, Extract Subtitles.
+
+**Audio** — Audio Converter, Cut & Merge.
+
+Main navigation: Home, Jobs (one unified screen for active and previous
+work — no separate Queue/History), Settings.
+
+Explicitly outside V1: a general-purpose editor, creative effects,
+subtitle authoring or timing tools, OCR, standalone image
+conversion/editing, animated GIF/WebP output, cloud processing, user
+accounts, AI features. These are not "coming soon" — they are not in the
+product.
 
 ## Real-world goals
 
 - Make a video much smaller while preserving acceptable visual quality.
-- Fit a video under an exact upload/file-size limit.
+- Fit a video under an exact file-size limit (target size).
 - Convert media into a compatible format.
-- Remux without re-encoding when possible.
-- Extract or convert audio.
-- Preserve or manipulate multiple audio tracks.
-- Preserve, extract, convert, add, remove, or burn subtitles.
-- Batch-process multiple media files.
-- Continue long jobs in the background where the OS permits.
-- Recover interrupted work as aggressively as technically possible.
+- Remux without re-encoding when the streams already fit.
+- Extract audio tracks without touching the video stream.
+- Pull specific frames out of a video — real frame identity, not
+  keyframe approximations.
+- Cut, split and join media with exact boundaries and correct timing.
+- Crop video like cropping a photo.
+- Extract subtitle tracks in valid standalone representations.
 
-## Non-goals (V1)
+## Behavior principles
 
-- PGS/VobSub → text subtitle OCR (not ordinary subtitle conversion).
-- Automatic speech caption generation.
-- Video editing (cutting together multiple sources, effects authoring).
-- Fake/unlimited background execution against OS policy.
-
-## Product surfaces
-
-- **Home** — media selection, primary actions (Compress, Convert, Audio tools),
-  active jobs, recent results. Never overloaded.
-- **Conversion workspace** — preview, source info, goal, output format,
-  compression/quality controls, resolution, audio, subtitles, estimation,
-  Advanced (hidden by default), Start.
-- **Queue** — queued, preparing, running, checkpointing, paused, recovering,
-  interrupted, failed, completed.
-- **History** — original vs output size, output metadata, open/play/share/reuse/delete.
-- **Settings** — appearance, defaults, processing preference, recovery, storage,
-  notifications, diagnostics.
-
-## Compression UX
-
-Goal-oriented: Recommended / Smaller File / Fit Under Size / High Quality / Custom.
-No misleading generic "compression percentage". Fit Under Size computes a realistic
-bitrate budget (duration, audio allocation, container overhead), determines feasibility,
-may adjust resolution, validates the final output, and tells the user clearly when the
-requested size is unrealistic.
-
-## Presets vs direct controls
-
-Presets express user intention. Direct controls express precise technical choices.
-Exact resolution, exact bitrate, sample rate, channel layout, subtitle timing offset,
-and exact codec selection use direct controls. Whenever a preset hides real parameters,
-an Advanced section exposes the underlying controls. Advanced is hidden by default;
-closing it never discards custom changes. A modified preset becomes
-"Custom — based on <preset>".
-
-## Platform promise
-
-Background processing: continue where the OS permits and recover safely when execution
-is interrupted. A crash must not mean restarting a multi-hour job from zero.
+- Everything works offline; no media leaves the device.
+- Originals are never modified; outputs are new files.
+- Supported options come from the core — the UI never offers a
+  combination the engine cannot execute, and direct injected requests
+  are rejected the same way.
+- Compression is off by default (preserve media; re-encode only when a
+  requested change requires it).
+- Completion means validated output, not a successful library call.
+- A target-size result that misses the target is reported as "target
+  not met", never as success.

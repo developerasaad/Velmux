@@ -9,6 +9,8 @@
 | Full codec enumeration per warm conversion | 0 |
 | Test encoding during planning | 0 |
 | Unnecessary full-file scans | 0 |
+| Cached selector interaction | < 100 ms |
+| Warm configuration updates | < 20 ms |
 
 These are measurement targets, not fake guarantees. `core/tests/planner_tests.cpp`
 includes a warm-path planning benchmark assertion (generous CI-safe bound) and the
@@ -16,10 +18,12 @@ telemetry store accumulates real planning timings.
 
 ## Non-negotiables
 
-- Never block the React Native JS thread with media processing.
+- Never block a UI thread with media processing (the Kotlin engine client
+  dispatches all transport calls off the main thread).
 - No expensive codec discovery, FFmpeg init, hardware probing, or test encoding
   synchronously when the user presses Convert.
-- UI responsiveness is independent of encoding throughput.
+- UI responsiveness is independent of encoding throughput; the poll loop parks
+  when idle and listeners detach cleanly.
 
 ## Priority order (when trade-offs collide)
 

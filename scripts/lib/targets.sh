@@ -128,7 +128,7 @@ EOF
 # test.sh argument parsing
 # ---------------------------------------------------------------------------
 parse_test_args() {
-  local suite="${VELMUX_TEST_SUITE:-host}" api="" abi="$VELMUX_ANDROID_EMULATOR_ABI"
+  local suite="${VELMUX_TEST_SUITE:-host}" api="" abi="$VELMUX_ANDROID_EMULATOR_ABI" sanitize=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --host) suite="host" ;;
@@ -137,6 +137,7 @@ parse_test_args() {
       --ios-sim) suite="ios-sim" ;;
       --android-device) suite="android-device" ;;
       --ios-device) suite="ios-device" ;;
+      --sanitize) sanitize="1" ;;
       --api) shift; [ $# -gt 0 ] || vdie "--api requires a value"; api="$1" ;;
       --api=*) api="${1#--api=}" ;;
       --abi) shift; [ $# -gt 0 ] || vdie "--abi requires a value"; abi="$1" ;;
@@ -146,6 +147,9 @@ parse_test_args() {
     esac
     shift
   done
+  if [ -n "$sanitize" ] && [ "$suite" != "host" ]; then
+    vdie "--sanitize applies to the host suite only"
+  fi
   case "$suite" in
     android-emulator)
       [ -n "$api" ] || vdie "--android-emulator requires --api (tested set: $VELMUX_ANDROID_EMULATOR_APIS)"
@@ -157,6 +161,7 @@ parse_test_args() {
   echo "$suite"
   echo "api:${api:-}"
   echo "abi:$abi"
+  echo "sanitize:${sanitize:-}"
 }
 
 test_sh_usage() {
@@ -179,6 +184,8 @@ Suites:
 Options:
   --api <level>      Emulator API level (29 or 34)
   --abi <abi>        Emulator ABI (default: x86_64)
+  --sanitize         Host suite only: rebuild the suites with
+                     AddressSanitizer + UBSan and run them instrumented
 
 The host suite is the local development default; mobile product builds run
 through ./scripts/build.sh (CI executes the same scripts).

@@ -1,69 +1,97 @@
 # Velmux
 
-Velmux is a premium cross-platform video/audio/subtitle conversion and compression
-application backed by a reusable media-processing framework.
+Velmux is a fully offline, cross-platform video and audio converter,
+compressor and focused media-processing application.
 
-> Velmux is a fast, premium, cross-platform media converter/compressor whose shared
-> C++ brain constructs the best valid pipeline from native OS capabilities and a
-> comprehensive feature-selected FFmpeg backend, while keeping ordinary workflows
-> simple, preserving full advanced control for power users, and protecting
-> long-running work as aggressively as technically possible.
+The user specifies the desired result. An authoritative C++ core determines
+which configurations are supported for each source, validates every request,
+and executes the accepted operation — assembling FFmpeg-based and native
+OS codec stages under one deterministic planner. A shared Compose
+Multiplatform UI renders the core's authoritative state and forwards user
+intentions; native Android and iOS hosts provide the operating-system
+services (file access, foreground execution, notifications, hardware
+codecs).
 
 ## Architecture (three layers)
 
 | Layer | Location | Responsibility |
 |---|---|---|
-| React Native UI | `apps/mobile` | Presentation, interaction, navigation, job state display |
-| Shared C++ core | `core` | Feature registry, capability registry, pipeline planning, job/scheduler/recovery, validation |
-| Execution backends | `backends/{ffmpeg,android,apple}` | Demux/decode/process/encode/mux execution behind stable C++ interfaces |
+| Shared UI (Kotlin/Compose Multiplatform) | `ui/mobile` | Navigation, presentation, gestures, display of authoritative core state |
+| C++ core | `core` | Media models, capability catalog, configuration sessions, planning, processing, jobs, persistence, recovery, validation, structured errors |
+| Native platform integration | `platform/android`, `platform/ios` | App hosts, JNI/C-interop bridges, file access, foreground services, MediaCodec/VideoToolbox stages |
 
-The C++ core has no React Native dependency and is reusable from Kotlin, Swift,
-Flutter, desktop apps, and CLI tools via the stable `velmux::core` API
-(`core/include/velmux`).
+The integration contract between the shared UI and the C++ core is a frozen,
+versioned C ABI (`core/include/velmux/abi.h`) consumed through JNI on
+Android and Kotlin/Native cinterop on iOS. The core is independently
+testable on the host (Linux/macOS) without Compose or a mobile app.
 
 ## Repository layout
 
 ```
-docs/                  Canonical documents (start with docs/PROJECT_STATUS.md)
-core/                  Shared C++ core (the "brain")
-backends/ffmpeg/       FFmpeg backend using libav* libraries directly (no CLI subprocess)
-backends/android/      Android native backend (MediaCodec/MediaExtractor/MediaMuxer, NDK)
-backends/apple/        Apple backend (VideoToolbox/AVFoundation/CoreMedia)
-bridge/                React Native TurboModule/JSI bridge
-apps/mobile/           React Native application (TypeScript)
-tools/ffmpeg-builder/  Reproducible, pinned, feature-selected FFmpeg build system
-testdata/              Test fixture generation and fixtures
-.github/workflows/     CI (authoritative cross-platform validation)
+ui/mobile/            Shared Kotlin Multiplatform / Compose Multiplatform UI
+core/                 The authoritative C++ engine (include/, src/, tests/)
+platform/android/     Android host, interop (JNI + CMake), services, native stages, tests
+platform/ios/         iOS host (Xcode project), interop (cinterop + ObjC++), native stages, tests
+third_party/          Vendored SQLite amalgamation
+scripts/              The repository-owned build/test system (build.sh, test.sh, ffmpeg-builder, ...)
+docs/                 Documentation
+testdata/             Test fixture generation
+.github/workflows/    CI (thin orchestration over the repository scripts)
 ```
 
-## Building and testing the C++ core (host, Linux/macOS)
+## Building and testing
 
-Requirements: CMake >= 3.21, Ninja, C++20 compiler, SQLite3 dev package,
-and a host FFmpeg build (see below).
+All substantial build logic lives in repository-owned scripts; CI only
+orchestrates them. The same commands work locally (macOS for Apple/iOS
+work, Linux or macOS for the host and Android builds).
 
 ```bash
-# Build a pinned host FFmpeg through the Velmux builder (one time)
-tools/ffmpeg-builder/build-host.sh
+# Host engine + FFmpeg + the full ctest suite (Linux/macOS)
+./scripts/test.sh
 
-# Configure, build, and test the core + backends + tests
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVELMUX_BUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+# Shared Kotlin/Compose compile + JVM tests (host verification target)
+./scripts/test.sh --ui
+
+# Android release build (mandatory FFmpeg resolution, per-ABI)
+./scripts/build.sh --android --release
+./scripts/build.sh --android --arm64-v8a --release
+
+# Android instrumented suites on real emulators
+./scripts/test.sh --android-emulator --api 29
+./scripts/test.sh --android-emulator --api 34
+
+# iOS (requires macOS + Xcode)
+./scripts/build.sh --ios --release
+./scripts/test.sh --ios-sim
+./scripts/test.sh --ios-device        # requires a connected, signed device
 ```
 
-## Current status
+See `docs/BUILD.md` for prerequisites, dependency construction, and
+artifact locations; `docs/TESTING.md` for what each suite verifies.
 
-See `docs/PROJECT_STATUS.md` for the honest, up-to-date milestone state.
+## FFmpeg
 
-## Documentation
+The pinned, feature-selected FFmpeg and its dependencies (x264, x265,
+SVT-AV1, dav1d, libvpx, opus, vorbis, mp3lame, libass, harfbuzz, fribidi,
+freetype, zimg, libwebp) are built by `scripts/ffmpeg-builder` for the host,
+Android ABIs, and Apple device/simulator slices. Artifacts are reused only
+when a recorded build identity matches the current tree; FFmpeg is
+mandatory for every app build (there is intentionally no "without FFmpeg"
+product).
 
-- `docs/PRODUCT.md` — product identity and mission
-- `docs/ARCHITECTURE.md` — layer architecture and module map
-- `docs/FEATURE_MATRIX.md` — supported codecs, containers, subtitle formats
-- `docs/BACKEND_POLICY.md` — backend selection and ownership policy
-- `docs/PERFORMANCE.md` — performance targets and measurements
-- `docs/RECOVERY.md` — durability, checkpoints, crash reconciliation
-- `docs/DESIGN_SYSTEM.md` — UI design direction
-- `docs/DECISIONS.md` — decision log
-- `docs/PROJECT_STATUS.md` — current state (start here)
-- `docs/AGENT_PROTOCOL.md` — how engineering agents cooperate on this repo
+## Verification status
+
+The authoritative, continuously verified state is maintained by GitHub
+Actions (Linux runners for host/Android work, macOS runners for Apple
+work): host engine tests including real-media processing, Android release
+builds, Android API 29/34 emulator instrumented suites, and the iOS
+simulator suite + device build. See `docs/TESTING.md` and
+`docs/FEATURE_MATRIX.md` for what is implemented and verified, and for the
+honest device-conditional limitations (physical-device codec behavior is
+only validated on physical devices).
+
+## License
+
+See `LICENSE`, `docs/RELEASE.md` and the third-party notices there. The
+linked dependency set (GPL-enabled x264/x265) imposes corresponding
+obligations on distributed binaries; nothing nonfree is enabled.

@@ -276,7 +276,9 @@ jobs:
 
       # The iOS FFmpeg cross-build (run by the scripts when the artifacts
       # are missing or stale) needs these. cmake/ninja/pkg-config are
-      # preinstalled on macOS runners.
+      # preinstalled on macOS runners; autoconf/automake provide zimg's
+      # autoreconf (the builder builds a pinned libtool itself when the
+      # host ships no libtoolize).
       - name: Install FFmpeg build tools
         run: |
           if ! command -v meson >/dev/null 2>&1; then
@@ -284,6 +286,9 @@ jobs:
           fi
           if ! command -v nasm >/dev/null 2>&1; then
             brew install nasm
+          fi
+          if ! command -v autoreconf >/dev/null 2>&1; then
+            brew install autoconf automake
           fi
 
       - name: Compute FFmpeg artifact identity
@@ -432,8 +437,8 @@ jobs:
 
           Release candidate built from commit ${GITHUB_SHA}.
 
-          See docs/PROJECT_STATUS.md for the current implementation and
-          validation state, and docs/AUDIT.md for the feature audit.
+          See docs/TESTING.md for the current verification state and
+          docs/FEATURE_MATRIX.md for the feature audit.
           EOF
             echo "path=/tmp/velmux-release-notes.md" >> "$GITHUB_OUTPUT"
           fi
