@@ -47,11 +47,11 @@ val androidSdkAvailable: Boolean =
             System.getenv("ANDROID_SDK_ROOT") != null)
 
 if (androidSdkAvailable) {
-    // KMP: the android target needs the Kotlin Android plugin plus an AGP
-    // library so :platform:android:host can consume this module as a project
-    // dependency (the shared code's Android compilation happens through the
-    // host app, never as a standalone Android build here).
-    apply(plugin = "org.jetbrains.kotlin.android")
+    // KMP: the android target needs ONLY the Android library plugin — the
+    // Kotlin Multiplatform plugin provides the Kotlin side of the target
+    // (applying org.jetbrains.kotlin.android on top registers a second
+    // 'kotlin' extension and the build fails: "extension already
+    // registered with that name").
     apply(plugin = "com.android.library")
 }
 
@@ -64,13 +64,24 @@ kotlin {
         target.compilations.getByName("main").cinterops.create("velmux") {
             defFile(rootProject.layout.projectDirectory.file("platform/ios/interop/velmux.def"))
         }
+        // The Xcode host consumes a STATIC Compose framework: the Kotlin
+        // object code, the C++ engine archives and the pinned FFmpeg all
+        // link into ONE app binary (scripts/ios/prepare-xcode-inputs.sh
+        // stages the per-SDK build here; the undefined velmux_* symbols
+        // resolve at the app link against the staged engine archives).
+        target.binaries.framework {
+            baseName = "Velmux"
+            isStatic = true
+        }
     }
 
     if (androidSdkAvailable) {
         androidTarget {
             compilations.all {
-                compilerOptions.configure {
-                    jvmTarget.set(JvmTarget.JVM_17)
+                compileTaskProvider.configure {
+                    compilerOptions {
+                        jvmTarget.set(JvmTarget.JVM_17)
+                    }
                 }
             }
         }

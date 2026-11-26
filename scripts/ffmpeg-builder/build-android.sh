@@ -547,6 +547,10 @@ ZPC
      make -j"$JOBS" >/dev/null && make install >/dev/null)
     log "[$abi] zimg installed"
   fi
+  # bionic keeps the math functions in libm; FFmpeg's static probes
+  # link the .pc's Libs only, so zimg/libwebp/sharpyuv need -lm listed
+  # explicitly (glibc/libSystem hosts are unaffected: harmless no-op).
+  append_pc_libs "$prefix" zimg -lm
 
   # --- libwebp (cmake cross; still WebP output, mandate 29.3) --------------------------
   if [ ! -f "$prefix/lib/libwebp.a" ]; then
@@ -571,6 +575,8 @@ ZPC
     cmake --install "$webp_build" >/dev/null
     log "[$abi] libwebp installed"
   fi
+  append_pc_libs "$prefix" libwebp -lm -lsharpyuv
+  append_pc_libs "$prefix" sharpyuv -lm
 
   # --- FFmpeg (out of tree) -----------------------------------------------------------------
   ffmpeg_tb="$(fetch_ffmpeg)"

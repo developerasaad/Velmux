@@ -147,6 +147,37 @@ PY
   log "sanitized x265.pc implicit-lib entries"
 }
 
+# append_pc_libs <prefix> <pc-name> <libs...> — append missing -l entries to
+# a staged .pc's Libs line. Needed on Android: bionic keeps the math
+# functions in libm (glibc/libSystem fold them into libc), so probes that
+# link libwebp/zimg WITHOUT -lm fail on undefined pow/log10/expf and
+# FFmpeg's configure reports the dependency as missing. No-op (and no
+# duplicate) when the entry is already there.
+append_pc_libs() {
+  local prefix="$1" name="$2"; shift 2
+  local pc="$prefix/lib/pkgconfig/$name.pc"
+  [ -f "$pc" ] || return 0
+  python3 - "$pc" "$@" <<'PY'
+import sys
+path = sys.argv[1]
+want = sys.argv[2:]
+s = open(path, encoding="utf-8").read()
+lines = s.splitlines()
+out = []
+appended = []
+for line in lines:
+    if line.startswith("Libs:") and not line.startswith("Libs.private:"):
+        for w in want:
+            if f" {w} " not in f" {line} ":
+                line = line.rstrip() + " " + w
+                appended.append(w)
+    out.append(line)
+if appended:
+    open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+PY
+  log "patched $name.pc (probe link closure)"
+}
+
 # ensure_build_libtool <prefix> — guarantee a host-usable libtoolize for
 # autogen-based dependencies (zimg). CI images ship libtool; hosts without
 # it get a prefix-local build from the pinned tarball (nasm-style
