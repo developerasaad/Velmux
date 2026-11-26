@@ -14,7 +14,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGING="$1"
 mkdir -p "$STAGING"
 
-OUTPUTS="$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build/outputs"
+OUTPUTS="$VELMUX_ROOT/$VELMUX_ANDROID_HOST_DIR/build/outputs"
 [ -d "$OUTPUTS/apk/release" ] || vdie "no release APK outputs found; run scripts/android/build.sh --release first"
 
 cp "$OUTPUTS"/apk/release/*.apk "$STAGING/" 2>/dev/null || vdie "no APK in $OUTPUTS/apk/release"

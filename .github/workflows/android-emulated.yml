@@ -1,6 +1,6 @@
 # Android instrumented tests on real emulators.
 #
-# The instrumented suite in apps/mobile runs REAL MediaCodec conversions
+# The instrumented suite in platform/android/tests runs REAL MediaCodec conversions
 # through the engine's JNI facade against fixtures generated on-device by
 # real encoders, and validates outputs with an independent MediaExtractor
 # probe. This workflow runs them on API 29 (the product floor) and a modern
@@ -17,11 +17,10 @@ name: Android emulated
 on:
   push:
     paths:
-      - apps/**
       - core/**
-      - backends/**
-      - bridge/**
-      - tools/ffmpeg-builder/**
+      - platform/**
+      - ui/**
+      - scripts/ffmpeg-builder/**
       # The scripts this workflow executes: test.sh --android-emulator
       # dispatches to scripts/android/emulator-test.sh, which builds the
       # app through scripts/android/build.sh (FFmpeg via scripts/ffmpeg/*)
@@ -31,18 +30,21 @@ on:
       - scripts/lib/**
       - scripts/ffmpeg/**
       - scripts/android/**
+      - gradle.properties
+      - settings.gradle.kts
       - .github/workflows/android-emulated.yml
   pull_request:
     paths:
-      - apps/**
       - core/**
-      - backends/**
-      - bridge/**
-      - tools/ffmpeg-builder/**
+      - platform/**
+      - ui/**
+      - scripts/ffmpeg-builder/**
       - scripts/test.sh
       - scripts/lib/**
       - scripts/ffmpeg/**
       - scripts/android/**
+      - gradle.properties
+      - settings.gradle.kts
       - .github/workflows/android-emulated.yml
   workflow_dispatch:
 
@@ -97,16 +99,10 @@ jobs:
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
           # FFmpeg build tools: the mandatory-FFmpeg policy makes the
           # suite resolve (and on a cache miss BUILD) the x86_64 FFmpeg
-          # inline — dav1d needs meson, x265 needs cmake + ninja, and
+          # inline — dav1d needs meson, x265/zimg need cmake + ninja
+          # (cmake is preinstalled), zimg's autogen needs libtool, and
           # nasm enables the x86 asm paths (dav1d/x264/x265).
-          sudo apt-get install -y ninja-build meson pkg-config nasm
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: apps/mobile/package-lock.json
+          sudo apt-get install -y ninja-build meson pkg-config nasm libtool
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -181,8 +177,8 @@ jobs:
           # downloaded source tarballs. The key is the exact identity the
           # scripts verify before reuse.
           path: |
-            tools/ffmpeg-builder/out/android
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/android
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-android-x86_64-${{ steps.ffid.outputs.identity }}
 
       # The repository script owns everything: KVM permission fix, AVD
@@ -207,8 +203,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            tools/ffmpeg-builder/out/android
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/android
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-android-x86_64-${{ steps.ffid.outputs.identity }}
 
       - name: Collect diagnostics on failure
@@ -235,7 +231,7 @@ jobs:
           path: |
             /tmp/diag
             /tmp/velmux-emulator-*.log
-            apps/mobile/android/app/build/outputs/androidTest-results/
-            apps/mobile/android/app/build/reports/
+            platform/android/host/build/outputs/androidTest-results/
+            platform/android/host/build/reports/
           if-no-files-found: ignore
           retention-days: 7

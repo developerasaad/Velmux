@@ -121,6 +121,14 @@ kotlin {
                     rootProject.layout.projectDirectory
                         .dir("platform/android/host/ui-shared")
                 )
+                // The JNI Kotlin surface is part of the shared library's
+                // Android target: the shared EngineTransport actual binds
+                // it directly. The app module must not own it (that would
+                // invert the dependency: library -> app).
+                kotlin.srcDir(
+                    rootProject.layout.projectDirectory
+                        .dir("platform/android/interop")
+                )
                 dependencies {
                     // rememberFilePicker (SAF document picker) and the
                     // FileProvider share/open actuals.

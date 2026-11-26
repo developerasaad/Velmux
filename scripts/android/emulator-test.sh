@@ -13,12 +13,11 @@
 #      timeouts, which once ate an entire CI job silently);
 #   4. build the app for the emulator ABI ONLY (FFmpeg mandatory: the
 #      x86_64 artifacts are resolved or built through the identity-checked
-#      fetcher). The debug build EMBEDS the JS bundle — there is no Metro
-#      on the CI machine, and the launch verification must exercise the
-#      real app (RN init, JS runtime, native bridge), not a Metro error;
+#      fetcher);
 #   5. install, cold launch, and verify: process stays alive, activity
-#      resumed, the RN init marker proves the JS runtime reached app init
-#      with the native bridge available, no fatal errors in logcat;
+#      resumed, the engine init marker proves the Compose app reached a
+#      working engine surface (libvelmux_jni loaded, the facade answers),
+#      no fatal errors in logcat;
 #   6. run the full instrumented engine suite (real conversions, hybrid
 #      stage tests, checkpoint recovery) through gradle;
 #   7. force-stop, relaunch, verify alive again (lifecycle/persistence
@@ -84,9 +83,9 @@ collect_diagnostics() {
   adb_t logcat -d > "$DIAG_DIR/logcat.txt" 2>/dev/null || true
   # Bounded: bugreport against a half-booted emulator can hang.
   timeout 90 adb bugreport "$DIAG_DIR/bugreport.zip" > /dev/null 2>&1 || true
-  cp -R "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build/outputs/androidTest-results" \
+  cp -R "$VELMUX_ROOT/$VELMUX_ANDROID_HOST_DIR/build/outputs/androidTest-results" \
      "$DIAG_DIR/" 2>/dev/null || true
-  cp -R "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build/reports" \
+  cp -R "$VELMUX_ROOT/$VELMUX_ANDROID_HOST_DIR/build/reports" \
      "$DIAG_DIR/" 2>/dev/null || true
 }
 trap collect_diagnostics EXIT
@@ -213,10 +212,10 @@ timeout 30 adb wait-for-device 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # App build for the emulator ABI (FFmpeg mandatory through fetch.sh)
 # ---------------------------------------------------------------------------
-vlog "building the app for the emulator ($ABI, embedded JS bundle)"
-bash "$SCRIPTS_DIR/android/build.sh" --debug --abi "$ABI" --embed-bundle
+vlog "building the app for the emulator ($ABI)"
+bash "$SCRIPTS_DIR/android/build.sh" --debug --abi "$ABI"
 
-APK_GLOB="$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR/app/build/outputs/apk/debug/*.apk"
+APK_GLOB="$VELMUX_ROOT/$VELMUX_ANDROID_HOST_DIR/build/outputs/apk/debug/*.apk"
 APK="$(ls $APK_GLOB 2>/dev/null | head -1 || true)"
 [ -n "$APK" ] || vdie "debug APK not found after the build"
 
@@ -281,28 +280,27 @@ verify_launch() {
   printf '%s' "$resumed" | grep -q "ResumedActivity.*com.velmux.mobile" \
     || vdie "$phase: MainActivity is not the resumed activity"
   # Keep it alive for a sustained window; a late crash (JNI load failure,
-  # TurboModule registration, engine startup) must fail the run.
+  # engine startup, Compose runtime) must fail the run.
   sleep 12
   pid="$(timeout 10 adb shell pidof com.velmux.mobile 2>/dev/null | tr -d '\r' || true)"
   [ -n "$pid" ] || vdie "$phase: the app process died shortly after launch"
-  # RN initialization marker: the JS runtime must reach app init AND find
-  # the native bridge. This is what proves libappmodules.so loaded (its
-  # JNI_OnLoad installs the TurboModule providers), React Native
-  # initialized, and the Velmux TurboModule answered — without it a
-  # process that is alive but RN-dead (e.g. 'PlatformConstants' could not
-  # be found) would pass silently.
+  # Engine init marker: VelmuxApplication probes the engine facade right
+  # after the client starts and logs the result. This proves
+  # System.loadLibrary("velmux_jni") mapped the library, JNI_OnLoad
+  # registered the surface and the facade answers — without it a process
+  # that is alive but engine-dead would pass silently.
   local marker=""
   for i in $(seq 1 15); do
     marker="$(timeout 10 adb logcat -d 2>/dev/null | tr -d '\r' \
-      | grep -F '[Velmux] app init:' | tail -1 || true)"
+      | grep -F 'app init:' | tail -1 || true)"
     [ -n "$marker" ] && break
     sleep 2
   done
   [ -n "$marker" ] \
-    || vdie "$phase: the RN init marker never appeared (React Native or the JS runtime failed to initialize)"
+    || vdie "$phase: the engine init marker never appeared (the engine surface failed to initialize)"
   case "$marker" in
-    *'[Velmux] app init: native bridge available'*) ;;
-    *) vdie "$phase: the native bridge is not available at app init: $marker" ;;
+    *'engine ready'*) ;;
+    *) vdie "$phase: the engine surface is not available at app init: $marker" ;;
   esac
   # Fatal-error scan over everything logged since launch.
   local log
@@ -311,7 +309,7 @@ verify_launch() {
     printf '%s\n' "$log" | grep -E -A5 "FATAL EXCEPTION|SIGSEGV|SIGABRT|UnsatisfiedLinkError.*velmux" | head -60 >&2 || true
     vdie "$phase: fatal errors in logcat after launch"
   fi
-  vlog "$phase: app alive (pid $pid), RN init marker present, log clean"
+  vlog "$phase: app alive (pid $pid), engine init marker present, log clean"
 }
 
 verify_launch "cold launch"
@@ -320,11 +318,10 @@ verify_launch "cold launch"
 # Instrumented engine suite (real conversions through the app's engine)
 # ---------------------------------------------------------------------------
 vlog "running instrumented tests"
-ANDROID_DIR="$(repo_dir "$VELMUX_APP_ANDROID_DIR")"
-run_in "$ANDROID_DIR" ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
-  -PvelmuxAbis="$ABI" -PreactNativeArchitectures="$ABI" \
+run_in "$VELMUX_ROOT" ./gradlew :platform:android:host:connectedDebugAndroidTest \
+  --no-daemon --stacktrace \
+  -PvelmuxAbis="$ABI" \
   -PvelmuxFFmpegPrefix="$VELMUX_ROOT/$VELMUX_FFMPEG_OUT_DIR/android" \
-  -PvelmuxEmbedDebugBundle=true \
   -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
   -PvelmuxVersionCode="$VELMUX_VERSION_CODE"
 

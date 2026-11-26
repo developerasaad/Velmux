@@ -45,13 +45,13 @@ vlog "device: $(adb devices | sed -n 2p), ABI: $ABI"
 # a real process-death pass: am crash the app, relaunch, verify recovery.
 bash "$SCRIPTS_DIR/android/build.sh" --debug --abi "$ABI"
 
-APK="$(ls "$VELMUX_ROOT/$VELMUX_APP_ANDROID_DIR"/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1 || true)"
+APK="$(ls "$VELMUX_ROOT/$VELMUX_ANDROID_HOST_DIR"/build/outputs/apk/debug/*.apk 2>/dev/null | head -1 || true)"
 [ -n "$APK" ] || vdie "debug APK not found"
 adb install -r "$APK" > /dev/null
 
-ANDROID_DIR="$(repo_dir "$VELMUX_APP_ANDROID_DIR")"
-run_in "$ANDROID_DIR" ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace \
-  -PvelmuxAbis="$ABI" -PreactNativeArchitectures="$ABI" \
+run_in "$VELMUX_ROOT" ./gradlew :platform:android:host:connectedDebugAndroidTest \
+  --no-daemon --stacktrace \
+  -PvelmuxAbis="$ABI" \
   -PvelmuxFFmpegPrefix="$VELMUX_ROOT/$VELMUX_FFMPEG_OUT_DIR/android" \
   -PvelmuxVersionName="$VELMUX_VERSION_NAME" \
   -PvelmuxVersionCode="$VELMUX_VERSION_CODE"

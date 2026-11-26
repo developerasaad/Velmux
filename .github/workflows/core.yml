@@ -1,19 +1,19 @@
 # Host CI for the shared C++ core and the FFmpeg backend.
 #
-# Dumb executor: checkout + toolchain + repository scripts + upload. All
+# Thin orchestration (mandate §50 + the CI directive): checkout, toolchain,
+# identity-keyed cache restore, script invocation, artifact upload. All
 # build logic lives in the repository — ./scripts/test.sh resolves (or
-# builds) the pinned host FFmpeg, configures CMake, builds every registered
-# suite and runs ctest; scripts/ffmpeg/identity.sh supplies the exact cache
-# key so "cache hit" and "artifact valid" can never disagree.
+# builds) the pinned host FFmpeg, configures CMake, builds every
+# registered suite and runs ctest; scripts/ffmpeg/identity.sh supplies the
+# exact cache key so "cache hit" and "artifact valid" can never disagree.
 name: Core & FFmpeg backend (host)
 
 on:
   push:
     paths:
       - core/**
-      - backends/**
-      - bridge/cpp/**
-      - tools/ffmpeg-builder/**
+      - platform/**
+      - third_party/**
       - scripts/**
       - testdata/**
       - CMakeLists.txt
@@ -21,9 +21,8 @@ on:
   pull_request:
     paths:
       - core/**
-      - backends/**
-      - bridge/cpp/**
-      - tools/ffmpeg-builder/**
+      - platform/**
+      - third_party/**
       - scripts/**
       - testdata/**
       - CMakeLists.txt
@@ -54,8 +53,10 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          # meson: dav1d build system; pkg-config: FFmpeg configure probes.
-          sudo apt-get install -y ninja-build libsqlite3-dev meson pkg-config
+          # meson: dav1d build system; pkg-config: FFmpeg configure probes;
+          # libtool: zimg autogen (the builder builds a prefix-local
+          # fallback itself when the host ships none).
+          sudo apt-get install -y ninja-build libsqlite3-dev meson pkg-config libtool
 
       - name: Verify CMake toolchain
         run: |
@@ -77,8 +78,8 @@ jobs:
           # Both the built host artifacts and the downloaded source tarballs.
           # The key is the exact identity the scripts verify before reuse.
           path: |
-            tools/ffmpeg-builder/out/host
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/host
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
 
       # The repository script owns everything: FFmpeg resolve/rebuild,
@@ -101,8 +102,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            tools/ffmpeg-builder/out/host
-            tools/ffmpeg-builder/downloads
+            scripts/ffmpeg-builder/out/host
+            scripts/ffmpeg-builder/downloads
           key: ffmpeg-host-${{ steps.ffid.outputs.identity }}
 
       - name: Upload host FFmpeg artifact
@@ -116,7 +117,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-host-${{ steps.ffid.outputs.identity }}
-          path: tools/ffmpeg-builder/out/host
+          path: scripts/ffmpeg-builder/out/host
           retention-days: 14
           if-no-files-found: error
 
@@ -129,27 +130,16 @@ jobs:
           sudo apt-get install -y clang-format
           # Check every C/C++ source owned by the native layers. Directories
           # that do not exist are ignored so the step degrades gracefully.
-          sources=$(find core backends bridge/cpp -type f \
+          sources=$(find core platform -type f \
             \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \
-            -o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' \) 2>/dev/null || true)
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' \
+            -o -name '*.mm' \) 2>/dev/null || true)
           if [ -n "$sources" ]; then
             # --Werror makes clang-format fail on any file it would rewrite.
             clang-format --dry-run --Werror $sources
           else
             echo "No C/C++ sources found; nothing to check."
           fi
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: apps/mobile/package-lock.json
-
-      # TypeScript suite (type check + lint) through the repository script;
-      # it installs the JS dependencies itself when node_modules is missing.
-      - name: TypeScript suite (type check + lint)
-        run: ./scripts/test.sh --ts
 
       - name: Upload build and test logs on failure
         if: failure()

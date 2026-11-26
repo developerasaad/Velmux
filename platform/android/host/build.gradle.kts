@@ -11,10 +11,14 @@
 // the FFmpeg processing module) and drives assemble via gradle. Host
 // verification of the shared code runs on the JVM target.
 //
-// Legacy Android sources are compiled from their physical homes:
+// Platform sources compile from their physical homes (mandate §11.1):
 //   platform/android/interop  (VelmuxJni Kotlin surface + velmux_jni.cpp
-//                              through externalNativeBuild/CMake; ABI v2)
-//   platform/android/services (ConversionService, EngineHolder, FileImport)
+//                              through externalNativeBuild/CMake; the
+//                              Kotlin surface itself compiles into
+//                              :ui:mobile's androidMain — see its build
+//                              file)
+//   platform/android/services (ConversionService, the foreground host)
+//   platform/android/tests    (instrumented engine tests, androidTest)
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -50,6 +54,10 @@ android {
         targetSdk = 35
         versionCode = velmuxVersionCode.toInt()
         versionName = velmuxVersionName
+
+        // Instrumented engine tests (platform/android/tests) run through
+        // the standard androidx runner.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // Manifest placeholders (cleartext stays off for the product app).
         manifestPlaceholders["usesCleartextTraffic"] = false
@@ -102,11 +110,19 @@ android {
 
     sourceSets {
         getByName("main") {
-            // Legacy Kotlin platform sources compile from their physical
-            // homes under platform/android (mandate §11.1).
+            // Platform Kotlin sources compile from their physical homes
+            // under platform/android (mandate §11.1). The interop Kotlin
+            // surface (VelmuxJni) compiles into :ui:mobile's androidMain;
+            // this module only compiles the app-owned services.
             java.srcDirs(
-                rootProject.layout.projectDirectory.dir("platform/android/interop"),
                 rootProject.layout.projectDirectory.dir("platform/android/services"),
+            )
+        }
+        getByName("androidTest") {
+            // Instrumented engine tests: real conversions through the JNI
+            // facade on a device/emulator (mandate §46.4).
+            java.srcDirs(
+                rootProject.layout.projectDirectory.dir("platform/android/tests"),
             )
         }
     }
@@ -131,4 +147,10 @@ dependencies {
     implementation(compose.runtime)
     implementation(compose.ui)
     implementation(compose.material3)
+
+    // Instrumented engine tests (platform/android/tests).
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test:rules:1.6.1")
 }

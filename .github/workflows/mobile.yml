@@ -1,26 +1,40 @@
-# CI for the React Native application (TypeScript only: type check + lint).
+# CI for the shared Kotlin Multiplatform / Compose Multiplatform UI.
 #
-# Thin wrapper: ./scripts/test.sh --ts owns the logic (JS dependency install
-# included). This workflow stays separate from core.yml because its trigger
-# paths (apps/**, bridge/ts/**) are broader than core.yml's.
-name: Mobile app (TS)
+# Thin orchestration: checkout, JDK, Gradle caching, script invocation.
+# The suite logic lives in the repository — ./scripts/test.sh --ui runs
+# :ui:mobile:jvmTest (the host verification target; the Android target
+# compiles through the product build, the iOS targets through the macOS
+# framework build).
+name: Shared UI (Kotlin)
 
 on:
   push:
     paths:
-      - apps/**
-      - bridge/ts/**
-      # The scripts this workflow executes: test.sh --ts dispatches to
-      # scripts/lib/ts-suite.sh (through scripts/lib/common.sh and
-      # targets.sh). Only the shared library is filtered — the Android/iOS
-      # and FFmpeg scripts are never executed by the TS suite.
+      - ui/**
+      - platform/android/**
+      - platform/ios/**
+      - settings.gradle.kts
+      - build.gradle.kts
+      - gradle.properties
+      - gradle/**
+      - gradlew
+      - gradlew.bat
+      # The scripts this workflow executes: test.sh --ui dispatches to
+      # scripts/lib/ui-suite.sh.
       - scripts/test.sh
       - scripts/lib/**
       - .github/workflows/mobile.yml
   pull_request:
     paths:
-      - apps/**
-      - bridge/ts/**
+      - ui/**
+      - platform/android/**
+      - platform/ios/**
+      - settings.gradle.kts
+      - build.gradle.kts
+      - gradle.properties
+      - gradle/**
+      - gradlew
+      - gradlew.bat
       - scripts/test.sh
       - scripts/lib/**
       - .github/workflows/mobile.yml
@@ -35,24 +49,34 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    name: Type check and lint
-    # Pinned: ubuntu-latest became Ubuntu 26.04 in November 2026,
-    # where the Android emulator (37.3.10) dies instantly at boot; the
-    # 24.04 image is the validated environment (and keeps builds
-    # reproducible against a moving label).
+  jvm:
+    name: Shared Kotlin compile and JVM tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
         with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: apps/mobile/package-lock.json
+          distribution: temurin
+          java-version: '21'
 
-      - name: TypeScript suite
-        run: ./scripts/test.sh --ts
+      # Gradle dependency and wrapper caching.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The repository script owns the suite: it locates the Gradle
+      # wrapper, requires the JDK and runs :ui:mobile:jvmTest.
+      - name: Shared UI suite
+        run: ./scripts/test.sh --ui
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-test-results
+          path: ui/mobile/build/test-results/**
+          if-no-files-found: ignore
+          retention-days: 7
