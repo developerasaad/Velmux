@@ -63,11 +63,16 @@ DerivedData/
 *.xcodeproj/xcuserdata/
 **/ios/.xcode.env.local
 
-# FFmpeg builder
-tools/ffmpeg-builder/src/
-tools/ffmpeg-builder/out/
-tools/ffmpeg-builder/deps/
-tools/ffmpeg-builder/downloads/
+# FFmpeg builder (moved with the repository restructure; the generated
+# source/download/output trees are never committed)
+scripts/ffmpeg-builder/src/
+scripts/ffmpeg-builder/out/
+scripts/ffmpeg-builder/deps/
+scripts/ffmpeg-builder/downloads/
+
+# Local Gradle / Kotlin session state (machine-specific, never committed)
+.gradle/
+.kotlin/
 
 # Databases / test artifacts
 *.db
