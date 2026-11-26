@@ -67,7 +67,8 @@ enum class JobsFilter(val label: String) {
     fun accepts(state: JobStateUi): Boolean = when (this) {
         ALL -> true
         ACTIVE -> state.isOngoing
-        COMPLETED -> state == COMPLETED || state == TARGET_NOT_MET
+        COMPLETED -> state == JobStateUi.COMPLETED ||
+            state == JobStateUi.TARGET_NOT_MET
         FAILED -> state.isFailed
     }
 }

@@ -135,16 +135,172 @@ object Strings {
     const val BANNER_DISMISS = "Dismiss"
     const val ERROR_RETRY = "Retry"
 
-    // -- workflow placeholder (follow-up surface) ------------------------------------
-    const val WORKFLOW_PENDING_TITLE = "Configuration UI pending"
-    const val WORKFLOW_PENDING_BODY =
-        "This workflow's configuration screen is the follow-up task (UI-2). " +
-            "The session is live in the engine client and this route is its " +
-            "stable destination."
-    const val WORKFLOW_PENDING_SESSION = "Session"
-    const val WORKFLOW_PENDING_NO_SESSION = "No session attached"
-    const val WORKFLOW_PENDING_STATE = "Session state"
+    // -- workflow screens (UI-2: the eight primary workflows) --------------------
     const val WORKFLOW_BACK = "Back"
+    const val WORKFLOW_NO_SESSION = "No open configuration"
+    const val WORKFLOW_NO_SESSION_BODY =
+        "This workflow has no session attached. Pick media from Home to " +
+            "start it."
+    const val WORKFLOW_UNKNOWN_TITLE = "Unknown workflow"
+    const val WORKFLOW_UNKNOWN_BODY =
+        "The engine reported an operation this app version does not " +
+            "provide a screen for (%s)."
+
+    const val INPUT_APPLY = "Apply"
+
+    // -- related changes (mandate §14.1) -------------------------------------------
+    const val RELATED_CHANGE_TITLE = "A related change is required"
+    const val RELATED_CHANGE_KEEP = "Keep current"
+    const val RELATED_CHANGE_APPLY = "Apply change"
+
+    // -- fixed converter layout (mandate §19 / §31) --------------------------------
+    const val VIDEO_PRIMARY_SECTION = "Video output"
+    const val AUDIO_PRIMARY_SECTION = "Audio output"
+    const val SECONDARY_SECTION = "More options"
+    const val FIELD_FORMAT = "Format"
+    const val FIELD_CODEC = "Codec"
+    const val FIELD_RESOLUTION = "Resolution"
+    const val FIELD_FRAME_RATE = "Frame rate"
+    const val FIELD_SAMPLE_RATE = "Sample rate"
+    const val FIELD_CHANNELS = "Channels"
+    const val RESOLUTION_WIDTH = "Width"
+    const val RESOLUTION_HEIGHT = "Height"
+    const val CONVERT_ACTION = "Convert"
+    const val COMPRESSION_SECTION_TITLE = "Reduce file size"
+
+    // -- compression (mandate §20) ---------------------------------------------------
+    const val COMPRESSION_TITLE = "Reduce file size"
+    const val COMPRESSION_OFF_HINT =
+        "Off by default — compatible streams are preserved without " +
+            "re-encoding"
+    const val COMPRESSION_PRESET = "Goal"
+    const val COMPRESSION_TARGET_SIZE = "Target file size"
+    const val COMPRESSION_VIDEO_BITRATE = "Video bitrate"
+    const val COMPRESSION_AUDIO_BITRATE = "Audio bitrate"
+    const val COMPRESSION_QUALITY = "Quality"
+
+    // -- track sections (mandate §23 / §24 / §28 / §30) --------------------------------
+    const val AUDIO_TRACKS_SECTION = "Audio tracks"
+    const val SUBTITLES_SECTION = "Subtitles"
+    const val EXTRACT_TRACKS_SECTION = "Tracks"
+    const val TRACKS_NONE = "No tracks of this kind"
+    const val TRACK_FORMAT = "Track %d"
+
+    // -- subtitle policies (mandate §24) ------------------------------------------------
+    const val SUBTITLE_POLICY_PRESERVE = "Preserve"
+    const val SUBTITLE_POLICY_BURN_IN = "Burn into video"
+    const val SUBTITLE_POLICY_REMOVE = "Remove"
+    const val SUBTITLE_TRACKS_NONE = "No subtitle tracks"
+    const val SUBTITLE_DEFAULT = "Default"
+    const val SUBTITLE_FORCED = "Forced"
+    const val SUBTITLE_TARGET_SECTION = "Output format"
+    const val SUBTITLE_TARGET_ORIGINAL = "Original representation"
+    const val SUBTITLE_TARGET_SRT = "SRT"
+    const val SUBTITLE_TARGET_VTT = "WebVTT"
+    const val SUBTITLE_TARGET_ASS = "ASS"
+    const val SUBTITLES_DEFAULT_STEM = "subtitles"
+
+    // -- adjustments (mandate §25 / §32) ---------------------------------------------------
+    const val ADJUSTMENTS_SECTION = "Adjustments"
+    const val ADJUST_ROTATION = "Rotation (degrees)"
+    const val ADJUST_FLIP_H = "Flip horizontally"
+    const val ADJUST_FLIP_V = "Flip vertically"
+    const val ADJUST_SPEED = "Playback speed"
+    const val ADJUST_REVERSE = "Reverse"
+    const val ADJUST_HDR_TO_SDR = "Convert HDR to SDR"
+    const val ADJUST_HDR_TO_SDR_HINT =
+        "Tone-maps HDR (PQ/HLG) to standard dynamic range"
+    const val ADJUST_VOLUME = "Volume (dB)"
+    const val ADJUST_NORMALIZE = "Normalize loudness"
+    const val ADJUST_NORMALIZE_HINT = "Measured loudness to -16 LUFS"
+    const val ADJUST_FADE_IN = "Fade in (ms)"
+    const val ADJUST_FADE_OUT = "Fade out (ms)"
+    const val ADJUST_PRESERVE_PITCH = "Preserve pitch"
+    const val ADJUST_REMOVE_SILENCE = "Remove silence"
+    const val ADJUST_REMOVE_SILENCE_HINT =
+        "Removes intervals quieter than -45 dBFS (600 ms or longer)"
+
+    // -- metadata (mandate §33) ------------------------------------------------------------
+    const val METADATA_SECTION = "Metadata"
+    const val META_TITLE = "Title"
+    const val META_ARTIST = "Artist"
+    const val META_ALBUM = "Album"
+    const val META_GENRE = "Genre"
+    const val META_DATE = "Date"
+    const val META_DESCRIPTION = "Description"
+    const val META_LOCATION = "Location"
+    const val META_PLACEHOLDER = "Leave unchanged"
+
+    // -- timeline / cut & merge (mandate §27) ----------------------------------------------
+    const val TIMELINE_MODE_SECTION = "Operation"
+    const val TIMELINE_MODE_TRIM = "Trim"
+    const val TIMELINE_MODE_CUT = "Cut"
+    const val TIMELINE_MODE_SPLIT = "Split"
+    const val TIMELINE_MODE_MERGE = "Merge"
+    const val RANGE_SECTION = "Range"
+    const val REMOVED_SECTION = "Removed intervals"
+    const val SPLIT_SECTION = "Split rules"
+    const val MERGE_SECTION = "Merge layout"
+    const val RANGE_START = "Start"
+    const val RANGE_END = "End"
+    const val RANGE_OPEN_END = "To end"
+    const val RANGE_ADD = "Add"
+    const val RANGE_REMOVE = "Remove interval"
+    const val SPLIT_PART_COUNT = "Number of parts"
+    const val SPLIT_PART_DURATION = "Part duration"
+    const val SPLIT_MAX_SIZE = "Maximum part size"
+    const val SPLIT_BOUNDARY = "Boundary"
+    const val MERGE_LAYOUT = "Layout"
+    const val MERGE_LAYOUT_SEQUENTIAL = "Sequential"
+    const val MERGE_LAYOUT_SIDE_BY_SIDE = "Side by side"
+    const val MERGE_LAYOUT_TOP_BOTTOM = "Top and bottom"
+    const val MERGE_AUDIO = "Audio"
+    const val MERGE_AUDIO_FIRST = "From the first video"
+    const val MERGE_AUDIO_SECOND = "From the second video"
+    const val MERGE_AUDIO_BOTH = "From both videos"
+    const val MERGE_AUDIO_NONE = "No audio"
+    const val MERGE_LONGER_DURATION = "Run to the longer duration"
+    const val MERGE_LONGER_DURATION_HINT =
+        "The finished side turns black after the shorter video ends"
+    const val CUTMERGE_ACTION = "Run"
+
+    // -- crop (mandate §26) --------------------------------------------------------------------
+    const val CROP_SECTION = "Crop rectangle"
+    const val CROP_LEFT = "Left"
+    const val CROP_TOP = "Top"
+    const val CROP_WIDTH = "Width"
+    const val CROP_HEIGHT = "Height"
+    const val CROP_RATIO = "Aspect ratio"
+    const val CROP_RATIO_ORIGINAL = "Original"
+    const val CROP_RESULT_FORMAT = "Result: %d × %d"
+    const val CROP_ACTION = "Crop video"
+    const val CROP_DEFAULT_NAME = "cropped"
+
+    // -- extract frames (mandate §29) -----------------------------------------------------------
+    const val FRAMES_SELECTION_SECTION = "Frames"
+    const val FRAMES_MODE = "Mode"
+    const val FRAMES_INTERVAL = "Interval"
+    const val FRAMES_COUNT = "Number of frames"
+    const val FRAMES_RANGE = "Range"
+    const val IMAGE_OUTPUT_SECTION = "Image output"
+    const val IMAGE_FORMAT = "Format"
+    const val IMAGE_QUALITY = "Quality"
+    const val IMAGE_MAX_WIDTH = "Maximum width"
+    const val IMAGE_MAX_HEIGHT = "Maximum height"
+    const val IMAGE_DIMENSIONS_ORIGINAL = "Original"
+    const val EXTRACT_FRAMES_ACTION = "Extract frames"
+    const val FRAMES_DEFAULT_STEM = "frame"
+
+    // -- extract audio / subtitles ---------------------------------------------------------------
+    const val EXTRACT_AUDIO_ACTION = "Extract audio"
+    const val EXTRACT_SUBTITLES_ACTION = "Extract subtitles"
+    const val EXTRACTED_AUDIO_DEFAULT_NAME = "audio"
+
+    // -- output naming ------------------------------------------------------------------------------
+    const val OUTPUT_SECTION = "Output"
+    const val OUTPUT_NAME = "File name"
+    const val OUTPUT_STEM = "Name stem"
+    const val TRIMMED_DEFAULT_NAME = "trimmed"
 
     // -- shared -----------------------------------------------------------------------
     const val SIZE_UNKNOWN = "Unknown size"

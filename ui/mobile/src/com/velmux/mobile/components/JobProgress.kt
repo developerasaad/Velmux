@@ -34,7 +34,7 @@ fun StateChip(state: JobStateUi, modifier: Modifier = Modifier) {
     val (background, content) = when {
         state.isFailed -> VelmuxColors.Danger to Color.White
         state.isTerminal && !state.isFailed -> VelmuxColors.Success to Color.White
-        state == JobStateUi.TargetNotMet -> VelmuxColors.Warn to Color.White
+        state == JobStateUi.TARGET_NOT_MET -> VelmuxColors.Warn to Color.White
         else -> VelmuxColors.Copper300 to VelmuxColors.Copper700
     }
     Surface(

@@ -79,14 +79,22 @@ kotlin {
     sourceSets {
         commonMain {
             // Shared code root: ui/mobile/src (spec structure) in addition to
-            // the conventional src/commonMain/kotlin.
+            // the conventional src/commonMain/kotlin. src/jvmMain belongs to
+            // the jvmMain source set (its default location) — exclude it so
+            // the actuals are not compiled twice.
             kotlin.srcDir("src")
+            kotlin.exclude("jvmMain/**")
             dependencies {
                 implementation(compose.runtime)
                 implementation(compose.foundation)
                 implementation(compose.material3)
                 implementation(compose.ui)
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+                // Vector icon set (mandate §36.4: real vector icons, never
+                // emoji). The material-icons artifacts stayed at 1.7.3 while
+                // Compose Multiplatform moved to 1.8 — they only depend on
+                // the runtime/foundation APIs and interoperate.
+                implementation("org.jetbrains.compose.material:material-icons-core:1.7.3")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
             }
         }

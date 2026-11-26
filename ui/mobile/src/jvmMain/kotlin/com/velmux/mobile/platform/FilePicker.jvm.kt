@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
  * JVM actual: no system document picker exists on the dev target — the
  * handle is honest about it ([available] == false, launch is a no-op).
  */
-actual class FilePickerHandle actual constructor() {
+actual class FilePickerHandle {
 
     private val _picks = MutableStateFlow<List<PickedFile>>(emptyList())
     actual val picks: StateFlow<List<PickedFile>> = _picks

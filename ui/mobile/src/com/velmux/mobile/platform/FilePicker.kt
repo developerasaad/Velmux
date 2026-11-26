@@ -36,8 +36,9 @@ expect class FilePickerHandle {
 }
 
 /**
- * Remembers a file picker for [mimeTypes] ("video/*", "audio/*"...),
- * allowing multiple documents when [multiple] (batch and merge workflows).
+ * Remembers a file picker for [mimeTypes] (video and audio mime
+ * groups), allowing multiple documents when [multiple] (batch and
+ * merge workflows).
  */
 @Composable
 expect fun rememberFilePicker(mimeTypes: List<String>, multiple: Boolean): FilePickerHandle

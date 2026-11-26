@@ -31,8 +31,11 @@ object VelmuxJson {
                 EngineErrorCode.INVALID_ARGUMENT,
                 "engine returned a non-object payload",
             )
+        // The error envelope is {"error":{...}} — a REAL error object.
+        // Legit payload fields named "error" (job snapshots carry
+        // "error":null / "error":"message" as DATA) must not trip this.
         val errorField = obj["error"]
-        if (errorField != null) {
+        if (errorField is JsonObject) {
             throw decodeError(errorField)
         }
         return obj

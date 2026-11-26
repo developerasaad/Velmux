@@ -30,7 +30,7 @@ import com.velmux.mobile.features.home.HomeScreen
 import com.velmux.mobile.features.jobs.JobsScreen
 import com.velmux.mobile.features.settings.SettingsController
 import com.velmux.mobile.features.settings.SettingsScreen
-import com.velmux.mobile.features.workflow.WorkflowPlaceholderScreen
+import com.velmux.mobile.features.workflow.WorkflowScreen
 import com.velmux.mobile.navigation.Destination
 import com.velmux.mobile.navigation.Navigator
 import com.velmux.mobile.platform.AppSettings
@@ -109,10 +109,10 @@ fun VelmuxApp(
                         client = client,
                         controller = settings,
                     )
-                    is Destination.Workflow -> WorkflowPlaceholderScreen(
+                    is Destination.Workflow -> WorkflowScreen(
+                        operation = current.operation,
                         client = client,
                         navigator = navigator,
-                        operation = current.operation,
                         sessionId = current.sessionId,
                     )
                 }

@@ -37,6 +37,7 @@ fun OptionRow(
     value: String,
     modifier: Modifier = Modifier,
     valueMissing: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     ListItem(
@@ -59,11 +60,17 @@ fun OptionRow(
             )
         },
         trailingContent = {
-            Icon(
-                imageVector = VelmuxIcons.Expand,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                trailing?.invoke()
+                Icon(
+                    imageVector = VelmuxIcons.Expand,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
     )
 }

@@ -2,7 +2,6 @@ package com.velmux.mobile.engine
 
 import com.velmux.mobile.platform.PickedFile
 import kotlinx.coroutines.test.advanceTimeBy
-import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -18,9 +17,10 @@ import kotlin.test.assertTrue
  * terminal event -> full jobs refresh, and submission idempotency with
  * durable submission ids.
  *
- * Virtual time: runCurrent() settles the bootstrap; advanceTimeBy(250)
- * drives exactly one poll tick; advanceUntilIdle() is only used while the
- * loop is parked (no ongoing jobs, no listeners) so it always converges.
+ * Virtual time: runCurrent() settles the bootstrap (advanceUntilIdle does
+ * NOT settle backgroundScope work under kotlinx-coroutines-test 1.10.x);
+ * advanceTimeBy(250) drives exactly one poll tick. The poll loop parks
+ * when nothing is busy and nobody listens, so the tests never race it.
  */
 class EngineClientTest {
 
@@ -38,7 +38,7 @@ class EngineClientTest {
         val engine = client(fake)
 
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(EngineStatus.Ready, engine.engineStatus.value)
         val info = assertNotNull(engine.engineInfo.value)
@@ -56,7 +56,7 @@ class EngineClientTest {
         val engine = client(fake)
 
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         val status = engine.engineStatus.value
         assertTrue(status is EngineStatus.AbiMismatch)
@@ -72,7 +72,7 @@ class EngineClientTest {
         val fake = transport()
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         val sessionId = engine.beginWorkflow("video-convert", listOf(FakeTransport.pick()))
 
@@ -116,7 +116,7 @@ class EngineClientTest {
         fake.prepareSessionHandler = { throw EngineException("inspection-failed", "no demuxer") }
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         val sessionId = engine.beginWorkflow("video-convert", listOf(FakeTransport.pick()))
 
@@ -149,7 +149,7 @@ class EngineClientTest {
         }
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         engine.beginWorkflow("video-convert", listOf(FakeTransport.pick()))
 
@@ -294,7 +294,7 @@ class EngineClientTest {
         }
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         engine.beginWorkflow("video-convert", listOf(FakeTransport.pick()))
 
@@ -322,7 +322,7 @@ class EngineClientTest {
         val fake = transport()
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
 
         engine.beginWorkflow("video-convert", listOf(FakeTransport.pick()))
         assertEquals("j-1", engine.submitSession("s-0"))
@@ -343,7 +343,7 @@ class EngineClientTest {
         val fake = transport()
         val engine = client(fake)
         engine.start(backgroundScope)
-        advanceUntilIdle()
+        runCurrent()
         val pollsWhileIdle = fake.pollEventsCalls
 
         // No jobs, no listeners: the loop parks (no further polls).
