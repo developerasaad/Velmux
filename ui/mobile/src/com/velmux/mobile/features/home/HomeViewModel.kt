@@ -24,7 +24,12 @@ data class WorkflowDef(
     val multiple: Boolean,
 )
 
-/** The EIGHT primary workflows across the two domains (Video & Audio). */
+/**
+ * The EIGHT primary workflows across the two domains, exactly as the
+ * product scope fixes them (mandate §9): Video owns six — Converter,
+ * Crop, Cut & Merge, Extract Audio, Extract Frames, Extract Subtitles;
+ * Audio owns two — Converter, Cut & Merge.
+ */
 val VideoWorkflows: List<WorkflowDef> = listOf(
     WorkflowDef(
         operation = "video-convert",
@@ -51,6 +56,14 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
         multiple = true,
     ),
     WorkflowDef(
+        operation = "extract-audio",
+        title = Strings.WORKFLOW_EXTRACT_AUDIO,
+        hint = Strings.WORKFLOW_EXTRACT_AUDIO_HINT,
+        icon = VelmuxIcons.Audio,
+        mimeTypes = listOf("video/*"),
+        multiple = false,
+    ),
+    WorkflowDef(
         operation = "extract-frames",
         title = Strings.WORKFLOW_EXTRACT_FRAMES,
         hint = Strings.WORKFLOW_EXTRACT_FRAMES_HINT,
@@ -69,14 +82,6 @@ val VideoWorkflows: List<WorkflowDef> = listOf(
 )
 
 val AudioWorkflows: List<WorkflowDef> = listOf(
-    WorkflowDef(
-        operation = "extract-audio",
-        title = Strings.WORKFLOW_EXTRACT_AUDIO,
-        hint = Strings.WORKFLOW_EXTRACT_AUDIO_HINT,
-        icon = VelmuxIcons.Audio,
-        mimeTypes = listOf("video/*", "audio/*"),
-        multiple = false,
-    ),
     WorkflowDef(
         operation = "audio-convert",
         title = Strings.WORKFLOW_AUDIO_CONVERT,

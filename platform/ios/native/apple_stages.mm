@@ -204,7 +204,7 @@ AppleStageDecoder::~AppleStageDecoder() {
 Error AppleStageDecoder::open(const std::string &sourcePath,
                               InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "apple");
   }
   AVURLAsset *asset = [AVURLAsset assetWithURL:fileUrlFor(sourcePath)];
@@ -246,7 +246,7 @@ Error AppleStageDecoder::open(const std::string &sourcePath,
       initWithTrack:track
       outputSettings:settings];
   if (impl_->output == nil || ![impl_->reader canAddOutput:impl_->output]) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "cannot decode the video track", "apple");
   }
   [impl_->reader addOutput:impl_->output];
@@ -264,7 +264,7 @@ Error AppleStageDecoder::open(const std::string &sourcePath,
   impl_->format.width = int(track.naturalSize.width);
   impl_->format.height = int(track.naturalSize.height);
   if (impl_->format.width <= 0 || impl_->format.height <= 0) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "the source has no usable video geometry", "apple");
   }
   if (CMTIME_IS_NUMERIC(asset.duration) && asset.duration.value > 0) {
@@ -309,7 +309,7 @@ Error AppleStageDecoder::next(CpuFramePtr &frame) {
   const int height = int(CVPixelBufferGetHeight(pixels));
   if (width <= 0 || height <= 0 || (width % 2) != 0 || (height % 2) != 0) {
     CFRelease(sample);
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "decoded geometry is not usable for Yuv420P interchange",
                        "apple");
   }
@@ -501,13 +501,13 @@ AppleStageEncoder::~AppleStageEncoder() {
 Error AppleStageEncoder::open(const StageEncoderConfig &config,
                               InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "apple");
   }
   bool codecOk = false;
   const FourCharCode codecType = codecTypeFor(config.codec, codecOk);
   if (!codecOk) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "VideoToolbox cannot encode this output codec",
                        "apple");
   }
@@ -515,7 +515,7 @@ Error AppleStageEncoder::open(const StageEncoderConfig &config,
   // honest refusal, never a silent crop.
   if (config.width <= 0 || config.height <= 0 || (config.width % 2) != 0 ||
       (config.height % 2) != 0) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "VideoToolbox needs positive even dimensions "
                        "(got " +
                            std::to_string(config.width) + "x" +
@@ -546,7 +546,7 @@ Error AppleStageEncoder::open(const StageEncoderConfig &config,
       nullptr, nullptr, &Impl::outputCallback, impl_.get(), &impl_->session);
   if (status != noErr) {
     impl_->session = nullptr;
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "cannot create the VideoToolbox session (status " +
                            std::to_string(status) + ")",
                        "apple");
@@ -824,7 +824,7 @@ Error AppleMuxStage::open(const std::string &outputPath,
     fileType = AVFileType3GPP;
     break;
   default:
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "AVAssetWriter cannot write this container", "apple");
   }
   NSError *nsError = nil;
@@ -881,7 +881,7 @@ Error AppleMuxStage::open(const std::string &outputPath,
         outputSettings:nil];
     if (impl_->audioOutput == nil ||
         ![impl_->audioReader canAddOutput:impl_->audioOutput]) {
-      return Error::make(ErrorCode::UnsupportedFeature,
+      return Error::make(ErrorCode::UnsupportedOperation,
                          "cannot read the source audio track", "apple");
     }
     [impl_->audioReader addOutput:impl_->audioOutput];
@@ -902,7 +902,7 @@ Error AppleMuxStage::open(const std::string &outputPath,
     impl_->audioInput.expectsMediaDataInRealTime = NO;
     if (impl_->audioInput == nil ||
         ![impl_->writer canAddInput:impl_->audioInput]) {
-      return Error::make(ErrorCode::UnsupportedFeature,
+      return Error::make(ErrorCode::UnsupportedOperation,
                          "cannot configure the audio track", "apple");
     }
     [impl_->writer addInput:impl_->audioInput];
@@ -962,7 +962,7 @@ Error AppleMuxStage::writeVideoPacket(const PacketView &packet) {
             kCFAllocatorDefault, pointers.size(), pointers.data(),
             sizes.data(), 4, nullptr, &impl_->videoFormat);
       } else {
-        return Error::make(ErrorCode::UnsupportedFeature,
+        return Error::make(ErrorCode::UnsupportedOperation,
                            "HEVC parameter sets need macOS 10.13/iOS 11",
                            "apple");
       }
@@ -983,7 +983,7 @@ Error AppleMuxStage::writeVideoPacket(const PacketView &packet) {
     impl_->videoInput.expectsMediaDataInRealTime = NO;
     if (impl_->videoInput == nil ||
         ![impl_->writer canAddInput:impl_->videoInput]) {
-      return Error::make(ErrorCode::UnsupportedFeature,
+      return Error::make(ErrorCode::UnsupportedOperation,
                          "cannot configure the video track", "apple");
     }
     [impl_->writer addInput:impl_->videoInput];

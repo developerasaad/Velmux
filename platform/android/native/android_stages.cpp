@@ -270,7 +270,7 @@ AndroidStageDecoder::~AndroidStageDecoder() {
 Error AndroidStageDecoder::open(const std::string &sourcePath,
                                 InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "android");
   }
   Impl &d = *impl_;
@@ -594,13 +594,13 @@ AndroidStageEncoder::~AndroidStageEncoder() {
 Error AndroidStageEncoder::open(const StageEncoderConfig &config,
                                 InterchangePixel pixel) {
   if (pixel != InterchangePixel::Yuv420P) {
-    return Error::make(ErrorCode::UnsupportedFeature,
+    return Error::make(ErrorCode::UnsupportedOperation,
                        "unsupported interchange pixel format", "android");
   }
   const char *mime = stageVideoMimeFor(config.codec);
   if (mime == nullptr) {
     return Error::make(
-        ErrorCode::UnsupportedFeature,
+        ErrorCode::UnsupportedOperation,
         std::string("no Android encoder mime for codec: ") +
             codecName(config.codec),
         "android");
@@ -762,7 +762,7 @@ Error AndroidStageEncoder::push(const ICpuFrame &frame) {
     } else {
       AMediaCodec_queueInputBuffer(e.codec, size_t(idx), 0, 0, 0, 0);
       return Error::make(
-          ErrorCode::UnsupportedFeature,
+          ErrorCode::UnsupportedOperation,
           "unsupported encoder input color format: " +
               std::to_string(colorFormat),
           "android");
@@ -1086,7 +1086,7 @@ Error AndroidMuxStage::open(const std::string &outputPath,
     // No NDK muxer for this container (e.g. MPEG-T): refuse honestly
     // rather than silently writing a different container.
     return Error::make(
-        ErrorCode::UnsupportedFeature,
+        ErrorCode::UnsupportedOperation,
         std::string("the Android stage muxer cannot write container: ") +
             containerName(tracks.container),
         "android");
@@ -1178,7 +1178,7 @@ Error AndroidMuxStage::writeVideoPacket(const PacketView &packet) {
       }
       const char *mime = stageVideoMimeFor(m.tracks.videoCodec);
       if (mime == nullptr) {
-        return Error::make(ErrorCode::UnsupportedFeature,
+        return Error::make(ErrorCode::UnsupportedOperation,
                            "no Android mime for the output video codec",
                            "android");
       }

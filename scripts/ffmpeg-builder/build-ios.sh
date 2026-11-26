@@ -49,6 +49,14 @@ require_tool lipo
 ensure_cmake_ninja
 ensure_meson
 
+# This builder is explicitly cross-configured (per-slice wrapper scripts
+# with their own -isysroot); a caller's SDKROOT only contaminates the
+# HOST-side tool builds (meson's native compiler sanity run targets the
+# caller's SDK and the built tool cannot run on macOS). Observed when the
+# Xcode "Prepare engine and framework" phase invoked this script with
+# SDKROOT=iphonesimulator in its environment.
+unset SDKROOT
+
 FFMPEG_VERSION="$(json_field "$BUILDER_ROOT/versions.json" "ffmpeg.version")"
 
 log "Xcode: $(xcodebuild -version 2>/dev/null | head -1 || echo 'unknown')"
